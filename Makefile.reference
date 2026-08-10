@@ -1,0 +1,29 @@
+# Makefile.reference — build the three untouched CPU reference programs.
+#
+# Output binaries are emitted into reference/ with the pinned names:
+#   reference/ff_seg  <- segmentedSieve.C
+#   reference/pen     <- penultimateBestParallelizedFastFruedenthalYet.C
+#   reference/pen2    <- penultimateBestParallelizedFastFruedenthalYet2.C
+# Todos 2/13 acceptance commands (e.g. `./reference/ff_seg`) depend on these
+# EXACT paths. Plain g++, no extra dependencies.
+
+CXX      ?= g++
+CXXFLAGS ?= -O2 -Wall
+
+REFDIR := reference
+
+.PHONY: all clean
+
+all: $(REFDIR)/ff_seg $(REFDIR)/pen $(REFDIR)/pen2
+
+$(REFDIR)/ff_seg: $(REFDIR)/segmentedSieve.C
+	$(CXX) $(CXXFLAGS) -o $@ $<
+
+$(REFDIR)/pen: $(REFDIR)/penultimateBestParallelizedFastFruedenthalYet.C
+	$(CXX) $(CXXFLAGS) -o $@ $<
+
+$(REFDIR)/pen2: $(REFDIR)/penultimateBestParallelizedFastFruedenthalYet2.C
+	$(CXX) $(CXXFLAGS) -o $@ $<
+
+clean:
+	rm -f $(REFDIR)/ff_seg $(REFDIR)/pen $(REFDIR)/pen2

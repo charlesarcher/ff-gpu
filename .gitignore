@@ -1,0 +1,15 @@
+# Scratch / per-leg run dirs (golden regeneration + verify.sh capture)
+run/
+
+# Reference programs chdir into ffPlayground in their cwd and leave
+# ffpartNNN partial files behind on failure — never commit either.
+ffPlayground/
+ffpart*
+
+# verify.sh writes the GPU binary's captured-and-normalized stdout here
+out.txt
+
+# Reference binaries are build artifacts of Makefile.reference
+reference/ff_seg
+reference/pen
+reference/pen2
