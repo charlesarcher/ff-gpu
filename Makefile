@@ -45,14 +45,20 @@ AMDFLAGS := $(HOST_CXXFLAGS) $(ROCM_INC) -DSIEVE_KERNEL_ARCH=$(ARCH_AMD)
 NVFLAGS  := -O2 $(ROCM_INC) -DSIEVE_KERNEL_ARCH=$(ARCH_NV)
 
 BUILD := build
-OBJS  := $(BUILD)/smoke_main.o $(BUILD)/hip_smoke.o $(BUILD)/cuda_smoke.o
+OBJS  := $(BUILD)/main.o $(BUILD)/config.o $(BUILD)/budget.o \
+         $(BUILD)/geometry.o $(BUILD)/device_registry.o \
+         $(BUILD)/hip_enum.o $(BUILD)/cuda_enum.o \
+         $(BUILD)/smoke_main.o $(BUILD)/hip_smoke.o $(BUILD)/cuda_smoke.o
 
 # Pinned output path: every acceptance invocation in later todos uses
 # ./ff_sieve from the repo root (bash does not search the cwd for bare
 # command names — Momus round-7 NIT).
 BIN := ff_sieve
 
-.PHONY: all smoke clean
+# Pure-logic self-test for the todo-3 modules (g++ only, no vendor headers).
+SELFTEST := tests/ff_budget_selftest
+
+.PHONY: all smoke selftest clean
 
 all: $(BIN)
 
@@ -68,12 +74,50 @@ $(BUILD)/cuda_smoke.o: smoke/cuda_smoke.cpp smoke/smoke_kernel.h | $(BUILD)
 $(BUILD)/smoke_main.o: smoke/smoke_main.cpp | $(BUILD)
 	$(GXX) $(HOST_CXXFLAGS) -c $< -o $@
 
+# ---- todo 3: startup device enumeration (split vendor TUs, never mixed) ----
+# AMD enumeration TU: DEFAULT HIP platform (hipcc as-is) — sees the 9070 XT.
+$(BUILD)/hip_enum.o: src/hip_enum.cpp src/device_info.h | $(BUILD)
+	$(HIPCC) $(AMDFLAGS) -c $< -o $@
+
+# NVIDIA enumeration TU: HIP_PLATFORM=nvidia (same path as cuda_smoke.o) —
+# sees the 5090 only. Includes cuda_runtime.h, so -Wall stays out (NVFLAGS).
+$(BUILD)/cuda_enum.o: src/cuda_enum.cpp src/device_info.h | $(BUILD)
+	HIP_PLATFORM=nvidia $(HIPCC) $(NVFLAGS) -x cu -arch=$(ARCH_NV) -c $< -o $@
+
+# ---- todo 3: vendor-neutral modules (g++, no vendor headers) ----
+$(BUILD)/main.o: src/main.cpp src/config.h src/budget.h src/geometry.h \
+                 src/device_registry.h src/device_info.h | $(BUILD)
+	$(GXX) $(HOST_CXXFLAGS) -c $< -o $@
+
+$(BUILD)/config.o: src/config.cpp src/config.h | $(BUILD)
+	$(GXX) $(HOST_CXXFLAGS) -c $< -o $@
+
+$(BUILD)/budget.o: src/budget.cpp src/budget.h src/config.h src/device_info.h | $(BUILD)
+	$(GXX) $(HOST_CXXFLAGS) -c $< -o $@
+
+$(BUILD)/geometry.o: src/geometry.cpp src/geometry.h | $(BUILD)
+	$(GXX) $(HOST_CXXFLAGS) -c $< -o $@
+
+$(BUILD)/device_registry.o: src/device_registry.cpp src/device_registry.h \
+                            src/device_info.h | $(BUILD)
+	$(GXX) $(HOST_CXXFLAGS) -c $< -o $@
+
 # ---- link: objects ONLY, never a .cu source on the link line ----
 $(BIN): $(OBJS)
 	$(GXX) -o $@ $(OBJS) $(CUDA_LIB) -lcudart $(ROCM_LIB) -lamdhip64
 
 $(BUILD):
 	mkdir -p $(BUILD)
+
+$(SELFTEST): tests/budget_selftest.cpp src/config.cpp src/budget.cpp \
+             src/geometry.cpp src/device_registry.cpp \
+             src/config.h src/budget.h src/geometry.h src/device_registry.h \
+             src/device_info.h | $(BUILD)
+	$(GXX) $(HOST_CXXFLAGS) -Isrc -o $@ tests/budget_selftest.cpp src/config.cpp \
+	    src/budget.cpp src/geometry.cpp src/device_registry.cpp
+
+selftest: $(SELFTEST)
+	./$(SELFTEST)
 
 smoke: all
 	./$(BIN)
