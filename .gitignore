@@ -13,3 +13,7 @@ out.txt
 reference/ff_seg
 reference/pen
 reference/pen2
+
+# Todo 4 dual-arch build artifacts (Makefile)
+build/
+ff_sieve
