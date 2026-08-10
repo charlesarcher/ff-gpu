@@ -106,6 +106,8 @@ class Prime
     inline uint32_t operator[](const uint32_t index) const;
     inline Boolean IsPrime(const uint64_t n) const;
     inline uint64_t MaxPrimeMapValue() const;
+    inline unsigned char* PrimeMap() const; // Test-only accessor: raw primeMap buffer
+    inline uint64_t PrimeMapSize() const;   // Test-only accessor: primeMap byte count
 
   private:
    struct Stage2ThreadData {
@@ -295,6 +297,14 @@ inline Prime::Boolean Prime::IsPrime(const uint64_t n) const
 
 inline uint64_t Prime::MaxPrimeMapValue() const
  {return maxPrimeMapValue;
+ }
+
+inline unsigned char* Prime::PrimeMap() const
+ {return primeMap;
+ }
+
+inline uint64_t Prime::PrimeMapSize() const
+ {return (maxPrimeMapValue+1+15)>>4;
  }
 
 inline uint64_t Prime::ModularMulL(uint64_t a, uint64_t b, uint64_t modulus)
@@ -817,7 +827,21 @@ inline void FreudenthalThreads::RunIt(const ThreadData& thread)
 
 
 int main (int argc, char* argv[])
- {uint32_t sumStart,
+ {char* dumpFile=nullptr;
+  // Sieve-only test option: --dump-map <file> [<sumStart>] [<sumLimit>]. The
+  // flag must be FIRST; strip it (and its file argument) from argv so the
+  // reference's positional argument parsing below is left unchanged.
+  if (argc>1&&strcmp(argv[1],"--dump-map")==0)
+   {if (argc<3)
+     {cout<<"--dump-map requires a file argument."<<endl;
+      exit(-6);
+     }
+    dumpFile=argv[2];
+    for (int i=3; i<argc; ++i)
+      argv[i-2]=argv[i];
+    argc-=2;
+   }
+  uint32_t sumStart,
            sumLimit;
   if (argc>2)
    {sumStart=atoi(argv[1])|1;
@@ -855,6 +879,27 @@ int main (int argc, char* argv[])
   Prime prime(primeLimit,xlogx+1.2762*xlogx/log(double(maxGeneratedPrime))); //Estimate number of primes <= maxGeneratedPrime.
   auto stop = high_resolution_clock::now();
   auto pTime = duration_cast<microseconds>(stop-start);
+
+  if (dumpFile)
+   {ofstream dumpStream(dumpFile, ios::binary|ios::trunc);
+    if (!dumpStream)
+     {cout<<"Cannot open dump file '"<<dumpFile<<"' for writing."<<endl;
+      if (chdir("..")||rmdir("ffPlayground")) {}
+      exit(-6);
+     }
+    dumpStream.write((const char*)prime.PrimeMap(), prime.PrimeMapSize());
+    if (!dumpStream)
+     {cout<<"Failed to write dump file '"<<dumpFile<<"'."<<endl;
+      if (chdir("..")||rmdir("ffPlayground")) {}
+      exit(-7);
+     }
+    dumpStream.close();
+    if (chdir("..")||rmdir("ffPlayground"))
+     {cout<<"Something has gone horribly wrong with the file system. Quitting seems prudent."<<endl;
+      exit(-4);
+     }
+    return 0;
+   }
 
   start = high_resolution_clock::now();
   uint64_t pmapSumLimit=isqrt64((prime.MaxPrimeMapValue()-2)<<2)<<1;
