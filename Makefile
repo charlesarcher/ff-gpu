@@ -58,7 +58,7 @@ BIN := ff_sieve
 # Pure-logic self-test for the todo-3 modules (g++ only, no vendor headers).
 SELFTEST := tests/ff_budget_selftest
 
-.PHONY: all smoke selftest clean
+.PHONY: all smoke selftest abstraction-smoke clean
 
 all: $(BIN)
 
@@ -83,6 +83,43 @@ $(BUILD)/hip_enum.o: src/hip_enum.cpp src/device_info.h | $(BUILD)
 # sees the 5090 only. Includes cuda_runtime.h, so -Wall stays out (NVFLAGS).
 $(BUILD)/cuda_enum.o: src/cuda_enum.cpp src/device_info.h | $(BUILD)
 	HIP_PLATFORM=nvidia $(HIPCC) $(NVFLAGS) -x cu -arch=$(ARCH_NV) -c $< -o $@
+
+# ---- todo 6: vendor-neutral DevAbstraction (GPU_PLAN §5.2) ----
+# Host TU (g++, NO vendor headers): logical device list via ff::mergeAndDedupe
+# (bus-ID dedup) + dispatch to the split backend TUs below.
+$(BUILD)/devabstraction.o: src/devabstraction.cpp src/devabstraction.h \
+                           src/device_registry.h src/device_info.h | $(BUILD)
+	$(GXX) $(HOST_CXXFLAGS) -c $< -o $@
+
+# AMD backend TU: DEFAULT HIP platform (hipcc as-is) — sees the 9070 XT only.
+$(BUILD)/hip_devabstraction.o: src/hip_devabstraction.cpp \
+                               src/devabstraction.h src/device_info.h \
+                               smoke/smoke_kernel.h | $(BUILD)
+	$(HIPCC) $(AMDFLAGS) -c $< -o $@
+
+# NVIDIA backend TU: HIP_PLATFORM=nvidia (nvcc path) — sees the 5090 only.
+# Includes cuda_runtime.h, so -Wall stays out (NVFLAGS).
+$(BUILD)/cuda_devabstraction.o: src/cuda_devabstraction.cpp \
+                                src/devabstraction.h src/device_info.h \
+                                smoke/smoke_kernel.h | $(BUILD)
+	HIP_PLATFORM=nvidia $(HIPCC) $(NVFLAGS) -x cu -arch=$(ARCH_NV) -c $< -o $@
+
+# Abstraction smoke test (own main(), NOT linked into ff_sieve): links the
+# host TU + both backend TUs + the todo-3 enumeration/registry objects. The
+# dual-runtime link line is objects-only (never a .cu source).
+SMOKE_TEST := tests/abstraction_smoke
+$(SMOKE_TEST): tests/abstraction_smoke.cpp src/devabstraction.h \
+               $(BUILD)/devabstraction.o $(BUILD)/hip_devabstraction.o \
+               $(BUILD)/cuda_devabstraction.o $(BUILD)/device_registry.o \
+               $(BUILD)/hip_enum.o $(BUILD)/cuda_enum.o | $(BUILD)
+	$(GXX) $(HOST_CXXFLAGS) -Isrc -o $@ tests/abstraction_smoke.cpp \
+	    $(BUILD)/devabstraction.o $(BUILD)/hip_devabstraction.o \
+	    $(BUILD)/cuda_devabstraction.o $(BUILD)/device_registry.o \
+	    $(BUILD)/hip_enum.o $(BUILD)/cuda_enum.o \
+	    $(CUDA_LIB) -lcudart $(ROCM_LIB) -lamdhip64
+
+abstraction-smoke: $(SMOKE_TEST)
+	./$(SMOKE_TEST)
 
 # ---- todo 3: vendor-neutral modules (g++, no vendor headers) ----
 $(BUILD)/main.o: src/main.cpp src/config.h src/budget.h src/geometry.h \
