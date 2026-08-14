@@ -111,6 +111,11 @@ int DevEventElapsedMs(DevEvent* start, DevEvent* end, float* ms);
 // launch is observable before returning.
 int DevLaunch(int deviceIndex, void* devBuf, int n, DevStream* s);
 
+// M0 benchmark kernel launch (smoke/m0_kernel.h). kernel_id: 0 = MEMSET
+// (constant 0xDEADBEEF fill), 1 = BW_SEQ (sequential index-based pattern).
+// Synchronizes the used stream before returning — same contract as DevLaunch.
+int DevLaunchM0(int deviceIndex, int kernel_id, void* devBuf, int n, DevStream* s);
+
 // ---- TEST-ONLY override (never used by ff_sieve; the abstraction is not
 // even linked into it) ----
 // Forces the backend for a PCI bus ID, re-enumerating the forced backend to
@@ -160,6 +165,10 @@ int ff_dev_cuda_event_record(int dev, void* e, void* s);
 int ff_dev_cuda_event_sync(int dev, void* e);
 int ff_dev_cuda_event_elapsed_ms(int dev, void* e0, void* e1, float* ms);
 int ff_dev_cuda_launch(int dev, void* buf, int n, void* s);
+
+// M0 benchmark kernel launches (smoke/m0_kernel.h).
+int ff_dev_hip_m0_launch(int dev, int kernel_id, void* buf, int n, void* s);
+int ff_dev_cuda_m0_launch(int dev, int kernel_id, void* buf, int n, void* s);
 
 }  // extern "C"
 

@@ -446,6 +446,23 @@ int DevLaunch(int deviceIndex, void* devBuf, int n, DevStream* s)
     return 0;
 }
 
+int DevLaunchM0(int deviceIndex, int kernel_id, void* devBuf, int n, DevStream* s)
+{
+    DevMapEntry e;
+    if (resolveLogical(deviceIndex, &e) != 0) return -1;
+    void* sTok = s ? s->token : nullptr;
+    int rc = e.backend == DevBackend::Hip
+                 ? ff_dev_hip_m0_launch(e.vendorIndex, kernel_id, devBuf, n, sTok)
+                 : ff_dev_cuda_m0_launch(e.vendorIndex, kernel_id, devBuf, n, sTok);
+    if (rc != 0) {
+        std::fprintf(stderr,
+                     "[ffdev] DevLaunchM0(%d, kernel=%d) failed via %s backend\n",
+                     deviceIndex, kernel_id, backendName(e.backend));
+        return -1;
+    }
+    return 0;
+}
+
 int DevForceBackendForBus(const char* busId, DevBackend backend)
 {
     if (!g_initialized) {

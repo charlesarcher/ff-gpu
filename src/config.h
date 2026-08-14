@@ -25,6 +25,17 @@ struct Config {
     uint64_t hostTierCapBytes = 0;                   // 0 = disabled (default)
     bool noHostTier = false;                         // --no-host-tier: force-disable the host overflow tier
     bool listDevices = false;                        // --list-devices (recon flag, plan-defined)
+    std::string deviceFilter;                        // --devices <backend>: "amd"|"nvidia" ("" = all)
+    // M2 weighted pulls (plan todo 10): vendor name -> bandwidth weight (> 0).
+    // Populated by loadPullWeights() from config/m0-benchmarks.json
+    // (writeBandwidthGbs), overridden by FF_PULL_WEIGHTS. Vendors absent from
+    // the map fall back to weight 1.0 (uniform pulls).
+    std::map<std::string, double> pullWeights;
+    double pullWeightRatio = 0.0;                    // max/min of pullWeights (0 = not loaded)
+    std::string disableVendors;                      // FF_DISABLE_DEVICE: "amd"|"nvidia" ("" = none)
+    std::string dumpMapFile;                        // --dump-map <file> (todo 13)
+    bool noGpu = false;                             // --no-gpu: force CPU-only search
+    bool gpuSearch = false;                         // --gpu-search: try GPU when VRAM allows
 };
 
 // Size parser: "<num>[unit]" — unit in {b, k, m, g, ki, mi, gi, kib, mib, gib}
@@ -47,6 +58,15 @@ bool parseDeviceFractionSpec(const std::string& spec,
 // ignored budget env could oversubscribe; never silently oversubscribe (§4.3).
 // Returns 0 on success, -1 on error.
 int loadEnv(Config* cfg);
+
+// Loads pull weights (M2, plan todo 10) into cfg->pullWeights: per-vendor
+// writeBandwidthGbs from config/m0-benchmarks.json (hand-rolled scanner, no
+// third-party libraries — guardrail). FF_PULL_WEIGHTS values already merged by
+// loadEnv() take precedence; vendors absent from both fall back to 1.0 at use
+// time. A missing/unreadable JSON file is a warning (uniform pulls), but a
+// weight <= 0 from any source is a HARD error. Returns 0 on success, -1 on
+// error (message on stderr).
+int loadPullWeights(Config* cfg);
 
 // Parses the CLI: flags (+ optional =value form) and positionals. CLI values
 // override env. Unknown --* flags are rejected (plan guardrail: any other new

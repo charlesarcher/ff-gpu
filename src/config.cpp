@@ -39,6 +39,81 @@ bool parseSizeImpl(const std::string& s, uint64_t* out)
     return true;
 }
 
+// FF_PULL_WEIGHTS spec: comma-separated "vendor=weight" pairs (vendor
+// case-insensitive, weight > 0). Malformed/zero/negative -> false.
+bool parsePullWeightsSpec(const std::string& spec,
+                          std::map<std::string, double>* out)
+{
+    out->clear();
+    size_t pos = 0;
+    for (;;) {
+        size_t comma = spec.find(',', pos);
+        std::string item = spec.substr(
+            pos, comma == std::string::npos ? std::string::npos : comma - pos);
+        if (item.empty()) return false;
+        size_t eq = item.find('=');
+        if (eq == std::string::npos) return false;
+        std::string vendor = toLower(item.substr(0, eq));
+        std::string val = item.substr(eq + 1);
+        if (vendor.empty() || val.empty()) return false;
+        double w = 0.0;
+        if (!parseFraction(val, &w)) return false;
+        if (w <= 0.0) return false;
+        (*out)[vendor] = w;
+        if (comma == std::string::npos) break;
+        pos = comma + 1;
+    }
+    return true;
+}
+
+bool readFileIntoString(const char* path, std::string* out)
+{
+    FILE* f = std::fopen(path, "rb");
+    if (!f) return false;
+    std::fseek(f, 0, SEEK_END);
+    long len = std::ftell(f);
+    if (len < 0) { std::fclose(f); return false; }
+    std::fseek(f, 0, SEEK_SET);
+    out->resize(static_cast<size_t>(len));
+    size_t got = len > 0
+                     ? std::fread(&(*out)[0], 1, static_cast<size_t>(len), f)
+                     : 0;
+    std::fclose(f);
+    return got == static_cast<size_t>(len);
+}
+
+// Scans config/m0-benchmarks.json for {"vendor": "...", ...,
+// "writeBandwidthGbs": <num>} device entries. Hand-rolled — the JSON library
+// guardrail forbids third-party deps and the document is a fixed small file.
+bool scanWriteBandwidths(const std::string& text,
+                         std::map<std::string, double>* out)
+{
+    bool found = false;
+    size_t pos = 0;
+    for (;;) {
+        size_t vk = text.find("\"vendor\"", pos);
+        if (vk == std::string::npos) break;
+        size_t colon = text.find(':', vk);
+        if (colon == std::string::npos) break;
+        size_t q1 = text.find('"', colon + 1);
+        if (q1 == std::string::npos) break;
+        size_t q2 = text.find('"', q1 + 1);
+        if (q2 == std::string::npos) break;
+        std::string vendor = text.substr(q1 + 1, q2 - q1 - 1);
+        size_t wk = text.find("\"writeBandwidthGbs\"", q2);
+        if (wk == std::string::npos) break;
+        size_t wcolon = text.find(':', wk);
+        if (wcolon == std::string::npos) break;
+        char* end = nullptr;
+        double val = std::strtod(text.c_str() + wcolon + 1, &end);
+        if (end == text.c_str() + wcolon + 1) break;
+        (*out)[vendor] = val;
+        found = true;
+        pos = q2 + 1;
+    }
+    return found;
+}
+
 }  // namespace
 
 bool parseSize(const std::string& s, uint64_t* out) { return parseSizeImpl(s, out); }
@@ -136,6 +211,28 @@ int loadEnv(Config* cfg)
             cfg->hasHostTierCap = true;
             cfg->hostTierCapBytes = sz;
         }
+    }
+    if ((v = std::getenv("FF_PULL_WEIGHTS")) && *v) {
+        std::map<std::string, double> w;
+        if (!parsePullWeightsSpec(v, &w)) {
+            std::fprintf(stderr,
+                         "[ff_sieve] error: malformed FF_PULL_WEIGHTS='%s' "
+                         "(expected comma-separated 'vendor=weight', e.g. "
+                         "'nvidia=1656.10,amd=598.75'; weights must be > 0)\n",
+                         v);
+            return -1;
+        }
+        cfg->pullWeights = w;
+    }
+    if ((v = std::getenv("FF_DISABLE_DEVICE")) && *v) {
+        std::string b = toLower(v);
+        if (b != "amd" && b != "nvidia") {
+            std::fprintf(stderr,
+                         "[ff_sieve] error: malformed FF_DISABLE_DEVICE='%s' "
+                         "(expected 'amd' or 'nvidia', case-insensitive)\n", v);
+            return -1;
+        }
+        cfg->disableVendors = b;
     }
     return 0;
 }
@@ -253,6 +350,32 @@ int parseArgs(int argc, char** argv, Config* cfg,
             }
             continue;
         }
+        if (name == "--devices") {
+            const char* v = needValue(name.c_str());
+            if (!v) return -1;
+            std::string b = toLower(v);
+            if (b != "amd" && b != "nvidia") {
+                std::fprintf(stderr, "[ff_sieve] error: invalid --devices "
+                             "backend '%s' (expected 'amd' or 'nvidia')\n", v);
+                return -1;
+            }
+            cfg->deviceFilter = b;
+            continue;
+        }
+if (name == "--dump-map") {
+            const char* v = needValue(name.c_str());
+            if (!v) return -1;
+            cfg->dumpMapFile = v;
+            continue;
+        }
+        if (name == "--no-gpu") {
+            cfg->noGpu = true;
+            continue;
+        }
+        if (name == "--gpu-search") {
+            cfg->gpuSearch = true;
+            continue;
+        }
         std::fprintf(stderr, "[ff_sieve] error: unknown option '%s'\n", name.c_str());
         return -1;
     }
@@ -318,6 +441,40 @@ int validateConfig(Config* cfg)
             std::fprintf(stderr, "[ff_sieve] warning: host RAM < 4 GiB; "
                                  "--host-tier-cap auto resolves to 0\n");
     }
+    return 0;
+}
+
+int loadPullWeights(Config* cfg)
+{
+    std::map<std::string, double> jsonWeights;
+    std::string text;
+    if (readFileIntoString("config/m0-benchmarks.json", &text)) {
+        if (scanWriteBandwidths(text, &jsonWeights)) {
+            for (const auto& kv : jsonWeights) {
+                if (cfg->pullWeights.find(kv.first) == cfg->pullWeights.end())
+                    cfg->pullWeights[kv.first] = kv.second;
+            }
+        } else {
+            std::fprintf(stderr,
+                         "[ff_sieve] warning: config/m0-benchmarks.json contains "
+                         "no writeBandwidthGbs entries; pull weights are uniform\n");
+        }
+    } else {
+        std::fprintf(stderr,
+                     "[ff_sieve] warning: config/m0-benchmarks.json unreadable; "
+                     "pull weights are uniform\n");
+    }
+    double minW = 0.0, maxW = 0.0;
+    for (const auto& kv : cfg->pullWeights) {
+        if (kv.second <= 0.0) {
+            std::fprintf(stderr, "[ff_sieve] error: pull weight '%s=%.6g' must "
+                                 "be > 0\n", kv.first.c_str(), kv.second);
+            return -1;
+        }
+        if (minW == 0.0 || kv.second < minW) minW = kv.second;
+        if (kv.second > maxW) maxW = kv.second;
+    }
+    if (!cfg->pullWeights.empty()) cfg->pullWeightRatio = maxW / minW;
     return 0;
 }
 

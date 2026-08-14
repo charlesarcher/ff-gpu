@@ -2,12 +2,9 @@
 // budget CLI. Flow: env -> CLI parse -> §4.3 validation -> --list-devices
 // (recon) -> no-args = todo-4 dual-runtime smoke (make smoke regression) ->
 // leg path: geometry -> enumerate (HIP + CUDA, deduped by PCI bus ID) ->
-// per-device budgets (§4.2) -> AGGREGATE sieve run-gate -> audit on STDERR.
-//
-// At this stage there is NO sieve: a passing gate prints the budget/audit
-// lines and exits 0; a failing gate exits 1 with the aggregate capacity
-// numbers + remediation. STDERR discipline (Metis BLOCKER #2): EVERY
-// diagnostic goes to stderr — stdout stays byte-pure under every invocation.
+// per-device budgets (§4.2) -> AGGREGATE sieve run-gate -> SieveEngine::run
+// -> GpuPrime -> RunIt Freudenthal search. STDOUT carries byte-exact headers
+// and Freudenthal results; STDERR carries all budget/diagnostic/audit output.
 
 #include <cstdio>
 #include <cstdlib>
@@ -19,7 +16,16 @@
 #include "config.h"
 #include "device_info.h"
 #include "device_registry.h"
+#include "devabstraction.h"
 #include "geometry.h"
+#include "gpu_prime.h"
+#include "sieve_engine.h"
+#include "pull_scheduler.h"
+#include "cpu_search.h"
+#include "m4/gpu_search_launcher.h"
+#include "m4/gpu_search_emission.cpp"
+#include <chrono>
+#include <iostream>
 
 extern "C" int ff_enum_hip(ff::DeviceInfo* out, int maxDevices, int* outCount);
 extern "C" int ff_enum_cuda(ff::DeviceInfo* out, int maxDevices, int* outCount);
@@ -35,6 +41,16 @@ struct RunDevices {
     bool hipFailed = false;
     bool cudaFailed = false;
 };
+
+double elapsedMs(const std::chrono::steady_clock::time_point& start) {
+    auto now = std::chrono::steady_clock::now();
+    double ms = std::chrono::duration<double, std::milli>(now - start).count();
+    return ms;
+}
+
+void dumpPhaseTimer(const char* phase, double ms) {
+    std::fprintf(stderr, "ff_sieve timing: %s = %.3f ms\n", phase, ms);
+}
 
 RunDevices enumerate()
 {
@@ -78,7 +94,10 @@ void printDeviceHeader(const ff::DeviceInfo& d, int idx)
 
 int runListDevices()
 {
+    auto t_list = std::chrono::steady_clock::now();
     RunDevices r = enumerate();
+    double listMs = elapsedMs(t_list);
+    dumpPhaseTimer("device enumeration (--list-devices)", listMs);
     if (r.devs.empty()) {
         std::fprintf(stderr, "[ff_sieve] error: no devices enumerated\n");
         return 1;
@@ -112,6 +131,14 @@ std::string renderDeviceFractions(const ff::Config& cfg)
         s += kv.first + "=" + buf;
     }
     return s;
+}
+
+static uint64_t isqrt64(uint64_t n) {
+    if (n == 0) return 0;
+    uint64_t x = (uint64_t)std::sqrt((double)n);
+    while ((x + 1) * (x + 1) <= n) ++x;
+    while (x * x > n) --x;
+    return x;
 }
 
 int runLeg(const ff::Config& cfg, const std::vector<std::string>& positionals)
@@ -157,7 +184,10 @@ int runLeg(const ff::Config& cfg, const std::vector<std::string>& positionals)
                  cfg.hostTierCapBytes == 0 && !cfg.noHostTier ? " (disabled)"
                                                               : "");
 
+    auto t_enum = std::chrono::steady_clock::now();
     RunDevices r = enumerate();
+    double enumMs = elapsedMs(t_enum);
+    dumpPhaseTimer("device enumeration", enumMs);
     if (r.devs.empty()) {
         std::fprintf(stderr,
                      "[ff_sieve] error: no devices enumerated (HIP%s, CUDA%s)\n",
@@ -168,7 +198,58 @@ int runLeg(const ff::Config& cfg, const std::vector<std::string>& positionals)
         std::fprintf(stderr, "[ff_sieve] note: %d bus-ID duplicate(s) skipped in "
                              "the device union\n", r.skippedDuplicates);
 
+    // --devices <backend> restricts participation to one vendor; the leg-fit
+    // gate below then evaluates against the filtered devices only.
+    if (!cfg.deviceFilter.empty()) {
+        std::vector<ff::DeviceInfo> kept;
+        for (const ff::DeviceInfo& d : r.devs) {
+            if (cfg.deviceFilter == d.vendor) kept.push_back(d);
+        }
+        std::fprintf(stderr, "[ff_sieve] device filter: --devices=%s kept %zu of "
+                             "%zu logical device(s)\n",
+                     cfg.deviceFilter.c_str(), kept.size(), r.devs.size());
+        if (kept.empty()) {
+            std::fprintf(stderr, "[ff_sieve] ERROR: no device matches "
+                                 "--devices=%s (enumerated:",
+                         cfg.deviceFilter.c_str());
+            for (size_t i = 0; i < r.devs.size(); ++i)
+                std::fprintf(stderr, " %s", r.devs[i].vendor);
+            std::fprintf(stderr, ")\n");
+            return 1;
+        }
+        r.devs = std::move(kept);
+    }
+
+    // FF_DISABLE_DEVICE=<amd|nvidia> (plan todo 10): removes a vendor's
+    // devices before budgets/scheduling (case-insensitive, enforced in
+    // loadEnv). An empty pool is a hard error — never run an unscheduled
+    // fallback path silently.
+    if (!cfg.disableVendors.empty()) {
+        std::vector<ff::DeviceInfo> kept;
+        for (const ff::DeviceInfo& d : r.devs) {
+            if (cfg.disableVendors != d.vendor) kept.push_back(d);
+        }
+        std::fprintf(stderr,
+                     "[ff_sieve] device filter: FF_DISABLE_DEVICE=%s kept %zu of "
+                     "%zu logical device(s)\n",
+                     cfg.disableVendors.c_str(), kept.size(), r.devs.size());
+        if (kept.empty()) {
+            std::fprintf(stderr, "[ff_sieve] ERROR: FF_DISABLE_DEVICE=%s leaves "
+                                 "no devices (enumerated:",
+                         cfg.disableVendors.c_str());
+            for (size_t i = 0; i < r.devs.size(); ++i)
+                std::fprintf(stderr, " %s", r.devs[i].vendor);
+            std::fprintf(stderr, ")\n");
+            return 1;
+        }
+        r.devs = std::move(kept);
+    }
+
+    // --dump-map <file> (todo 13): dump prime map after sieve, exit before search
+    const std::string& dumpMapFile = cfg.dumpMapFile;
+
     // §4.2 per-device budgets.
+    auto t_budget = std::chrono::steady_clock::now();
     std::vector<ff::DeviceBudget> budgets;
     unsigned long long aggregateBacking = 0;
     for (size_t i = 0; i < r.devs.size(); ++i) {
@@ -208,6 +289,8 @@ int runLeg(const ff::Config& cfg, const std::vector<std::string>& positionals)
                      static_cast<unsigned long long>(b.slabCount));
         aggregateBacking += b.backing;
     }
+
+    dumpPhaseTimer("budget computation", elapsedMs(t_budget));
 
     // AGGREGATE sieve run-gate (Oracle round-3): sum(device backing) +
     // host-tier-cap >= mapBytes(leg); host-tier-cap defaults to 0. The
@@ -250,9 +333,207 @@ int runLeg(const ff::Config& cfg, const std::vector<std::string>& positionals)
         return 1;
     }
 
-    std::fprintf(stderr,
-                 "[ff_sieve] gate: PASS — no sieve in this stage; todo 7 adds "
-                 "SieveSlabKernel\n");
+    // Allocate host map
+    uint64_t mapBytes = (g.maxPrimeMapValue + 1 + 15) >> 4;
+    std::vector<uint8_t> hostMap(mapBytes, 0);
+
+    // M2 backing pool + weighted dynamic pulls (plan todo 10): device-
+    // independent prep (geometry + host primes), then the pull scheduler
+    // sieves the full map across ALL logical devices. SieveEngine's ctor
+    // device/vendor are unused by prepare()/kernelPrimes() — keep them valid
+    // for the CPU search's small-prime list below.
+    auto t_sieve = std::chrono::steady_clock::now();
+    SieveEngine engine(r.devs[0].runtimeIndex, r.devs[0].vendor);
+    uint64_t maxPrimeMapValue = engine.prepare(g.sumLimit);
+    if (maxPrimeMapValue == 0) {
+        std::fprintf(stderr, "[ff_sieve] sieve prepare failed\n");
+        return 1;
+    }
+    uint32_t kernelPrimeCount = 0;
+    const uint32_t* kernelPrimes = engine.kernelPrimes(&kernelPrimeCount);
+    uint64_t sieveUs = 0;
+maxPrimeMapValue = ff::runPullScheduler(cfg, r.devs, budgets, g,
+                                             kernelPrimes, kernelPrimeCount,
+                                             hostMap.data(), &sieveUs);
+    double sieveMs = elapsedMs(t_sieve);
+    dumpPhaseTimer("sieve phase", sieveMs);
+    if (maxPrimeMapValue == 0) {
+        std::fprintf(stderr, "[ff_sieve] sieve failed\n");
+        return 1;
+    }
+
+    // --dump-map: write prime map to file and exit before search
+    if (!dumpMapFile.empty()) {
+        FILE* f = std::fopen(dumpMapFile.c_str(), "wb");
+        if (!f) {
+            std::fprintf(stderr,
+                         "[ff_sieve] ERROR: cannot open %s for writing\n",
+                         dumpMapFile.c_str());
+            return 1;
+        }
+        std::fwrite(hostMap.data(), 1, mapBytes, f);
+        std::fclose(f);
+        std::fprintf(stderr,
+                     "[ff_sieve] dump-map: wrote %s (%llu bytes)\n",
+                     dumpMapFile.c_str(),
+                     static_cast<unsigned long long>(mapBytes));
+        return 0;
+    }
+
+    // Create GpuPrime
+    GpuPrime prime(hostMap.data(), maxPrimeMapValue);
+
+    // Compute header values (matching reference Prime constructor)
+    uint64_t maxGeneratedPrime = g.maxGeneratedPrime;
+    double xlogx = (double)maxGeneratedPrime / std::log((double)maxGeneratedPrime);
+    uint32_t numPrimesRequested = (uint32_t)(xlogx + 1.2762 * xlogx / std::log((double)maxGeneratedPrime));
+    uint64_t estimatedMaxPrime = (uint64_t)numPrimesRequested * ((uint64_t)(std::log((double)numPrimesRequested)) + (uint64_t)(std::log((double)std::log((double)numPrimesRequested))));
+    if (maxPrimeMapValue < estimatedMaxPrime) maxPrimeMapValue = estimatedMaxPrime;
+    uint64_t primeMapSize = (maxPrimeMapValue + 15) >> 4;
+    uint64_t requestedPrimesSize = sizeof(uint32_t) * numPrimesRequested;
+    uint64_t totalBytes = requestedPrimesSize + primeMapSize;
+    uint64_t sqrtLimit = isqrt64(maxPrimeMapValue);
+
+    // Print headers (stdout, byte-exact)
+    std::cout << "maxPrimeMapValue " << maxPrimeMapValue
+              << " numPrimesRequested " << numPrimesRequested
+              << " totalBytes " << totalBytes << std::endl;
+    std::cout << "maxPrimeMapValue " << maxPrimeMapValue
+              << " numPrimesRequested " << numPrimesRequested
+              << " sqrtLimit " << sqrtLimit << std::endl;
+
+    // ---- GPU search path (budget-gated) ----
+    auto t_search = std::chrono::steady_clock::now();
+    {
+        uint64_t numOddSums = (g.sumLimit - g.sumStart) / 2 + 1;
+        uint64_t recordBytes = numOddSums * sizeof(GpuRecord);
+        uint64_t searchWorkspace = ff::searchWorkspaceBytes(g.sumLimit);
+
+        // GPU only activated with --gpu-search and not suppressed by --no-gpu.
+        // Default path (no flags) uses CPU search.
+        bool useGpu = (!cfg.noGpu && cfg.gpuSearch);
+        int gpuDeviceIndex = -1;
+        ffdev::DevHandle dPrimeMap, dRecords, dAtomic;
+
+        if (useGpu && ffdev::DevInit() == 0) {
+            for (int di = 0; di < (int)r.devs.size(); ++di) {
+                if (r.devs[di].freeBytes >= mapBytes + recordBytes) {
+                    gpuDeviceIndex = di;
+                    std::fprintf(stderr,
+                        "[ff_sieve] GPU search: device[%d] %s — "
+                        "budget OK: map %llu B + records %llu B <= free %llu B "
+                        "(host workspace: %llu B)\n",
+                        di, r.devs[di].name,
+                        static_cast<unsigned long long>(mapBytes),
+                        static_cast<unsigned long long>(recordBytes),
+                        static_cast<unsigned long long>(r.devs[di].freeBytes),
+                        static_cast<unsigned long long>(searchWorkspace));
+                    break;
+                }
+            }
+            if (!useGpu) {
+                std::fprintf(stderr,
+                    "[ff_sieve] GPU search: no device has enough free VRAM "
+                    "for map(%llu B) + records(%llu B) = %llu B\n",
+                    static_cast<unsigned long long>(mapBytes),
+                    static_cast<unsigned long long>(recordBytes),
+                    static_cast<unsigned long long>(mapBytes + recordBytes));
+            }
+        } else {
+            std::fprintf(stderr,
+                "[ff_sieve] GPU search: DevInit failed, using CPU fallback\n");
+        }
+
+        if (useGpu) {
+            if (ffdev::DevAlloc(gpuDeviceIndex, mapBytes, &dPrimeMap) != 0 ||
+                ffdev::DevAlloc(gpuDeviceIndex, recordBytes, &dRecords) != 0 ||
+                ffdev::DevAlloc(gpuDeviceIndex, sizeof(uint32_t), &dAtomic) != 0) {
+                std::fprintf(stderr,
+                    "[ff_sieve] GPU search: device allocation failed, using CPU fallback\n");
+                useGpu = false;
+            }
+        }
+
+        if (useGpu) {
+            // Zero-init atomic counter
+            uint32_t hAtomicCount = 0;
+            ffdev::DevCopy(&dAtomic, &hAtomicCount, sizeof(uint32_t),
+                           ffdev::DevCopyDir::H2D);
+
+            // Copy host prime map to device
+            ffdev::DevCopy(&dPrimeMap, hostMap.data(), mapBytes,
+                           ffdev::DevCopyDir::H2D);
+
+            // Launch GPU search
+            int launchRet = GpuSearchLaunch(
+                r.devs[gpuDeviceIndex].runtimeIndex,
+                static_cast<const uint8_t*>(dPrimeMap.ptr),
+                maxPrimeMapValue,
+                g.sumStart, g.sumLimit,
+                static_cast<GpuRecord*>(dRecords.ptr),
+                static_cast<uint32_t*>(dAtomic.ptr));
+
+            if (launchRet == 0) {
+                // Copy atomic count back
+                ffdev::DevCopy(&dAtomic, &hAtomicCount, sizeof(uint32_t),
+                               ffdev::DevCopyDir::D2H);
+
+                // Copy records back
+                std::vector<GpuRecord> hRecords(hAtomicCount);
+                if (hAtomicCount > 0) {
+                    ffdev::DevCopy(&dRecords, hRecords.data(),
+                                   hAtomicCount * sizeof(GpuRecord),
+                                   ffdev::DevCopyDir::D2H);
+                }
+
+                // Format output (stdout, byte-exact)
+                std::cout.flush();
+                auto t1 = std::chrono::high_resolution_clock::now();
+                GpuSearchEmit(prime, hRecords.data(), hAtomicCount);
+                auto t2 = std::chrono::high_resolution_clock::now();
+
+                // Free device memory
+                ffdev::DevFree(&dRecords);
+                ffdev::DevFree(&dAtomic);
+                ffdev::DevFree(&dPrimeMap);
+
+                // Print timing (stdout, byte-exact)
+                uint64_t searchUs = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
+                std::cout << "Prime time: " << sieveUs << " \u03bcs" << std::endl;
+                std::cout << "Freudenthal time: " << searchUs << " \u03bcs" << std::endl;
+
+                return 0;
+            } else {
+                std::fprintf(stderr,
+                    "[ff_sieve] GPU search: launch failed (ret=%d), using CPU fallback\n",
+                    launchRet);
+                useGpu = false;
+            }
+        }
+
+        // Free device memory on any failure path
+        if (dPrimeMap.ptr) ffdev::DevFree(&dPrimeMap);
+        if (dRecords.ptr)  ffdev::DevFree(&dRecords);
+        if (dAtomic.ptr)   ffdev::DevFree(&dAtomic);
+
+        // CPU fallback
+        auto t1 = std::chrono::high_resolution_clock::now();
+        int count = 0;
+        uint32_t smallPrimeCount = 0;
+        const uint32_t* smallPrimes = engine.getSmallPrimes(&smallPrimeCount);
+        RunIt(prime, g.sumStart, g.sumLimit, g.productLimit, smallPrimes, smallPrimeCount, count);
+        auto t2 = std::chrono::high_resolution_clock::now();
+
+        // Print timing (stdout, byte-exact) - μ is UTF-8 micro sign.
+        // sieveUs is the M2 pull scheduler's wall time (thread spawn through
+        // assembly); verify.sh normalizes any digit run to N.
+        uint64_t searchUs = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
+        std::cout << "Prime time: " << sieveUs << " \u03bcs" << std::endl;
+        std::cout << "Freudenthal time: " << searchUs << " \u03bcs" << std::endl;
+    }
+    double searchMs = elapsedMs(t_search);
+    dumpPhaseTimer("search phase", searchMs);
+
     return 0;
 }
 
@@ -260,12 +541,23 @@ int runLeg(const ff::Config& cfg, const std::vector<std::string>& positionals)
 
 int main(int argc, char** argv)
 {
-    ff::Config cfg;
-    if (ff::loadEnv(&cfg) != 0) return 1;
-    std::vector<std::string> positionals;
-    if (ff::parseArgs(argc, argv, &cfg, &positionals) != 0) return 1;
-    if (ff::validateConfig(&cfg) != 0) return 1;
-    if (cfg.listDevices) return runListDevices();
-    if (positionals.empty()) return ff_smoke_main();   // no-args = todo-4 smoke
-    return runLeg(cfg, positionals);
+    auto t0 = std::chrono::steady_clock::now();
+    int ret = 0;
+    {
+        ff::Config cfg;
+        if (ff::loadEnv(&cfg) != 0) { ret = 1; goto done; }
+        if (ff::loadPullWeights(&cfg) != 0) { ret = 1; goto done; }
+        std::vector<std::string> positionals;
+        if (ff::parseArgs(argc, argv, &cfg, &positionals) != 0) { ret = 1; goto done; }
+        if (ff::validateConfig(&cfg) != 0) { ret = 1; goto done; }
+        if (cfg.listDevices) { ret = runListDevices(); goto done; }
+        if (positionals.empty()) { ret = ff_smoke_main(); goto done; }
+        ret = runLeg(cfg, positionals);
+    }
+done:
+    {
+        double totalMs = elapsedMs(t0);
+        std::fprintf(stderr, "ff_sieve timing: total = %.3f ms\n", totalMs);
+    }
+    return ret;
 }
