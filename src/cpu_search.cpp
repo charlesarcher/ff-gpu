@@ -389,7 +389,7 @@ static void ProcessRange(const ThreadWork& w) {
 
 void RunIt(const GpuPrime& prime, uint64_t sumStart, uint64_t sumLimit, uint64_t productLimit,
            const uint32_t* smallPrimes, uint32_t smallPrimeCount, int& countOut) {
-    int threadCount = 20;
+    int threadCount = 31;
     const char* envThreads = std::getenv("FF_THREADS");
     if (envThreads) {
         int v = std::atoi(envThreads);
