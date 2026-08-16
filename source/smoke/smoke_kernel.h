@@ -4,7 +4,7 @@
 // process (M0 dual-runtime smoke, plan todo 4). Todo 7's real
 // SieveSlabKernel extends this exact pattern.
 //
-// The two compile paths (see Makefile) are:
+// The two compile paths (see CMakeLists.txt's per-arch hipcc commands) are:
 //   AMD:    /opt/rocm/bin/hipcc -I/opt/rocm/include -DSIEVE_KERNEL_ARCH=gfx1201
 //   NVIDIA: HIP_PLATFORM=nvidia /opt/rocm/bin/hipcc -x cu -arch=sm_120 \
 //             -I/opt/rocm/include -DSIEVE_KERNEL_ARCH=sm_120

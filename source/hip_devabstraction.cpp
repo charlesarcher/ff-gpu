@@ -16,7 +16,7 @@
 #include <cstdio>
 #include <cstring>
 
-#include "../smoke/smoke_kernel.h"
+#include "smoke/smoke_kernel.h"
 #include "devabstraction.h"
 
 namespace {

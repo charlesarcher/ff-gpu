@@ -13,7 +13,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 REF_BIN="$ROOT/reference/ff_seg"
-NEW_BIN="$ROOT/ff_sieve"
+NEW_BIN="$ROOT/build/ff_sieve"
 CSV="$ROOT/scripts/bench_results.csv"
 
 declare -A EXPECTED=(

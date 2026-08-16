@@ -40,7 +40,7 @@ fail=0
 for prog in $PROGS; do
   bin="$REF/$prog"
   if [[ ! -x "$bin" ]]; then
-    echo "ERROR: reference binary not found/executable: $bin (run 'make -f Makefile.reference' first)" >&2
+    echo "ERROR: reference binary not found/executable: $bin (run 'cmake --build --preset dev' first)" >&2
     fail=1
     continue
   fi

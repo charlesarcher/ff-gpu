@@ -18,7 +18,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 REF_BIN="$ROOT/reference/ff_seg"
-NEW_BIN="$ROOT/ff_sieve"
+NEW_BIN="$ROOT/build/ff_sieve"
 CSV="$ROOT/scripts/bench_full_results.csv"
 REPORT="$ROOT/scripts/bench_full_report.md"
 TIMEOUT_SEC=600  # Per-run timeout (10 min)
@@ -42,9 +42,8 @@ declare -a CONFIGS=(
 mkdir -p "$ROOT/run"
 
 echo "=== BUILD ==="
-make -f Makefile.reference 2>&1 | tail -3
+cmake --build --preset dev 2>&1 | tail -3
 [[ -x "$REF_BIN" ]] || { echo "ERROR: $REF_BIN missing"; exit 1; }
-make 2>&1 | tail -3
 [[ -x "$NEW_BIN" ]] || { echo "ERROR: $NEW_BIN missing"; exit 1; }
 echo "Both binaries OK."
 

@@ -3,7 +3,7 @@
 #
 # Usage:  ./scripts/m0_bench.sh
 #
-# Builds the benchmark binary (make bench) if not up-to-date,
+# Builds the benchmark binary (cmake --build --preset dev --target m0_bench) if not up-to-date,
 # runs it, prints results to STDERR, persists JSON to config/m0-benchmarks.json.
 # All benchmark data goes to STDERR; this script exits 0 on success.
 
@@ -16,7 +16,7 @@ cd "${PROJECT_ROOT}"
 
 # Build the benchmark binary.
 echo "[m0_bench] building benchmark binary..." >&2
-make bench >&2
+cmake --build --preset dev --target m0_bench >&2
 
 BENCH="./build/m0_bench"
 if [ ! -x "${BENCH}" ]; then

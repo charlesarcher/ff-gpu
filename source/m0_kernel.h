@@ -4,8 +4,9 @@
 //   M0_BW_SEQ_<arch>:  sequential write with index-based pattern (no RMW)
 //
 // Both kernels write 4 bytes per element, measuring raw memory write bandwidth.
-// Uses SIEVE_KERNEL_ARCH (set via -D in the Makefile) to drive the per-arch
-// kernel symbol rename, sharing the same compile-time mechanism as smoke_kernel.h.
+// Uses SIEVE_KERNEL_ARCH (set via -D in CMakeLists.txt's per-arch hipcc
+// commands) to drive the per-arch kernel symbol rename, sharing the same
+// compile-time mechanism as smoke_kernel.h.
 
 #ifndef FF_M0_KERNEL_H
 #define FF_M0_KERNEL_H

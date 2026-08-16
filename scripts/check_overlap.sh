@@ -11,7 +11,7 @@ mkdir -p run
 
 echo "[check_overlap] running ff_sieve 5 2097152 with --host-tier-cap=16GiB"
 # HIP_VISIBLE_DEVICES=1 forces NVIDIA-only (AMD ROCm JIT compilation is extremely slow on this system)
-HIP_VISIBLE_DEVICES=1 ./ff_sieve 5 2097152 --host-tier-cap=16GiB 2>"$LOGFILE" &
+HIP_VISIBLE_DEVICES=1 ./build/ff_sieve 5 2097152 --host-tier-cap=16GiB 2>"$LOGFILE" &
 PID=$!
 
 # Wait for completion (with 20min timeout for large runs)

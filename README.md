@@ -35,33 +35,34 @@ This project implements a heterogeneous GPU-accelerated prime search pipeline:
 - **Compiler**: g++ (C++17)
 - **NVIDIA**: CUDA 12.8+ (tested with 13.3)
 - **AMD**: ROCm 6.4+ (tested with 7.2.4)
-- **Build**: Make
+- **Build**: CMake 3.28+ (tested with 4.4.2), Ninja
 
 ### Build Commands
 
 ```bash
-# Build reference programs (CPU-only)
-make -f Makefile.reference
+# Configure + build everything (GPU binary, tests, reference programs)
+cmake --preset dev
+cmake --build --preset dev
 
-# Build GPU binary
-make
+# Run the test suite (CTest)
+ctest --preset dev
 ```
 
 ## Usage
 
 ```bash
 # Run with GPU sieve + CPU search (default)
-./ff_sieve 5 2097152
+./build/ff_sieve 5 2097152
 
 # Run with GPU sieve + GPU search (experimental)
-./ff_sieve --gpu-search 5 2097152
+./build/ff_sieve --gpu-search 5 2097152
 
 # Run with specific device only
-./ff_sieve --devices=nvidia 5 2097152
-./ff_sieve --devices=amd 5 1048576  # AMD cannot handle 2M
+./build/ff_sieve --devices=nvidia 5 2097152
+./build/ff_sieve --devices=amd 5 1048576  # AMD cannot handle 2M
 
 # List available devices
-./ff_sieve --list-devices
+./build/ff_sieve --list-devices
 ```
 
 ### CLI Options
@@ -107,30 +108,33 @@ make
 
 ```
 ff-gpu/
-├── src/                    # Source code
+├── source/                # Source code
 │   ├── main.cpp           # Entry point, CLI parsing
 │   ├── config.cpp         # Configuration parsing
 │   ├── cpu_search.cpp     # Multi-threaded CPU search
 │   ├── gpu_prime.h        # GpuPrime API
 │   ├── sieve_slab_engine.cpp  # GPU sieve engine
+│   ├── smoke/             # Dual-arch smoke kernel (AMD + NVIDIA TUs)
 │   └── m4/                # GPU search (M4)
 │       ├── gpu_search_kernel.h    # GPU Freudenthal kernel
 │       ├── gpu_search_launcher.cpp
 │       └── gpu_search_emission.cpp
-├── tests/                  # Unit tests
+├── test/source/           # Unit tests
 │   ├── m4_kernel_unit.cpp
-│   └── m4_order.cpp
-├── scripts/                # Benchmark & validation
+│   ├── m4_order.cpp
+│   ├── slab_cmp.cpp
+│   └── abstraction_smoke.cpp
+├── scripts/               # Benchmark & validation
 │   ├── bench_full.sh      # Comprehensive benchmark
 │   ├── verify.sh          # Golden file verification
 │   └── m0_bench.sh        # M0 bandwidth benchmark
-├── goldens/                # Golden files (byte-exact contract)
-├── reference/              # Reference CPU programs
+├── goldens/               # Golden files (byte-exact contract)
+├── reference/             # Reference CPU programs
 │   ├── ff_seg             # Original segmentedSieve binary
 │   ├── pen                # Alternative wheel-sieve
 │   └── pen2               # Alternative wheel-sieve v2
-├── Makefile                # Main build
-├── Makefile.reference      # Reference program build
+├── CMakeLists.txt         # Main build (CMake 3.28+)
+├── CMakePresets.json      # Shared presets
 └── README.md
 ```
 
@@ -153,10 +157,10 @@ Output:
 bash scripts/verify.sh --self-test
 
 # All legs (CPU search)
-bash scripts/verify.sh ./ff_sieve --all-legs
+bash scripts/verify.sh ./build/ff_sieve --all-legs
 
 # All legs (GPU search)
-bash scripts/verify.sh ./ff_sieve --all-legs --gpu-search
+bash scripts/verify.sh ./build/ff_sieve --all-legs --gpu-search
 ```
 
 ## Known Issues
@@ -172,7 +176,7 @@ The GPU search kernel produces incorrect results at small legs (~20% correct). W
 
 **Root Cause**: `factors[]` stack allocation (4096 × 8 bytes = 32 KB) may exceed LDS limits on AMD RDNA4.
 
-**Fix**: Reduce `MAX_FACTORS` from 4096 to 256 in `src/m4/gpu_search_kernel.h`.
+**Fix**: Reduce `MAX_FACTORS` from 4096 to 256 in `source/m4/gpu_search_kernel.h`.
 
 ### 2. AMD RX 9070 XT Deep-Idle Hang (MEDIUM)
 

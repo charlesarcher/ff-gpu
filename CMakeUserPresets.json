@@ -1,0 +1,48 @@
+{
+  "version": 2,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 28,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "flags-ff-gpu",
+      "description": "Faithful port of Makefile host flags (-O2 -Wall, no -DNDEBUG)",
+      "hidden": true,
+      "cacheVariables": {
+        "CMAKE_CXX_FLAGS": "-O2 -Wall"
+      }
+    },
+    {
+      "name": "dev",
+      "binaryDir": "${sourceDir}/build",
+      "generator": "Ninja",
+      "inherits": ["dev-mode", "flags-ff-gpu"],
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "dev",
+      "configurePreset": "dev",
+      "jobs": 32
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "dev",
+      "configurePreset": "dev",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "jobs": 32,
+        "noTestsAction": "error"
+      }
+    }
+  ]
+}

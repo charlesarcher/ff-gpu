@@ -13,7 +13,7 @@
 //      lines with prime-map metadata; the GPU kernel does not).
 //   7. Diff the two files.  Must be identical.
 //
-// Build: make m4 && ./tests/m4_order
+// Build: cmake --build --preset dev --target m4_order_bin && ./build/test/m4_order_bin
 //
 // NOTE: This test is linked with BOTH per-arch M4 host+kernel objects and
 // DevAbstraction so it can discover and use whichever GPU is available.
