@@ -80,13 +80,20 @@ static bool cpu_IsPrime(uint64_t n, const uint8_t* primeMap, uint64_t maxPrimeMa
 
 // ---- CPU small-prime sieve ----
 
-static uint64_t cpu_isqrt64(uint64_t x) {
-    if (x == 0) return 0;
-    uint64_t r = (uint64_t)1 << 31;
-    while (r * r > x) r >>= 1;
-    uint64_t next = (r + x / r) >> 1;
-    if (next < r) r = next;
-    return r;
+// Integer square root of a 64-bit value.
+// Bit-by-bit long-division port of the reference isqrt64 (segmentedSieve.C:37-52).
+static uint64_t cpu_isqrt64(uint64_t arg) {
+    uint64_t result = 0, bitsToShift = 8 * sizeof(uint64_t), testValue = 0;
+    do {
+        testValue = (testValue << 2) | (arg >> (bitsToShift -= 2) & 3);
+        result <<= 1;
+        uint64_t divisor = result << 1;
+        if (divisor < testValue) {
+            result |= 1;
+            testValue -= divisor | 1;
+        }
+    } while (bitsToShift);
+    return result;
 }
 
 static std::vector<uint32_t> cpu_generateSmallPrimes(uint64_t limit) {
@@ -114,7 +121,7 @@ static uint64_t cpu_AllButOneProductOfTermPairsOfSumOfFactorPairsHasSingleFactor
     uint32_t power2, uint64_t oddProduct,
     const uint8_t* primeMap, uint64_t maxPrimeMapValue)
 {
-    uint32_t primeIndex = 1,
+    uint32_t compositePrime = 3, // cursor: last prime taken from the prime list (reference primes[primeIndex])
              primeFactor = 3,
              numFactors = 0,
              numPendingFactors = 0,
@@ -128,7 +135,7 @@ static uint64_t cpu_AllButOneProductOfTermPairsOfSumOfFactorPairsHasSingleFactor
     uint64_t factors[256]; // CPU test only needs small factor lists
     factors[0] = ((uint64_t)1 << power2);
     if (factors[0] <= factorLimit)
-        numMultipleFactorPairs += !(cpu_IsPrime(factors[0] + oddProduct - 2, primeMap, maxPrimeMapValue));
+        numMultipleFactorPairs += !(cpu_IsPrime(factors[numFactors++] + oddProduct - 2, primeMap, maxPrimeMapValue));
 
     for (;;) {
         if (temp * primeFactor == testProduct) {
@@ -160,9 +167,12 @@ static uint64_t cpu_AllButOneProductOfTermPairsOfSumOfFactorPairsHasSingleFactor
                 primeFactor = (uint32_t)testProduct;
                 temp = 1;
             } else {
-                primeFactor = (uint32_t)(testFactor + 2);
-                while (!cpu_IsPrime(primeFactor, primeMap, maxPrimeMapValue))
-                    primeFactor += 2;
+                // Advance through the prime list in order (reference: primeFactor = primes[++primeIndex]),
+                // independent of testFactor, which accumulates prime powers in the if-branch.
+                compositePrime += 2;
+                while (!cpu_IsPrime(compositePrime, primeMap, maxPrimeMapValue))
+                    compositePrime += 2;
+                primeFactor = compositePrime;
                 if (primeFactor > factorLimit) break;
                 temp = testProduct / primeFactor;
             }
@@ -188,6 +198,14 @@ static bool cpu_DoesPeterKnow(
 }
 
 static bool cpu_DoesSammyKnow(uint64_t sum, const uint8_t* primeMap, uint64_t maxPrimeMapValue) {
+    // Reference RunIt filter (segmentedSieve.C:797), mirrored by the GPU kernel's skipSum:
+    // skip odd sums where sum-2 is prime (single factor pair), or where sum == 3*sumDiv3
+    // and sumDiv3 is composite.
+    uint64_t sumDiv3 = sum / 3;
+    if ((sum & 1) && (cpu_IsPrime(sum - 2, primeMap, maxPrimeMapValue) ||
+        (sum == 3 * sumDiv3 && !cpu_IsPrime(sumDiv3, primeMap, maxPrimeMapValue))))
+        return false;
+
     uint32_t numValid = 0;
     uint64_t termA = 0, termB = 0;
     bool termsFound = false;

@@ -30,7 +30,7 @@
 
 // ---- Constants ----
 
-#define MAX_FACTORS                4096
+#define MAX_FACTORS                256
 #define MAX_COMP_MAX_POWER2        64
 
 // ---- GpuRecord: one solution per record slot (host-visible) ----
@@ -47,14 +47,20 @@ typedef struct {
 
 #ifdef SIEVE_KERNEL_ARCH
 
-// Integer square root of a 64-bit value (Newton's method, integer only).
-__device__ static uint64_t dev_isqrt64(uint64_t x) {
-    if (x == 0) return 0;
-    uint64_t r = (uint64_t)1 << 31;
-    while (r * r > x) r >>= 1;
-    uint64_t next = (r + x / r) >> 1;
-    if (next < r) r = next;
-    return r;
+// Integer square root of a 64-bit value.
+// Bit-by-bit long-division port of the reference isqrt64 (segmentedSieve.C:37-52).
+__device__ static uint64_t dev_isqrt64(uint64_t arg) {
+    uint64_t result = 0, bitsToShift = 8 * sizeof(uint64_t), testValue = 0;
+    do {
+        testValue = (testValue << 2) | (arg >> (bitsToShift -= 2) & 3);
+        result <<= 1;
+        uint64_t divisor = result << 1;
+        if (divisor < testValue) {
+            result |= 1;
+            testValue -= divisor | 1;
+        }
+    } while (bitsToShift);
+    return result;
 }
 
 // Power-of-2 test: (-x & x) == x iff x is a power of 2 and x > 0.
@@ -133,6 +139,7 @@ __device__ static bool dev_AllButOneProductOfTermPairsOfSumOfFactorPairsHasSingl
     const uint8_t* __restrict__ primeMap, uint64_t maxPrimeMapValue)
 {
     uint32_t primeFactor = 3,
+             compositePrime = 3, // cursor: last prime taken from the prime list (reference primes[primeIndex])
              numFactors = 0,
              numPendingFactors = 0,
              numMultipleFactorPairs = 0;
@@ -146,7 +153,7 @@ __device__ static bool dev_AllButOneProductOfTermPairsOfSumOfFactorPairsHasSingl
     factors[0] = ((uint64_t)1 << power2);
     if (factors[0] <= factorLimit)
         numMultipleFactorPairs += !dev_ProductOfTermPairsHasSingleFactorPair(
-            factors[0] + oddProduct, primeMap, maxPrimeMapValue);
+            factors[numFactors++] + oddProduct, primeMap, maxPrimeMapValue);
 
     for (;;) {
         if (temp * primeFactor == testProduct) {
@@ -182,9 +189,12 @@ __device__ static bool dev_AllButOneProductOfTermPairsOfSumOfFactorPairsHasSingl
                 primeFactor = (uint32_t)testProduct;
                 temp = 1;
             } else {
-                primeFactor = (uint32_t)(testFactor + 2);
-                while (!dev_IsPrime(primeFactor, primeMap, maxPrimeMapValue))
-                    primeFactor += 2;
+                // Advance through the prime list in order (reference: primeFactor = primes[++primeIndex]),
+                // independent of testFactor, which accumulates prime powers in the if-branch.
+                compositePrime += 2;
+                while (!dev_IsPrime(compositePrime, primeMap, maxPrimeMapValue))
+                    compositePrime += 2;
+                primeFactor = compositePrime;
                 if (primeFactor > factorLimit) break;
                 temp = testProduct / primeFactor;
             }
@@ -232,7 +242,6 @@ __global__ void SEARCH_KERNEL(
     uint64_t sum = sumStart + (uint64_t)tidx * 2;
 
     // Thread-local storage.
-    uint64_t factors[MAX_FACTORS];
     uint32_t compositePower2[MAX_COMP_MAX_POWER2];
     uint32_t numComposite = 0;
     uint32_t numValid = 0;

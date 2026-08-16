@@ -206,6 +206,7 @@ int main(int /*argc*/, char** /*argv*/) {
     std::fflush(stdout);
 
     std::printf("\n--- GPU search output (first 20 lines) ---\n");
+    std::fflush(stdout); // send header to the terminal before stdout is redirected to the file
     const char* gpuOutputFile = "/home/archerc/Downloads/ff-gpu/gpu_search_output_65536.txt";
 
     {
@@ -225,6 +226,10 @@ int main(int /*argc*/, char** /*argv*/) {
         close(fd);
         // GpuSearchEmit writes to stdout, which now goes to the file.
         GpuSearchEmit(*h_gpuPrime, h_records.data(), h_atomicCount);
+        // Reference emission ends with the timing footer (segmentedSieve.C:877);
+        // goldens store it normalized to "N" (verify.sh NORM_SED), so emit the same shape.
+        std::printf("Prime time: N \u03bcs\nFreudenthal time: N \u03bcs\n");
+        std::fflush(stdout); // flush the user-space buffer so ALL emitted lines reach the file before stdout is restored
         fsync(STDOUT_FILENO);
         dup2(savedFd, STDOUT_FILENO);
         close(savedFd);
