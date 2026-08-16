@@ -415,33 +415,60 @@ maxPrimeMapValue = ff::runPullScheduler(cfg, r.devs, budgets, g,
         int gpuDeviceIndex = -1;
         ffdev::DevHandle dPrimeMap, dRecords, dAtomic;
 
-        if (useGpu && ffdev::DevInit() == 0) {
-            for (int di = 0; di < (int)r.devs.size(); ++di) {
-                if (r.devs[di].freeBytes >= mapBytes + recordBytes) {
-                    gpuDeviceIndex = di;
+        if (useGpu) {
+            if (ffdev::DevInit() == 0) {
+                // M4 search-participation gate (plan todo 3): a device must be
+                // able to hold the map + record slots + per-thread factors[]
+                // workspace within its budgeted VRAM. The budget (min of the
+                // vram-fraction share and FF_VRAM_BUDGET) is the gate, so a
+                // small budget cap forces CPU fallback even when the raw
+                // freeBytes would fit.
+                uint64_t requiredBytes =
+                    mapBytes + recordBytes + searchWorkspace;
+                for (int di = 0; di < (int)r.devs.size(); ++di) {
+                    if (budgets[di].budget >= requiredBytes) {
+                        gpuDeviceIndex = di;
+                        std::fprintf(stderr,
+                            "[ff_sieve] GPU search: device[%d] %s — "
+                            "budget OK: map %llu B + records %llu B + "
+                            "workspace %llu B <= budget %llu B\n",
+                            di, r.devs[di].name,
+                            static_cast<unsigned long long>(mapBytes),
+                            static_cast<unsigned long long>(recordBytes),
+                            static_cast<unsigned long long>(searchWorkspace),
+                            static_cast<unsigned long long>(
+                                budgets[di].budget));
+                        break;
+                    }
+                }
+                if (gpuDeviceIndex < 0) {
+                    // No device qualifies. Never reach DevAlloc with a stale
+                    // index: print the rejection and degrade to CPU search.
                     std::fprintf(stderr,
-                        "[ff_sieve] GPU search: device[%d] %s — "
-                        "budget OK: map %llu B + records %llu B <= free %llu B "
-                        "(host workspace: %llu B)\n",
-                        di, r.devs[di].name,
+                        "[ff_sieve] GPU search: ERROR: insufficient VRAM for "
+                        "GPU search. Need %llu B (map=%llu + records=%llu + "
+                        "workspace=%llu), device budgets: ",
+                        static_cast<unsigned long long>(requiredBytes),
                         static_cast<unsigned long long>(mapBytes),
                         static_cast<unsigned long long>(recordBytes),
-                        static_cast<unsigned long long>(r.devs[di].freeBytes),
                         static_cast<unsigned long long>(searchWorkspace));
-                    break;
+                    for (size_t di = 0; di < budgets.size(); ++di) {
+                        if (di > 0) std::fprintf(stderr, ", ");
+                        std::fprintf(stderr, "%llu B",
+                            static_cast<unsigned long long>(
+                                budgets[di].budget));
+                    }
+                    std::fprintf(stderr, ". Falling back to CPU search.\n");
+                    useGpu = false;
                 }
-            }
-            if (!useGpu) {
+            } else {
+                // Only reachable when GPU search was actually requested
+                // (useGpu is false on the default CPU path, which skips this
+                // whole block and prints nothing here).
                 std::fprintf(stderr,
-                    "[ff_sieve] GPU search: no device has enough free VRAM "
-                    "for map(%llu B) + records(%llu B) = %llu B\n",
-                    static_cast<unsigned long long>(mapBytes),
-                    static_cast<unsigned long long>(recordBytes),
-                    static_cast<unsigned long long>(mapBytes + recordBytes));
+                    "[ff_sieve] GPU search: DevInit failed, using CPU fallback\n");
+                useGpu = false;
             }
-        } else {
-            std::fprintf(stderr,
-                "[ff_sieve] GPU search: DevInit failed, using CPU fallback\n");
         }
 
         if (useGpu) {
