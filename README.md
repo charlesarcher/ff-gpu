@@ -8,9 +8,9 @@ This project implements a heterogeneous GPU-accelerated prime search pipeline:
 
 1. **GPU Sieve**: Fast prime number sieve on GPU (RTX 5090 + RX 9070 XT)
 2. **CPU Search**: Multi-threaded Freudenthal search (31 threads, byte-identical to reference)
-3. **GPU Search**: GPU-accelerated Freudenthal search (experimental, works at 2M)
+3. **GPU Search**: GPU-accelerated Freudenthal search (byte-identical on all legs)
 
-**Status**: Production-ready CPU search + GPU sieve. GPU search has correctness issues at small legs.
+**Status**: Production-ready. GPU sieve + CPU search is the default path; GPU search is fully functional and byte-identical to the CPU reference on all 6 benchmark legs.
 
 ## Architecture
 
@@ -25,59 +25,222 @@ This project implements a heterogeneous GPU-accelerated prime search pipeline:
 │  CPU Search (correct, multi-threaded, 31 threads)            │
 │  └── FreudenthalThreads pattern from segmentedSieve.C        │
 ├─────────────────────────────────────────────────────────────┤
-│  GPU Search (experimental)                                   │
+│  GPU Search (byte-identical to CPU reference)                │
 │  └── GPU Freudenthal kernel with sum-indexed slots           │
 └─────────────────────────────────────────────────────────────┘
 ```
 
+Both GPU vendors are compiled into **one** binary: per-arch object files are built with `hipcc` (HIP for AMD, CUDA backend for NVIDIA) and linked alongside the host code, so a single process runs both runtimes side by side.
+
 ## Build Requirements
 
-- **Compiler**: g++ (C++17)
-- **NVIDIA**: CUDA 12.8+ (tested with 13.3)
-- **AMD**: ROCm 6.4+ (tested with 7.2.4)
-- **Build**: CMake 3.28+ (tested with 4.4.2), Ninja
+| Component | Requirement | Tested |
+|-----------|-------------|--------|
+| Host compiler | g++ with C++17 | GCC 16.2.1 |
+| Build system | CMake ≥ 3.28, Ninja | CMake 4.4.2, Ninja 1.13.2 |
+| NVIDIA | CUDA ≥ 12.8 | 13.3 (`/usr/local/cuda`) |
+| AMD | ROCm ≥ 6.4 | 7.2.4 (`/opt/rocm`) |
+| GPU targets | NVIDIA `sm_120`, AMD `gfx1201` | RTX 5090, RX 9070 XT |
 
-### Build Commands
+The NVIDIA side is compiled through `hipcc`'s CUDA backend (`-x cu -arch=sm_120`), which delegates to the installed `nvcc`; it does not need `nvcc` directly.
+
+## Building
+
+### Quick start
 
 ```bash
-# Configure + build everything (GPU binary, tests, reference programs)
+# Configure (writes build/ with compile_commands.json)
 cmake --preset dev
-cmake --build --preset dev
 
-# Run the test suite (CTest)
-ctest --preset dev
+# Build everything (GPU binary, tests, reference programs)
+cmake --build --preset dev
 ```
 
-## Usage
+The `dev` preset (defined in `CMakeUserPresets.json`):
+
+- Uses the **Ninja** generator and `build/` as the binary directory
+- Host flags: `-O2 -Wall` (faithful port of the original Makefile flags, **no** `-DNDEBUG`, so assertions stay live)
+- Enables developer mode (`ff-gpu_DEVELOPER_MODE=ON`), which builds the CTest suite
+- Exports `build/compile_commands.json` for clangd/editor tooling
+
+### What gets built
+
+| Binary | Path | Description |
+|--------|------|-------------|
+| `ff_sieve` | `build/ff_sieve` | Main GPU program |
+| `m0_bench` | `build/m0_bench` | M0 memory-bandwidth benchmark |
+| `ff_seg`, `pen`, `pen2` | `reference/` | CPU reference programs (golden source) |
+| `abstraction_smoke` | `build/test/abstraction_smoke` | Dual-runtime smoke test |
+| `ff_budget_selftest` | `build/test/ff_budget_selftest` | Pure-host budget/geometry test |
+| `slab_cmp` | `build/test/slab_cmp` | Slab-kernel CPU-vs-GPU comparison |
+| `m4_kernel_unit_bin` | `build/test/m4_kernel_unit_bin` | M4 kernel unit test |
+| `m4_order_bin` | `build/test/m4_order_bin` | M4 output-order vs-golden test |
+
+### Building individual targets
 
 ```bash
-# Run with GPU sieve + CPU search (default)
+cmake --build --preset dev --target ff_sieve      # main binary only
+cmake --build --preset dev --target m4_order_bin  # one test
+cmake --build --preset dev --target ff_seg        # one reference program
+```
+
+### Customizing the build
+
+Pass extra cache variables on the configure command line (they persist in `build/CMakeCache.txt`):
+
+```bash
+cmake --preset dev -DCMAKE_CXX_FLAGS="-O2 -Wall -g"   # add debug info
+cmake --preset dev -DCMAKE_BUILD_TYPE=Release          # if you want NDEBUG-style release
+```
+
+Note: the Makefile port intentionally leaves `CMAKE_BUILD_TYPE` empty so the original `-O2 -Wall` (asserts enabled) semantics are preserved.
+
+### Clean rebuild
+
+```bash
+rm -rf build && cmake --preset dev && cmake --build --preset dev
+```
+
+The build directory is fully self-contained; `rm -rf build` is always safe.
+
+### Hard-coded toolchain paths
+
+The build assumes these fixed locations (mirroring the original Makefile):
+
+- `/opt/rocm/bin/hipcc` — the `hipcc` compiler driver for both vendor sides
+- `/opt/rocm/include` — ROCm headers
+- `/usr/local/cuda/lib64` — CUDA runtime library (for `-lcudart`)
+- `/opt/rocm/lib` — ROCm runtime library (for `-lamdhip64`)
+
+If your toolchain lives elsewhere, edit the paths in `CMakeLists.txt` (the AMD/NVIDIA custom-command blocks and the `FF_GPU_RUNTIME_LIBS` link directories).
+
+## Testing
+
+Run the full suite with CTest:
+
+```bash
+ctest --preset dev          # all 5 tests, parallel
+```
+
+Run one test, or get verbose output on failure:
+
+```bash
+ctest --preset dev -R slab_cmp
+ctest --preset dev --output-on-failure
+```
+
+### Test descriptions
+
+| Test | Verifies | Notes |
+|------|----------|-------|
+| `abstraction_smoke` | Both CUDA and ROCm runtimes initialize and run a trivial kernel in one process | Fast (~0.5 s) |
+| `ff_budget_selftest` | Pure-host budget/geometry/VRAM-capping logic | No GPU runtimes linked |
+| `slab_cmp` | Slab sieve kernel: CPU vs GPU output per slab | **5/10 pass** — see Known Issues |
+| `m4_kernel_unit_bin` | M4 GPU search kernel unit behavior | Slow (~16 s) |
+| `m4_order_bin` | M4 GPU-search emission vs reference `ff_seg` goldens, byte-identical | Slow (~8 s) |
+
+Expected result: **4/5 tests pass**; `slab_cmp` is a known pre-existing failure (see [Known Issues](#known-issues)).
+
+## Running `ff_sieve`
+
+```
+ff_sieve [options] <sumStart> <sumLimit>
+```
+
+- `<sumStart>`, `<sumLimit>` — search range for prime sums (default: `5 65535`). The reference benchmark legs are 65536, 131072, 262144, 524288, 1048576, 2097152.
+
+### Examples
+
+```bash
+# Default: GPU sieve + CPU search (production path), full 2M leg
 ./build/ff_sieve 5 2097152
 
-# Run with GPU sieve + GPU search (experimental)
+# GPU sieve + GPU search (experimental, byte-identical)
 ./build/ff_sieve --gpu-search 5 2097152
 
-# Run with specific device only
+# Restrict to one GPU vendor
 ./build/ff_sieve --devices=nvidia 5 2097152
-./build/ff_sieve --devices=amd 5 1048576  # AMD cannot handle 2M
+./build/ff_sieve --devices=amd 5 1048576     # AMD cannot handle 2M (VRAM)
 
-# List available devices
+# CPU-only (no GPU sieve, no GPU search)
+./build/ff_sieve --no-gpu 5 65536
+
+# List detected GPUs and exit
 ./build/ff_sieve --list-devices
 ```
 
-### CLI Options
+### CLI options
 
 | Option | Description |
 |--------|-------------|
-| `sumStart sumLimit` | Search range (default: 5 65535) |
-| `--gpu-search` | Enable GPU search (experimental) |
-| `--devices=<backend>` | Filter devices: `nvidia`, `amd`, or comma-separated |
-| `--list-devices` | List detected GPUs |
-| `--vram-fraction=<0.90>` | Fraction of free VRAM to use |
-| `--host-tier-cap=<bytes>` | Host pinned memory for spill (e.g., `8GiB`) |
-| `FF_THREADS=<n>` | CPU search threads (default: 31, max: hardware_concurrency) |
-| `HIP_VISIBLE_DEVICES=""` | Disable AMD GPU (workaround for deep-idle hang) |
-| `FF_DISABLE_DEVICE=amd` | Runtime disable AMD device |
+| `sumStart sumLimit` | Search range (positional; default `5 65535`) |
+| `--gpu-search` | Use GPU search instead of CPU search |
+| `--no-gpu` | Disable all GPU work (CPU-only mode) |
+| `--devices=<amd\|nvidia>` | Restrict GPU participation to one vendor |
+| `--list-devices` | Print detected GPUs and exit |
+| `--vram-fraction=<0.10–1.0>` | Fraction of each GPU's free VRAM used for the sieve (default 0.90) |
+| `--device-vram-fraction=<spec>` | Per-device fractions, e.g. `amd=0.9,nvidia=0.8` |
+| `--vram-budget=<size>` | Hard cap on total VRAM used, e.g. `20GiB` or bytes |
+| `--scratch=<size>` | Host scratch buffer size, e.g. `4GiB` |
+| `--slab-size=<size>` | Sieve slab size in bytes (must be 8-value aligned) |
+| `--host-tier-cap=<size\|auto>` | Host pinned-memory cap for the overflow tier (e.g. `8GiB`); `auto` resolves from system RAM |
+| `--no-host-tier` | Force-disable the host overflow tier |
+| `--dump-map=<file>` | Dump the prime map to a binary file (used by verification) |
+
+Sizes accept suffixes like `KiB`/`MiB`/`GiB` or raw byte counts.
+
+### Environment variables
+
+| Variable | Effect |
+|----------|--------|
+| `FF_THREADS=<n>` | CPU search thread count (default 31; max = `hardware_concurrency`) |
+| `FF_DISABLE_DEVICE=amd\|nvidia` | Remove a vendor at startup (diagnostics still print) |
+| `HIP_VISIBLE_DEVICES=""` | Disable the AMD GPU entirely (workaround for the deep-idle hang, see Known Issues) |
+
+## Verification
+
+### Golden-file verification (`scripts/verify.sh`)
+
+The committed `goldens/` files are the byte-exact contract: `ff_sieve` output must match them for every leg, in both search modes.
+
+```bash
+# Harness self-test (checks the diff tooling itself; no binary needed)
+bash scripts/verify.sh --self-test
+
+# All 6 legs, CPU search (default) — the production path
+bash scripts/verify.sh ./build/ff_sieve --all-legs
+
+# All 6 legs, GPU search
+bash scripts/verify.sh ./build/ff_sieve --all-legs --gpu-search
+
+# Single leg, one device
+bash scripts/verify.sh ./build/ff_sieve 1048576 --devices amd
+```
+
+Usage: `verify.sh [<gpu_bin>] [<limit>] [--all-legs] [--gpu-search] [--devices <backend>] [--self-test]`. It checks solution counts, byte-identical stdout against `goldens/out_ff_seg_<leg>.txt`, and (with `--dump-map`) the prime-map sha256 against the CPU reference.
+
+### Regenerating goldens (`scripts/regenerate_goldens.sh`)
+
+Rebuilds the 18 golden files from the vendored, untouched reference sources:
+
+```bash
+cmake --build --preset dev --target ff_seg pen pen2   # ensure reference binaries
+bash scripts/regenerate_goldens.sh
+```
+
+Only run this when the *reference* behavior legitimately changes — regenerated goldens are the new contract.
+
+### Benchmarks
+
+| Script | What it does | Output |
+|--------|--------------|--------|
+| `scripts/bench.sh` | Reference vs new binary across modes × legs | `scripts/bench_results.csv` |
+| `scripts/bench_full.sh` | Comprehensive GPU-vs-CPU sweep | `bench_full_results.csv`, `bench_full_report.md` |
+| `scripts/bench_per_device.sh` | Per-device: CPU vs each GPU, CPU-search vs GPU-search | `bench_per_device_results.csv`, `bench_per_device_report.md` |
+| `scripts/bench_resume.sh` | Run only the remaining unfinished legs and append to `bench_results.csv` | `bench_results.csv` |
+| `scripts/m0_bench.sh` | M0 memory-bandwidth benchmark (write/H2D/D2H per GPU) | `config/m0-benchmarks.json` |
+| `scripts/check_overlap.sh` | Overlap-engine verification (host-tier spill overlap) | console diagnostics |
+| `scripts/check_pull_balance.sh` | Weighted-pull balance checker | console diagnostics |
 
 ## Performance
 
@@ -100,8 +263,8 @@ ctest --preset dev
 ### Notes
 
 - **GPU+CPU**: GPU sieve + CPU search (production path)
-- **GPU All**: GPU sieve + GPU search (experimental, broken at small legs)
-- **AMD limitation**: Cannot handle 2M leg (VRAM insufficient)
+- **GPU All**: GPU sieve + GPU search (fully functional; correctness verified)
+- **AMD limitation**: Cannot handle the 2M leg (VRAM insufficient)
 - **AMD workaround**: Use `HIP_VISIBLE_DEVICES=""` to disable AMD
 
 ## Project Structure
@@ -110,7 +273,7 @@ ctest --preset dev
 ff-gpu/
 ├── source/                # Source code
 │   ├── main.cpp           # Entry point, CLI parsing
-│   ├── config.cpp         # Configuration parsing
+│   ├── config.cpp         # Configuration parsing & validation
 │   ├── cpu_search.cpp     # Multi-threaded CPU search
 │   ├── gpu_prime.h        # GpuPrime API
 │   ├── sieve_slab_engine.cpp  # GPU sieve engine
@@ -134,49 +297,18 @@ ff-gpu/
 │   ├── pen                # Alternative wheel-sieve
 │   └── pen2               # Alternative wheel-sieve v2
 ├── CMakeLists.txt         # Main build (CMake 3.28+)
-├── CMakePresets.json      # Shared presets
+├── CMakePresets.json      # Shared presets (dev-mode, CI)
+├── CMakeUserPresets.json  # Local dev preset (Ninja, -O2 -Wall, build/)
 └── README.md
 ```
 
-## Verification
-
-### Run Benchmarks
-
-```bash
-bash scripts/bench_full.sh
-```
-
-Output:
-- `scripts/bench_full_results.csv` - Raw benchmark data
-- `scripts/bench_full_report.md` - Formatted report
-
-### Verify Correctness
-
-```bash
-# Self-test (harness validation)
-bash scripts/verify.sh --self-test
-
-# All legs (CPU search)
-bash scripts/verify.sh ./build/ff_sieve --all-legs
-
-# All legs (GPU search)
-bash scripts/verify.sh ./build/ff_sieve --all-legs --gpu-search
-```
+Build outputs land in `build/` (fully gitignored); reference binaries stay in `reference/`.
 
 ## Known Issues
 
-### 1. GPU Search Correctness (HIGH PRIORITY)
+### 1. `slab_cmp` test fails 5/10 (pre-existing GPU kernel bug)
 
-The GPU search kernel produces incorrect results at small legs (~20% correct). Works at 2M.
-
-**Symptoms**:
-- 65K: 476/2357 solutions (20.2%)
-- 131K-1M: ~20% correct
-- 2M: 100% correct
-
-**Root Cause**: `factors[]` stack allocation (4096 × 8 bytes = 32 KB) may exceed LDS limits on AMD RDNA4.
-
-**Fix**: Reduce `MAX_FACTORS` from 4096 to 256 in `source/m4/gpu_search_kernel.h`.
+The slab sieve kernel produces incorrect results for **non-aligned or truncated segments** (a segment whose start is not a slab boundary, or whose length is not a whole number of sub-blocks). The CPU/GPU comparison test `slab_cmp` fails 5 of its 10 cases; the aligned cases pass. The failure predates the CMake migration — it reproduces identically with the original Makefile build and does not affect normal `ff_sieve` operation (the production path always uses aligned slabs).
 
 ### 2. AMD RX 9070 XT Deep-Idle Hang (MEDIUM)
 
