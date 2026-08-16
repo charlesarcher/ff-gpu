@@ -1,0 +1,7 @@
+{
+  "devices": [
+    {"name": "AMD Radeon RX 9070 XT", "vendor": "amd", "writeBandwidthGbs": 598.75, "h2dBandwidthGbs": 28.61, "d2hBandwidthGbs": 27.99},
+    {"name": "NVIDIA GeForce RTX 5090", "vendor": "nvidia", "writeBandwidthGbs": 1656.10, "h2dBandwidthGbs": 24.82, "d2hBandwidthGbs": 26.35}
+  ],
+  "weightRatio": 2.77
+}
