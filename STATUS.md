@@ -82,24 +82,6 @@ This is a GPU port of the Freudenthal prime-search program (`segmentedSieve.C`).
 - Layer 3: Function isolation (replace `dev_AllButOne...` with CPU reference)
 - Layer 4: Binary search on kernel (reduce to single sum evaluation)
 
-### 2. AMD RX 9070 XT Deep-Idle Behavior (INVESTIGATING)
-
-**Status**: Under investigation.
-
-**Symptoms**:
-- AMD GPU may hang during initialization on systems where the GPU enters deep idle state
-- May be a ROCm/KFD driver issue, hardware-specific issue, or configuration problem
-
-**Workaround** (if needed):
-```bash
-FF_DISABLE_DEVICE=amd  # Disables AMD at runtime, keeps NVIDIA functional
-```
-
-**Note**: This has NOT been confirmed as a universal AMD bug. Investigation ongoing to determine if it's:
-- A ROCm/KFD driver issue with deep idle power management
-- A hardware-specific issue with this RX 9070 XT unit
-- A missing kernel parameter or ROCm configuration
-
 ### 3. GPU vs CPU Performance (LOW PRIORITY)
 
 **Status**: GPU split model (sieve only) is slower than CPU reference.
@@ -150,7 +132,7 @@ FF_DISABLE_DEVICE=amd  # Disables AMD at runtime, keeps NVIDIA functional
 2. **Test on both architectures** (AMD + NVIDIA)
 3. **Validate at all 6 legs** with corrected kernel
 4. **Re-benchmark** with fixed GPU search
-5. **Address AMD hang** if production use is desired
+5. **Benchmark GPU search** to validate performance improvement
 
 ## Benchmark Recurrence
 

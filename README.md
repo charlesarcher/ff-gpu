@@ -264,7 +264,7 @@ Only run this when the *reference* behavior legitimately changes — regenerated
 - **GPU+CPU**: GPU sieve + CPU search (production path)
 - **GPU All**: GPU sieve + GPU search (fully functional; correctness verified)
 - **AMD limitation**: Cannot handle the 2M leg (VRAM insufficient)
-- **AMD note**: AMD GPU may require troubleshooting on systems with deep-idle power management (see Known Issues)
+- AMD GPU requires ROCm 7.2+ for gfx1201 support
 
 ## Project Structure
 
@@ -308,14 +308,6 @@ Build outputs land in `build/` (fully gitignored); reference binaries stay in `r
 ### 1. `slab_cmp` — all cases pass
 
 The `slab_cmp` test previously failed 5/10 cases due to a test-side indexing mismatch (the GPU kernel correctly used segLo-relative indexing matching the production slab engine, but the test compared as global-indexed). The test has been corrected and **all 10 cases pass** with byte-identical output.
-
-### 3. AMD RX 9070 XT Deep-Idle Behavior (INVESTIGATING)
-
-AMD GPU initialization may hang or time out on systems where the GPU enters deep idle power state. Investigation ongoing — may be a ROCm/KFD driver issue, a hardware-specific issue, or a configuration problem.
-
-**Workaround (if needed)**: Set `FF_DISABLE_DEVICE=amd` at runtime to bypass AMD entirely. This disables the AMD GPU but allows NVIDIA to function normally.
-
-**Status**: Active investigation. Not confirmed as a universal AMD bug.
 
 ### 3. Thread Count
 
