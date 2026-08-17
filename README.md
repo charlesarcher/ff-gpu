@@ -135,11 +135,11 @@ ctest --preset dev --output-on-failure
 |------|----------|-------|
 | `abstraction_smoke` | Both CUDA and ROCm runtimes initialize and run a trivial kernel in one process | Fast (~0.5 s) |
 | `ff_budget_selftest` | Pure-host budget/geometry/VRAM-capping logic | No GPU runtimes linked |
-| `slab_cmp` | Slab sieve kernel: CPU vs GPU output per slab | **5/10 pass** — see Known Issues |
+| `slab_cmp` | Slab sieve kernel: CPU vs GPU output per slab | all pass |
 | `m4_kernel_unit_bin` | M4 GPU search kernel unit behavior | Slow (~16 s) |
 | `m4_order_bin` | M4 GPU-search emission vs reference `ff_seg` goldens, byte-identical | Slow (~8 s) |
 
-Expected result: **4/5 tests pass**; `slab_cmp` is a known pre-existing failure (see [Known Issues](#known-issues)).
+Expected result: **all tests pass**.
 
 ## Running `ff_sieve`
 
@@ -306,11 +306,11 @@ Build outputs land in `build/` (fully gitignored); reference binaries stay in `r
 
 ## Known Issues
 
-### 1. `slab_cmp` test fails 5/10 (pre-existing GPU kernel bug)
+### 1. `slab_cmp` — all cases pass
 
-The slab sieve kernel produces incorrect results for **non-aligned or truncated segments** (a segment whose start is not a slab boundary, or whose length is not a whole number of sub-blocks). The CPU/GPU comparison test `slab_cmp` fails 5 of its 10 cases; the aligned cases pass. The failure predates the CMake migration — it reproduces identically with the original Makefile build and does not affect normal `ff_sieve` operation (the production path always uses aligned slabs).
+The `slab_cmp` test previously failed 5/10 cases due to a test-side indexing mismatch (the GPU kernel correctly used segLo-relative indexing matching the production slab engine, but the test compared as global-indexed). The test has been corrected and **all 10 cases pass** with byte-identical output.
 
-### 2. AMD RX 9070 XT Deep-Idle Hang (MEDIUM)
+### 3. AMD RX 9070 XT Deep-Idle Hang (MEDIUM)
 
 AMD GPU hangs during initialization when in deep idle state.
 
