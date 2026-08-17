@@ -139,6 +139,11 @@ int main(int /*argc*/, char** /*argv*/) {
     uint32_t h_atomicCount = 0;
     CHECK(ffdev::DevCopy(&dhAtomicCount, &h_atomicCount, sizeof(uint32_t), ffdev::DevCopyDir::H2D));
 
+    // --- 7b. Zero-fill records on device: the kernel writes sum-indexed
+    // slots, so unsolved slots must read zero after the host copy-back. ---
+    std::vector<GpuRecord> h_records(numOddSums);
+    CHECK(ffdev::DevCopy(&dhRecords, h_records.data(), recordSize, ffdev::DevCopyDir::H2D));
+
     // --- 8. Resolve kernel launch function ---
     SearchKernelRunFn launchFn = SearchKernelGetLaunchFn_gfx1201(0);
     if (!launchFn) launchFn = SearchKernelGetLaunchFn_sm_120(0);
@@ -172,34 +177,33 @@ int main(int /*argc*/, char** /*argv*/) {
     CHECK(ffdev::DevCopy(&dhAtomicCount, &h_atomicCount, sizeof(uint32_t), ffdev::DevCopyDir::D2H));
     std::printf("  Kernel results: %u valid Freudenthal sums\n", h_atomicCount);
 
-    std::vector<GpuRecord> h_records(numOddSums);
-    for (uint64_t i = 0; i < numOddSums; ++i) {
-        h_records[i].sum = 0;
-        h_records[i].low = 0;
-        h_records[i].high = 0;
-        h_records[i].tag = 0;
-    }
     CHECK(ffdev::DevCopy(&dhRecords, h_records.data(), recordSize, ffdev::DevCopyDir::D2H));
 
-    // --- 11. Sort records by sum (atomicAdd doesn't guarantee sum order) ---
-    std::sort(h_records.begin(), h_records.begin() + h_atomicCount,
-        [](const GpuRecord& a, const GpuRecord& b) { return a.sum < b.sum; });
+    // --- 11. Sum-indexed slots: solved slots are in ascending-sum order,
+    // so emission needs no sort.  Verify that property on the raw records. ---
 
     // --- 11b. Verify ascending slot order ---
     std::printf("\n--- Slot-order verification ---\n");
-    for (uint32_t i = 1; i < h_atomicCount; ++i) {
-        if (h_records[i].sum <= h_records[i - 1].sum) {
-            std::printf("  ORDER VIOLATION: slot %u (sum=%u) <= slot %u (sum=%u)\n",
-                        i, (unsigned)h_records[i].sum,
-                        i - 1, (unsigned)h_records[i - 1].sum);
-            ffdev::DevFree(&dhRecords);
-            ffdev::DevFree(&dhAtomicCount);
-            ffdev::DevFree(&dhPrimeMap);
-            delete h_gpuPrime;
-            return 1;
+    {
+        uint64_t prevSum = 0;
+        uint32_t seen = 0;
+        for (uint32_t i = 0; i < (uint32_t)numOddSums; ++i) {
+            if (h_records[i].sum == 0) continue;   // unsolved slot
+            ++seen;
+            if (seen > 1 && h_records[i].sum <= prevSum) {
+                std::printf("  ORDER VIOLATION: slot %u (sum=%u) <= previous (sum=%llu)\n",
+                            i, (unsigned)h_records[i].sum,
+                            (unsigned long long)prevSum);
+                ffdev::DevFree(&dhRecords);
+                ffdev::DevFree(&dhAtomicCount);
+                ffdev::DevFree(&dhPrimeMap);
+                delete h_gpuPrime;
+                return 1;
+            }
+            prevSum = h_records[i].sum;
         }
+        std::printf("  Slot order: OK (%u records, strictly ascending sum)\n", seen);
     }
-    std::printf("  Slot order: OK (%u records, strictly ascending sum)\n", h_atomicCount);
 
     // --- 12. Format and print via GpuSearchEmit ---
     // Flush any pending stdout so diagnostics don't leak into the output file.
@@ -225,7 +229,7 @@ int main(int /*argc*/, char** /*argv*/) {
         dup2(fd, STDOUT_FILENO);
         close(fd);
         // GpuSearchEmit writes to stdout, which now goes to the file.
-        GpuSearchEmit(*h_gpuPrime, h_records.data(), h_atomicCount);
+        GpuSearchEmit(*h_gpuPrime, h_records.data(), (uint32_t)numOddSums);
         // Reference emission ends with the timing footer (segmentedSieve.C:877);
         // goldens store it normalized to "N" (verify.sh NORM_SED), so emit the same shape.
         std::printf("Prime time: N \u03bcs\nFreudenthal time: N \u03bcs\n");

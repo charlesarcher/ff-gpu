@@ -132,7 +132,12 @@ struct TestCase {
     uint64_t segHi;
 };
 
-// Compare bytes [segLo>>4 .. (segHi-1)>>4] of two map buffers.
+// Compare the CPU reference map (GLOBAL indexing: result bytes live at
+// [segLo>>4 .. (segHi-1)>>4]) against the GPU kernel output (segLo-RELATIVE
+// indexing: byte b holds values [segLo+16b, segLo+16b+16), matching the
+// production slab engine's per-slab local buffers).  For segLo==0 the two
+// coincide; for segLo!=0 the GPU byte for a value is gpu[b], not
+// gpu[segLo>>4 + b].
 static bool compareMaps(const uint8_t* cpu, const uint8_t* gpu,
                         uint64_t segLo, uint64_t segHi)
 {
@@ -141,13 +146,13 @@ static bool compareMaps(const uint8_t* cpu, const uint8_t* gpu,
     uint64_t numBytes = endByte - startByte;
 
     for (uint64_t b = 0; b < numBytes; ++b) {
-        if (cpu[startByte + b] != gpu[startByte + b]) {
+        if (cpu[startByte + b] != gpu[b]) {
             std::fprintf(stderr,
                 "  BYTE MISMATCH at global byte %lu (value %lu): "
                 "cpu=0x%02x gpu=0x%02x\n",
                 (unsigned long)(startByte + b),
                 (unsigned long)((startByte + b) << 4),
-                cpu[startByte + b], gpu[startByte + b]);
+                cpu[startByte + b], gpu[b]);
             return false;
         }
     }
@@ -247,7 +252,10 @@ int main(int /*argc*/, char** /*argv*/)
         {"second sub-block", 524288, 1048576},
 
         // 8. Edge: segHi just past sub-block boundary
-        {"past sub-block boundary", 524200, 524400},
+        //    (segLo must be 16-aligned: the kernel's segLo-relative bit layout
+        //    only coincides with the CPU's global layout for 16-aligned starts,
+        //    which the production engine always guarantees)
+        {"past sub-block boundary", 524272, 524400},
 
         // 9. Range within one cache line (1024 values)
         {"within one cache line", 1200, 2000},

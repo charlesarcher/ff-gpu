@@ -117,9 +117,14 @@ run_one_leg() {
   local devarg=()
   [[ -n "$DEVICES" ]] && devarg=(--devices "$DEVICES")
 
+  # Forward --gpu-search so the M4 mode is actually exercised (it gates the
+  # binary's GPU-search path; without it the harness silently runs CPU search).
+  local searcharg=()
+  [[ $GPU_SEARCH -eq 1 ]] && searcharg=(--gpu-search)
+
   # Capture + assert rc. Diagnostics from the GPU binary go to stderr only.
   local rc=0
-  "$bin" "${devarg[@]}" "${PASSTHROUGH[@]}" 5 "$leg" > "$RAW_CAP" 2> "$ERR_LOG" || rc=$?
+  "$bin" "${devarg[@]}" "${searcharg[@]}" "${PASSTHROUGH[@]}" 5 "$leg" > "$RAW_CAP" 2> "$ERR_LOG" || rc=$?
   if [[ $rc -ne 0 ]]; then
     echo "FAIL leg $leg: '$bin' exited rc=$rc (see $ERR_LOG)" >&2
     sed -n '1,10p' "$ERR_LOG" >&2

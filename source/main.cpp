@@ -487,13 +487,23 @@ maxPrimeMapValue = ff::runPullScheduler(cfg, r.devs, budgets, g,
             ffdev::DevCopy(&dAtomic, &hAtomicCount, sizeof(uint32_t),
                            ffdev::DevCopyDir::H2D);
 
+            // Zero-fill the records buffer: the kernel writes one
+            // sum-indexed slot per odd sum, so unsolved slots must read
+            // zero on the host copy-back for deterministic emission.
+            std::vector<GpuRecord> hRecords(numOddSums);
+            ffdev::DevCopy(&dRecords, hRecords.data(), recordBytes,
+                           ffdev::DevCopyDir::H2D);
+
             // Copy host prime map to device
             ffdev::DevCopy(&dPrimeMap, hostMap.data(), mapBytes,
                            ffdev::DevCopyDir::H2D);
 
-            // Launch GPU search
+            // Launch GPU search.  Dispatch by vendor: both runtimes number
+            // their devices from 0, so an index-only launcher would pick the
+            // wrong arch (page fault when the selected device != allocator).
             int launchRet = GpuSearchLaunch(
                 r.devs[gpuDeviceIndex].runtimeIndex,
+                r.devs[gpuDeviceIndex].vendor,
                 static_cast<const uint8_t*>(dPrimeMap.ptr),
                 maxPrimeMapValue,
                 g.sumStart, g.sumLimit,
@@ -505,18 +515,15 @@ maxPrimeMapValue = ff::runPullScheduler(cfg, r.devs, budgets, g,
                 ffdev::DevCopy(&dAtomic, &hAtomicCount, sizeof(uint32_t),
                                ffdev::DevCopyDir::D2H);
 
-                // Copy records back
-                std::vector<GpuRecord> hRecords(hAtomicCount);
-                if (hAtomicCount > 0) {
-                    ffdev::DevCopy(&dRecords, hRecords.data(),
-                                   hAtomicCount * sizeof(GpuRecord),
-                                   ffdev::DevCopyDir::D2H);
-                }
+                // Copy the full sum-indexed record array back
+                ffdev::DevCopy(&dRecords, hRecords.data(), recordBytes,
+                               ffdev::DevCopyDir::D2H);
 
                 // Format output (stdout, byte-exact)
                 std::cout.flush();
                 auto t1 = std::chrono::high_resolution_clock::now();
-                GpuSearchEmit(prime, hRecords.data(), hAtomicCount);
+                GpuSearchEmit(prime, hRecords.data(),
+                              static_cast<uint32_t>(numOddSums));
                 auto t2 = std::chrono::high_resolution_clock::now();
 
                 // Free device memory

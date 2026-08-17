@@ -89,6 +89,18 @@ set(
 
 set(AMD_OBJECTS "")
 
+# Project headers each per-arch source includes — without these in DEPENDS,
+# editing a kernel header silently leaves stale arch objects linked in.
+set(
+    AMD_SRC_HEADERS
+    source/smoke/smoke_kernel.h
+    source/devabstraction.h
+    source/m0_kernel.h
+    source/m4/gpu_search_kernel.h
+    source/sieve_slab_kernel.h
+    source/sieve_slab_engine.h
+)
+
 foreach(amd_src IN LISTS AMD_SOURCES)
     get_filename_component(amd_stem "${amd_src}" NAME_WE)
     set(amd_obj "${CMAKE_CURRENT_BINARY_DIR}/amd_objs/${amd_stem}_gfx1201.o")
@@ -100,7 +112,9 @@ foreach(amd_src IN LISTS AMD_SOURCES)
             "-I${PROJECT_SOURCE_DIR}/source"
             -DSIEVE_KERNEL_ARCH=gfx1201
             -c "${PROJECT_SOURCE_DIR}/${amd_src}" -o "${amd_obj}"
-        DEPENDS "${PROJECT_SOURCE_DIR}/${amd_src}"
+        DEPENDS
+            "${PROJECT_SOURCE_DIR}/${amd_src}"
+            ${AMD_SRC_HEADERS}
         COMMENT "hipcc (AMD, gfx1201): ${amd_src}"
     )
     list(APPEND AMD_OBJECTS "${amd_obj}")
@@ -145,7 +159,9 @@ foreach(nv_src IN LISTS NV_SOURCES)
             "-I${PROJECT_SOURCE_DIR}/source"
             -DSIEVE_KERNEL_ARCH=sm_120 -x cu -arch=sm_120
             -c "${PROJECT_SOURCE_DIR}/${nv_src}" -o "${nv_obj}"
-        DEPENDS "${PROJECT_SOURCE_DIR}/${nv_src}"
+        DEPENDS
+            "${PROJECT_SOURCE_DIR}/${nv_src}"
+            ${AMD_SRC_HEADERS}
         COMMENT "hipcc (NVIDIA, sm_120): ${nv_src}"
     )
     list(APPEND NV_OBJECTS "${nv_obj}")

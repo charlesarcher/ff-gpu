@@ -56,9 +56,11 @@ extern "C" int SIEVE_SLAB_RUN_NAME(int deviceIndex,
 // segLo/segHi:  value-range [segLo, segHi).  segLo is assumed byte-aligned
 //               (multiple of 16) for the test harness.
 // h_out:        host buffer the caller pre-allocates to ((segHi+15)>>4) bytes.
-//               On return, bytes [segLo>>4 .. (segHi-1)>>4] contain the
-//               sieve result (all other bytes are 0xff except [0]=0x7f if
-//               segLo==0).
+//               On return, bytes [0 .. ((segHi-segLo)+15)>>4) hold the sieve
+//               result for values [segLo, segHi) using segLo-RELATIVE indexing
+//               (byte b = values [segLo+16b, segLo+16b+16)), matching the
+//               production slab engine's per-slab local buffers.  Bytes beyond
+//               that stay 0xff, except [0]=0x7f (value 1 cleared) if segLo==0.
 //
 // Returns 0 on success, -1 on any HIP error.
 extern "C" int SIEVE_SLAB_RUN_NAME(int deviceIndex,

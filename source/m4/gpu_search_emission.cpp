@@ -5,13 +5,13 @@
 // Three public functions:
 //   PrintOutputTags     — prints the suffix tag for a single term
 //   FormatGpuSearchResult — formats one GpuRecord as a single line
-//   GpuSearchEmit       — scans a record array and prints all results in order
+//   GpuSearchEmit       — scans a sum-indexed record array and prints results
 //
-// The slot-scan is strictly ascending by sum (no sort, no reordering). The
-// atomic counter in the kernel ensures records are written into slot 0, 1, 2,
-// ... in the order they are discovered, and since each thread handles one
-// odd sum in its assigned range, the per-slot sum values are monotonically
-// increasing with slot index.
+// The kernel writes each solution to the sum-indexed slot (sum-sumStart)/2,
+// so slot order IS ascending-sum order (no sort, no reordering).  Unsolved
+// slots read zero; GpuSearchEmit skips them while numbering the printed
+// solutions 1..N.  The caller passes the SLOT count (numOddSums), not the
+// solution count.
 
 #include "m4/gpu_search_kernel.h"
 #include "gpu_prime.h"
@@ -81,13 +81,17 @@ void FormatGpuSearchResult(const GpuPrime& prime, uint32_t count,
 // ================================================================
 // GpuSearchEmit
 //
-// Scans a GpuRecord array in slot order (ascending by sum) and prints each
-// record. No sorting, no reordering — slot 0 has the smallest sum, slot 1
-// the next, etc.
+// Scans the sum-indexed GpuRecord array in ascending slot order and prints
+// each non-zero slot (1-based ordinal).  Unsolved slots (zero-filled before
+// launch) are skipped.  slotCount = (sumLimit - sumStart)/2 + 1.
 // ================================================================
 
-void GpuSearchEmit(const GpuPrime& prime, const GpuRecord* records, uint32_t count) {
-    for (uint32_t i = 0; i < count; ++i) {
-        FormatGpuSearchResult(prime, i + 1, records[i]);
+void GpuSearchEmit(const GpuPrime& prime, const GpuRecord* records,
+                   uint32_t slotCount) {
+    uint32_t ordinal = 0;
+    for (uint32_t i = 0; i < slotCount; ++i) {
+        if (records[i].sum == 0) continue;   // unsolved slot
+        ++ordinal;
+        FormatGpuSearchResult(prime, ordinal, records[i]);
     }
 }

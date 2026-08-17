@@ -359,13 +359,16 @@ __global__ void SEARCH_KERNEL(
         uint64_t lo = termA, hi = termB;
         if (lo > hi) { uint64_t tmp = lo; lo = hi; hi = tmp; }
 
-        uint32_t count = atomicAdd(pAtomicCount, 1);
+        atomicAdd(pAtomicCount, 1);
         GpuRecord rec;
         rec.sum = (uint32_t)sum;
         rec.low = lo;
         rec.high = hi;
         rec.tag = 0;
-        pRecords[count] = rec;
+        // Sum-indexed slot: each thread owns slot (sum-sumStart)/2, so slots
+        // are in ascending-sum order — deterministic emission without a sort.
+        // Unsolved slots must read zero (caller zero-fills the buffer first).
+        pRecords[(sum - sumStart) >> 1] = rec;
     }
 }
 

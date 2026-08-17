@@ -26,7 +26,13 @@ extern "C" {
 
 /// Launches the GPU Freudenthal search kernel on the specified device.
 ///
-/// @param deviceIndex          CUDA/HIP device ordinal
+/// @param deviceIndex          runtime device ordinal within the vendor runtime
+/// @param vendor               "amd" or "nvidia" — selects the arch-specific
+///                             kernel (gfx1201 / sm_120).  The runtime index
+///                             alone is ambiguous: both vendor runtimes number
+///                             their devices from 0, so an AMD-first index
+///                             guess would launch the wrong arch's kernel on
+///                             the wrong device (page fault).
 /// @param d_primeMap           Device pointer to the sieve/prime bitmap
 /// @param d_maxPrimeMapValue   Maximum value the primeMap covers
 /// @param d_sumStart           First odd sum to evaluate
@@ -35,6 +41,7 @@ extern "C" {
 /// @param d_pAtomicCount       Device pointer to pre-allocated atomic uint32
 /// @return 0 on success, non-zero on failure
 int GpuSearchLaunch(int deviceIndex,
+                    const char* vendor,
                     const uint8_t* d_primeMap,
                     uint64_t d_maxPrimeMapValue,
                     uint64_t d_sumStart,

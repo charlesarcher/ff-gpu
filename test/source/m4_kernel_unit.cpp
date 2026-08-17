@@ -466,6 +466,12 @@ static int runTest(uint32_t sumStart, uint64_t sumLimit, uint32_t testInterval) 
     uint32_t h_atomicCount = 0;
     CHECK(ffdev::DevCopy(&dhAtomicCount, &h_atomicCount, sizeof(uint32_t), ffdev::DevCopyDir::H2D));
 
+    // 7b. Zero-fill the sum-indexed records buffer on device: the kernel
+    //     writes slot (sum-sumStart)/2, so unsolved slots must read zero
+    //     after the host copy-back.
+    std::vector<GpuRecord> h_records(numOddSums);
+    CHECK(ffdev::DevCopy(&dhRecords, h_records.data(), recordSize, ffdev::DevCopyDir::H2D));
+
     // 8. Resolve kernel launch function.
     SearchKernelRunFn launchFn = SearchKernelGetLaunchFn_gfx1201(0);
     if (!launchFn) launchFn = SearchKernelGetLaunchFn_sm_120(0);
@@ -498,8 +504,7 @@ static int runTest(uint32_t sumStart, uint64_t sumLimit, uint32_t testInterval) 
    CHECK(ffdev::DevCopy(&dhAtomicCount, &h_atomicCount, sizeof(uint32_t), ffdev::DevCopyDir::D2H));
     std::printf("  Kernel results: %u valid sums\n", h_atomicCount);
 
-    // Copy records back.
-    std::vector<GpuRecord> h_records(numOddSums);
+    // Copy records back (full sum-indexed slot array; declared in step 7b).
     CHECK(ffdev::DevCopy(&dhRecords, h_records.data(), recordSize, ffdev::DevCopyDir::D2H));
 
     // 11. Validate against CPU reference for sampled sums.
@@ -511,7 +516,7 @@ static int runTest(uint32_t sumStart, uint64_t sumLimit, uint32_t testInterval) 
         if ((sum - sumStart) % (2 * testInterval) != 0) continue;
         ++nSamples;
 
-        ValidationResult vr = validateSum(sum, (const uint8_t*)dhRecords.ptr, h_atomicCount,
+        ValidationResult vr = validateSum(sum, (const uint8_t*)dhRecords.ptr, (uint32_t)numOddSums,
                                           h_primeMap.data(), maxPrimeMapValue);
 
         if (vr.gpuHasResult && vr.cpuHasResult) {
@@ -548,8 +553,9 @@ static int runTest(uint32_t sumStart, uint64_t sumLimit, uint32_t testInterval) 
     // 12. Also verify GPU-reported counts for all sums.
     //     Count sums where GPU found a result.
     uint32_t gpuFoundCount = 0;
-    for (uint32_t i = 0; i < h_atomicCount; ++i) {
+    for (uint32_t i = 0; i < (uint32_t)numOddSums; ++i) {
         uint64_t sum = h_records[i].sum;
+        if (sum == 0) continue;   // unsolved slot (zero-filled pre-launch)
         if (sum < sumStart || sum > sumLimit) {
             std::printf("  ERROR: record sum %llu out of range [%llu, %llu]\n",
                         (unsigned long long)sum, (unsigned long long)sumStart, (unsigned long long)sumLimit);
@@ -568,7 +574,7 @@ static int runTest(uint32_t sumStart, uint64_t sumLimit, uint32_t testInterval) 
         ++gpuFoundCount;
 
         // Also verify this is a valid Freudenthal result.
-        ValidationResult vr = validateSum(sum, (const uint8_t*)dhRecords.ptr, h_atomicCount,
+        ValidationResult vr = validateSum(sum, (const uint8_t*)dhRecords.ptr, (uint32_t)numOddSums,
                                           h_primeMap.data(), maxPrimeMapValue);
         if (vr.cpuHasResult && !vr.match) {
             ++nMismatch;
