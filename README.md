@@ -195,7 +195,6 @@ Sizes accept suffixes like `KiB`/`MiB`/`GiB` or raw byte counts.
 |----------|--------|
 | `FF_THREADS=<n>` | CPU search thread count (default 31; max = `hardware_concurrency`) |
 | `FF_DISABLE_DEVICE=amd\|nvidia` | Remove a vendor at startup (diagnostics still print) |
-| `HIP_VISIBLE_DEVICES=""` | Disable the AMD GPU entirely (workaround for the deep-idle hang, see Known Issues) |
 
 ## Verification
 
@@ -265,7 +264,7 @@ Only run this when the *reference* behavior legitimately changes — regenerated
 - **GPU+CPU**: GPU sieve + CPU search (production path)
 - **GPU All**: GPU sieve + GPU search (fully functional; correctness verified)
 - **AMD limitation**: Cannot handle the 2M leg (VRAM insufficient)
-- **AMD workaround**: Use `HIP_VISIBLE_DEVICES=""` to disable AMD
+- **AMD note**: AMD GPU may require troubleshooting on systems with deep-idle power management (see Known Issues)
 
 ## Project Structure
 
@@ -310,13 +309,13 @@ Build outputs land in `build/` (fully gitignored); reference binaries stay in `r
 
 The `slab_cmp` test previously failed 5/10 cases due to a test-side indexing mismatch (the GPU kernel correctly used segLo-relative indexing matching the production slab engine, but the test compared as global-indexed). The test has been corrected and **all 10 cases pass** with byte-identical output.
 
-### 3. AMD RX 9070 XT Deep-Idle Hang (MEDIUM)
+### 3. AMD RX 9070 XT Deep-Idle Behavior (INVESTIGATING)
 
-AMD GPU hangs during initialization when in deep idle state.
+AMD GPU initialization may hang or time out on systems where the GPU enters deep idle power state. Investigation ongoing — may be a ROCm/KFD driver issue, a hardware-specific issue, or a configuration problem.
 
-**Workaround**: Use `HIP_VISIBLE_DEVICES=""` or `FF_DISABLE_DEVICE=amd`.
+**Workaround (if needed)**: Set `FF_DISABLE_DEVICE=amd` at runtime to bypass AMD entirely. This disables the AMD GPU but allows NVIDIA to function normally.
 
-**Status**: Known ROCm/KFD driver issue. No fix available.
+**Status**: Active investigation. Not confirmed as a universal AMD bug.
 
 ### 3. Thread Count
 

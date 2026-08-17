@@ -82,35 +82,23 @@ This is a GPU port of the Freudenthal prime-search program (`segmentedSieve.C`).
 - Layer 3: Function isolation (replace `dev_AllButOne...` with CPU reference)
 - Layer 4: Binary search on kernel (reduce to single sum evaluation)
 
-### 2. AMD RX 9070 XT Deep-Idle Hang (MEDIUM PRIORITY)
+### 2. AMD RX 9070 XT Deep-Idle Behavior (INVESTIGATING)
 
-**Status**: Known issue, workaround exists.
+**Status**: Under investigation.
 
 **Symptoms**:
-- AMD GPU enters deep idle state
-- KFD event loop blocks forever (poll never returns)
-- Process hangs during device initialization
+- AMD GPU may hang during initialization on systems where the GPU enters deep idle state
+- May be a ROCm/KFD driver issue, hardware-specific issue, or configuration problem
 
-**Root Cause**:
-- AMD ROCm/KFD driver doesn't respond to HIP runtime events when GPU is in low-power idle
-- Occurs on first device access after idle
-
-**Workaround**:
+**Workaround** (if needed):
 ```bash
-HIP_VISIBLE_DEVICES=""  # Disables HIP enumeration, uses only CUDA
-# OR
-FF_DISABLE_DEVICE=amd   # Runtime device filter
+FF_DISABLE_DEVICE=amd  # Disables AMD at runtime, keeps NVIDIA functional
 ```
 
-**Impact**:
-- Cannot use AMD GPU in production without workaround
-- Affects `gpu_all_9070` and `gpu+cpu_9070` configurations
-
-**Potential Fixes**:
-1. Force AMD GPU out of low-power state before first access
-2. Set `ROCR_VISIBLE_DEVICES` or similar env var
-3. Submit a workitem to ROCm for the KFD driver bug
-4. Use `AMDGPU_FORCE_LOOP_IPOFF=1` or similar kernel parameter
+**Note**: This has NOT been confirmed as a universal AMD bug. Investigation ongoing to determine if it's:
+- A ROCm/KFD driver issue with deep idle power management
+- A hardware-specific issue with this RX 9070 XT unit
+- A missing kernel parameter or ROCm configuration
 
 ### 3. GPU vs CPU Performance (LOW PRIORITY)
 
