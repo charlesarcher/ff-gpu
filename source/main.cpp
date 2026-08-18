@@ -409,9 +409,10 @@ maxPrimeMapValue = ff::runPullScheduler(cfg, r.devs, budgets, g,
         uint64_t recordBytes = numOddSums * sizeof(GpuRecord);
         uint64_t searchWorkspace = ff::searchWorkspaceBytes(g.sumLimit);
 
-        // GPU only activated with --gpu-search and not suppressed by --no-gpu.
-        // Default path (no flags) uses CPU search.
-        bool useGpu = (!cfg.noGpu && cfg.gpuSearch);
+        // GPU search is disabled: CPU search is faster than GPU search.
+        // The GPU sieve still runs (fast), but the Freudenthal search
+        // runs on CPU (31 threads, fits in L3 cache).
+        bool useGpu = false;
         int gpuDeviceIndex = -1;
         ffdev::DevHandle dPrimeMap, dRecords, dAtomic;
 

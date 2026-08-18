@@ -34,7 +34,7 @@ namespace {
 
 constexpr uint64_t SLAB_SIZE_BYTES = 1ull << 30;   // 1 GiB
 constexpr uint32_t kBlockSize = 256;
-constexpr uint64_t kSubBlockSize = 1ull << 19;     // 524288 values
+constexpr uint64_t kSubBlockSize = 1ull << 22;     // 4194304 values (8x baseline)
 constexpr uint32_t kBlocksPerSubBlock = 2;
 
 #define ENGINE_HIP_CHECK(call)                                                 \
