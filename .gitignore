@@ -11,6 +11,7 @@ out.txt
 
 # Reference binaries are build artifacts (built by cmake --preset dev)
 reference/ff_seg
+reference/ff_seg2
 reference/pen
 reference/pen2
 

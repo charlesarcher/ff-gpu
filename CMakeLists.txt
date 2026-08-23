@@ -249,6 +249,7 @@ ff_gpu_setup_binary(m0_bench)
 set(
     REFERENCE_PROGRAMS
     segmentedSieve.C:ff_seg
+    segmentedSieve2.C:ff_seg2
     penultimateBestParallelizedFastFruedenthalYet.C:pen
     penultimateBestParallelizedFastFruedenthalYet2.C:pen2
 )
