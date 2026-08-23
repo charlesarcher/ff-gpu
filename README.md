@@ -256,7 +256,7 @@ Only run this when the *reference* behavior legitimately changes — regenerated
 |--------|--------------|--------|
 | `scripts/bench.sh` | Reference vs new binary across modes × legs | `scripts/bench_results.csv` |
 | `scripts/bench_full.sh` | Comprehensive GPU-vs-CPU sweep | `bench_full_results.csv`, `bench_full_report.md` |
-| `scripts/bench_per_device.sh` | Per-device: CPU vs each GPU, CPU-search vs GPU-search | `bench_per_device_results.csv`, `bench_per_device_report.md` |
+| `scripts/bench_per_device.sh` | **Authoritative sweep** (see `scripts/BENCHMARK_METHODOLOGY.md`): reference vs full-GPU-enablement on each card, with warmups, per-rep raw CSV, correctness asserts, and per-run device-attribution gates | `bench_per_device_results.csv`, `bench_per_device_raw.csv`, `bench_per_device_report.md` |
 | `scripts/bench_resume.sh` | Run only the remaining unfinished legs and append to `bench_results.csv` | `bench_results.csv` |
 | `scripts/m0_bench.sh` | M0 memory-bandwidth benchmark (write/H2D/D2H per GPU) | `config/m0-benchmarks.json` |
 | `scripts/check_overlap.sh` | Overlap-engine verification (host-tier spill overlap) | console diagnostics |
