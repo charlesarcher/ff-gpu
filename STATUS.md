@@ -5,7 +5,11 @@
 This is a GPU port of the Freudenthal prime-search program (`segmentedSieve.C`). The project implements:
 - **GPU sieve**: GPU-accelerated prime number sieve on RTX 5090 + RX 9070 XT
 - **CPU search**: Multi-threaded Freudenthal search (31 threads, same as reference)
-- **GPU search**: GPU-accelerated Freudenthal search (currently broken at small legs)
+- **GPU search**: GPU-accelerated Freudenthal search (byte-identical to reference on ALL legs, both GPUs)
+
+Both GPUs are driven by ONE HIP-only source set compiled twice per arch
+(gfx1201 via HIP_PLATFORM=amd, sm_120 via HIP_PLATFORM=nvidia) — no direct
+CUDA calls anywhere in the tree.
 
 ## Architecture
 
@@ -20,7 +24,7 @@ This is a GPU port of the Freudenthal prime-search program (`segmentedSieve.C`).
 │  CPU Search (correct, multi-threaded, 31 threads)            │
 │  └── FreudenthalThreads pattern from segmentedSieve.C        │
 ├─────────────────────────────────────────────────────────────┤
-│  GPU Search (BROKEN at small legs, works at 2M)              │
+│  GPU Search (byte-identical to CPU reference, all legs)      │
 │  └── GPU Freudenthal kernel with sum-indexed slots           │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -48,41 +52,24 @@ This is a GPU port of the Freudenthal prime-search program (`segmentedSieve.C`).
 
 ### Correctness
 
+Verified 2026-08-23 via `ctest` (5/5) and `scripts/verify.sh --all-legs`
+(byte-exact stdout vs `goldens/out_ff_seg_<leg>.txt`, solution counts
+asserted, plus solution blocks vs `out_pen_*` / `out_pen2_*`):
+
 | Config | 65K | 131K | 262K | 524K | 1M | 2M |
 |--------|-----|------|------|------|----|-----|
-| Original (ff_seg) | YES | YES | YES | YES | YES | YES |
-| GPU+CPU RTX 5090 | YES | YES | YES | YES | YES | YES |
-| GPU+CPU RX 9070 XT | YES | YES | YES | YES | YES | - |
-| GPU All RTX 5090 | NO | NO | NO | NO | NO | YES |
-| GPU All RX 9070 XT | NO | NO | NO | NO | NO | - |
+| GPU+CPU search, NVIDIA only | YES | YES | YES | YES | YES | YES |
+| GPU+CPU search, AMD only | YES | YES | YES | YES | YES | GATE¹ |
+| GPU+CPU search, both GPUs | YES | YES | YES | YES | YES | YES |
+| GPU sieve + GPU search, AMD device[0] | YES | YES | YES | YES | YES | GATE¹ |
+| GPU sieve + GPU search, NVIDIA device[1] | YES | YES | YES | YES | YES | YES |
 
-## Issues to Address
+¹ Expected capacity-gate refusal: AMD backing (~13.2 GiB at default budget)
+< 16 GiB map. Passes with `--host-tier-cap=auto` (spill path), byte-identical.
+Prime-map sha256 is identical across AMD sieve, NVIDIA sieve, and both
+search paths (`--dump-map`, leg 1M).
 
-### 1. GPU Search Kernel Correctness (HIGH PRIORITY)
-
-**Status**: Broken at small legs (~20% correct), works at 2M.
-
-**Symptoms**:
-- At 65K-1M: produces ~20% of expected results
-- At 2M: produces 100% of expected results
-
-**Root Cause Hypotheses**:
-1. `factors[]` stack allocation (4096 × 8 bytes = 32 KB) may exceed LDS limits on AMD RDNA4
-2. Memory access faults at certain leg sizes
-3. Early termination conditions wrong
-
-**Testing Done**:
-- `m4_kernel_unit` with `testInterval=1` on 65K showed 476/2357 solutions (20.2%)
-- Stack-size hypothesis test: reduce `MAX_FACTORS` to 256, verify if correctness improves
-- Full enumeration check needed on both architectures
-
-**Fix Approach**:
-- Layer 1: Reduce `MAX_FACTORS` from 4096 to 256 (32 KB → 2 KB)
-- Layer 2: Phase isolation (disable Phases 2-4, run only Phase 1 Power2Prime)
-- Layer 3: Function isolation (replace `dev_AllButOne...` with CPU reference)
-- Layer 4: Binary search on kernel (reduce to single sum evaluation)
-
-### 3. GPU vs CPU Performance (LOW PRIORITY)
+### 2. GPU vs CPU Performance (LOW PRIORITY)
 
 **Status**: GPU split model (sieve only) is slower than CPU reference.
 
@@ -95,7 +82,7 @@ This is a GPU port of the Freudenthal prime-search program (`segmentedSieve.C`).
 - If GPU search is fixed, GPU All mode at 524K-1M shows **1.15-1.37x speedup**
 - This is the main reason to fix the GPU search kernel
 
-### 4. Thread Count Mismatch (INFORMATIONAL)
+### 3. Thread Count Mismatch (INFORMATIONAL)
 
 **Status**: Reference uses 31 threads, new binary defaults to 20 (now changed to 31).
 
@@ -117,10 +104,10 @@ This is a GPU port of the Freudenthal prime-search program (`segmentedSieve.C`).
 
 | File | Purpose |
 |------|---------|
-| `src/cpu_search.cpp` | Multi-threaded CPU search (FreudenthalThreads pattern) |
-| `src/m4/gpu_search_kernel.h` | GPU Freudenthal search kernel (BROKEN) |
-| `src/m4/gpu_search_launcher.cpp` | Host-side wrapper for GPU search |
-| `src/sieve_slab_engine.cpp` | GPU sieve engine |
+| `source/cpu_search.cpp` | Multi-threaded CPU search (FreudenthalThreads pattern) |
+| `source/m4/gpu_search_kernel.h` | GPU Freudenthal search kernel |
+| `source/m4/gpu_search_launcher.cpp` | Host-side wrapper for GPU search |
+| `source/sieve_slab_engine.cpp` | GPU sieve engine |
 | `scripts/bench_full.sh` | Comprehensive benchmark script |
 | `scripts/bench_full_results.csv` | Benchmark data (CSV format) |
 | `scripts/bench_full_report.md` | Benchmark report (markdown) |
@@ -128,11 +115,15 @@ This is a GPU port of the Freudenthal prime-search program (`segmentedSieve.C`).
 
 ## Next Steps
 
-1. **Fix GPU search kernel** (Layer 1: reduce MAX_FACTORS)
-2. **Test on both architectures** (AMD + NVIDIA)
-3. **Validate at all 6 legs** with corrected kernel
-4. **Re-benchmark** with fixed GPU search
-5. **Benchmark GPU search** to validate performance improvement
+1. ~~Fix GPU search kernel~~ DONE — root cause was a stale 7-arg extern
+   declaration of the 9-arg `SearchKernelRun_*` in `test/source/m4_order.cpp`
+   (extern "C" binds silently; the kernel then read garbage for its
+   `smallPrimes` pointer → AMD page fault). Test now passes all legs.
+2. ~~Test on both architectures~~ DONE — pure-HIP dual build (gfx1201 +
+   sm_120), both kernels verified per device.
+3. ~~Validate at all 6 legs~~ DONE — see correctness table above.
+4. Re-benchmark with the fixed GPU search (open).
+5. Benchmark GPU search to validate performance improvement (open).
 
 ## Benchmark Recurrence
 

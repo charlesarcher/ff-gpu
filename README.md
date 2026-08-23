@@ -19,8 +19,9 @@ This project implements a heterogeneous GPU-accelerated prime search pipeline:
 │                      ff_sieve binary                         │
 ├─────────────────────────────────────────────────────────────┤
 │  GPU Sieve (correct, byte-identical to CPU)                  │
-│  ├── NVIDIA RTX 5090 (CUDA, sm_120)                         │
-│  └── AMD RX 9070 XT (HIP/ROCm, gfx1201)                     │
+│  ├── AMD RX 9070 XT (HIP/ROCm objects, gfx1201)             │
+│  └── NVIDIA RTX 5090 (same HIP source via hipcc's           │
+│       nvidia platform → CUDA runtime symbols, sm_120)        │
 ├─────────────────────────────────────────────────────────────┤
 │  CPU Search (correct, multi-threaded, 31 threads)            │
 │  └── FreudenthalThreads pattern from segmentedSieve.C        │
@@ -29,6 +30,14 @@ This project implements a heterogeneous GPU-accelerated prime search pipeline:
 │  └── GPU Freudenthal kernel with sum-indexed slots           │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+**Pure HIP**: every kernel and device interaction is written once against the
+HIP API (`hipMalloc`, `hipLaunchKernelGGL`, …). There are no direct CUDA calls
+anywhere in the tree; the NVIDIA side is the *same* sources compiled by
+`hipcc` with `HIP_PLATFORM=nvidia`, where the hip* entry points resolve to the
+CUDA runtime at the symbol level. Per-arch object sets export arch-tagged
+symbols (`…_gfx1201` / `…_sm_120`), so both runtimes live side by side in one
+binary and each logical device is dispatched to its own backend by PCI bus ID.
 
 Both GPU vendors are compiled into **one** binary: per-arch object files are built with `hipcc` (HIP for AMD, CUDA backend for NVIDIA) and linked alongside the host code, so a single process runs both runtimes side by side.
 
@@ -136,8 +145,8 @@ ctest --preset dev --output-on-failure
 | `abstraction_smoke` | Both CUDA and ROCm runtimes initialize and run a trivial kernel in one process | Fast (~0.5 s) |
 | `ff_budget_selftest` | Pure-host budget/geometry/VRAM-capping logic | No GPU runtimes linked |
 | `slab_cmp` | Slab sieve kernel: CPU vs GPU output per slab | all pass |
-| `m4_kernel_unit_bin` | M4 GPU search kernel unit behavior | Slow (~16 s) |
-| `m4_order_bin` | M4 GPU-search emission vs reference `ff_seg` goldens, byte-identical | Slow (~8 s) |
+| `m4_kernel_unit_bin` | M4 GPU search kernel unit behavior | Slow (~83 s) |
+| `m4_order_bin` | M4 GPU-search emission vs reference `ff_seg` goldens, byte-identical | Slow (~7 s) |
 
 Expected result: **all tests pass**.
 
@@ -158,6 +167,16 @@ ff_sieve [options] <sumStart> <sumLimit>
 # GPU sieve + GPU search (experimental, byte-identical)
 ./build/ff_sieve --gpu-search 5 2097152
 
+# GPU search on a specific device (prints available devices and which is used)
+./build/ff_sieve --gpu-search --gpu-search-device=0 5 65536   # AMD
+./build/ff_sieve --gpu-search --gpu-search-device=1 5 65536   # NVIDIA
+
+# Sieve on a specific device
+./build/ff_sieve --sieve-device=1 5 65536                     # sieve on NVIDIA only
+
+# Combine: sieve on NVIDIA, search on AMD
+./build/ff_sieve --sieve-device=1 --gpu-search --gpu-search-device=0 5 65536
+
 # Restrict to one GPU vendor
 ./build/ff_sieve --devices=nvidia 5 2097152
 ./build/ff_sieve --devices=amd 5 1048576     # AMD cannot handle 2M (VRAM)
@@ -175,6 +194,8 @@ ff_sieve [options] <sumStart> <sumLimit>
 |--------|-------------|
 | `sumStart sumLimit` | Search range (positional; default `5 65535`) |
 | `--gpu-search` | Use GPU search instead of CPU search |
+| `--gpu-search-device=N` | Run GPU search on device index N (see `--list-devices`) |
+| `--sieve-device=N` | Run sieve on device index N (see `--list-devices`) |
 | `--no-gpu` | Disable all GPU work (CPU-only mode) |
 | `--devices=<amd\|nvidia>` | Restrict GPU participation to one vendor |
 | `--list-devices` | Print detected GPUs and exit |
