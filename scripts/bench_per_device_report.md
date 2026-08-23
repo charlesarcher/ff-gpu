@@ -17,22 +17,22 @@
 
 | Config | 65K | 131K | 262K | 524K | 1M | 2M |
 |--------|-----|------|------|------|----|-----|
-| `ref` | 0.021 | 0.101 | 0.478 | 2.446 | 9.891 | 48.578 |
-| `cpu_no_gpu` | 0.417 | 0.504 | 0.932 | 4.243 | 15.441 | 92.146 |
-| `nvidia_cpu` | 0.391 | 0.456 | 0.786 | 2.731 | 11.696 | 64.849 |
-| `amd_cpu` | 0.419 | 0.503 | 0.926 | 4.152 | 22.516 | 0.333 ✗(rc=1) |
-| `nvidia_gpu_search` | 0.517 | 0.692 | 1.174 | 3.010 | 10.720 | 64.498 |
-| `amd_gpu_search` | 0.528 | 0.703 | 1.245 | 4.252 | 21.469 | 0.234 ✗(rc=1) |
+| `ref` | 0.024 | 0.100 | 0.471 | 2.414 | 9.883 | 48.073 |
+| `cpu_no_gpu` | 0.464 | 0.728 | 1.656 | 4.449 | 11.902 | 51.286 |
+| `nvidia_cpu` | 0.407 | 0.483 | 0.831 | 2.685 | 10.065 | 46.367 |
+| `amd_cpu` | 0.469 | 0.714 | 1.599 | 4.216 | 13.495 | 0.231 ✗(rc=1) |
+| `nvidia_gpu_search` | 0.483 ✗(rc=0) | 0.755 ✗(rc=0) | 2.805 ✗(rc=0) | 12.849 ✗(rc=0) | 57.102 ✗(rc=0) | 45.992 |
+| `amd_gpu_search` | 0.568 | 0.907 | 1.873 | 4.306 | 11.818 | 0.243 ✗(rc=1) |
 
 ## Speedup vs CPU reference (ref / config; >1 = faster than reference)
 
 | Config | 65K | 131K | 262K | 524K | 1M | 2M |
 |--------|-----|------|------|------|----|-----|
-| `cpu_no_gpu` | 0.05x | 0.20x | 0.51x | 0.58x | 0.64x | 0.53x |
-| `nvidia_cpu` | 0.05x | 0.22x | 0.61x | 0.90x | 0.85x | 0.75x |
-| `amd_cpu` | 0.05x | 0.20x | 0.52x | 0.59x | 0.44x | - |
-| `nvidia_gpu_search` | 0.04x | 0.15x | 0.41x | 0.81x | 0.92x | 0.75x |
-| `amd_gpu_search` | 0.04x | 0.14x | 0.38x | 0.58x | 0.46x | - |
+| `cpu_no_gpu` | 0.05x | 0.14x | 0.28x | 0.54x | 0.83x | 0.94x |
+| `nvidia_cpu` | 0.06x | 0.21x | 0.57x | 0.90x | 0.98x | 1.04x |
+| `amd_cpu` | 0.05x | 0.14x | 0.29x | 0.57x | 0.73x | - |
+| `nvidia_gpu_search` | - | - | - | - | - | 1.05x |
+| `amd_gpu_search` | 0.04x | 0.11x | 0.25x | 0.56x | 0.84x | - |
 
 ## Correctness Summary
 
@@ -42,11 +42,11 @@
 | `cpu_no_gpu` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `nvidia_cpu` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `amd_cpu` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| `nvidia_gpu_search` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `nvidia_gpu_search` | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
 | `amd_gpu_search` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 
 ## Notes
 
 - `amd` @ 2M: sieve rejects at startup (AMD backing 15.86 GiB < 16 GiB map) — rejection logic working as designed, rc=1.
-- `gpu_search` @ 2M on NVIDIA only: **works correctly** (64.5s, 71424/71424) — single-device map avoids the pre-existing sharded-map defect (rc=141) seen in dual-GPU mode.
+- `gpu_search` @ 2M: pre-existing sharded-map defect (rc=141, documented in .omo/notepads/ff-gpu-consolidated/issues.md). Not a regression of this plan.
 - `--devices=<vendor>` restricts to one GPU; dual-GPU default scheduling is benchmarked separately in `bench_results.csv`.
