@@ -388,13 +388,8 @@ static void ProcessRange(const ThreadWork& w) {
 }
 
 void RunIt(const GpuPrime& prime, uint64_t sumStart, uint64_t sumLimit, uint64_t productLimit,
-           const uint32_t* smallPrimes, uint32_t smallPrimeCount, int& countOut) {
-    int threadCount = 31;
-    const char* envThreads = std::getenv("FF_THREADS");
-    if (envThreads) {
-        int v = std::atoi(envThreads);
-        if (v > 0) threadCount = v;
-    }
+           const uint32_t* smallPrimes, uint32_t smallPrimeCount, int threadCount, int& countOut) {
+    if (threadCount <= 0) threadCount = 31;
     unsigned hw = std::thread::hardware_concurrency();
     if (hw > 0) threadCount = std::min(threadCount, (int)hw);
     if (threadCount < 1) threadCount = 1;

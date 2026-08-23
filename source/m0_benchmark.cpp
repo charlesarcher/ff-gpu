@@ -77,8 +77,9 @@ double bench_copy(ffdev::DevHandle& h, void* host, size_t bytes, ffdev::DevCopyD
 
 std::string backendLabel(ffdev::DevBackend b)
 {
-    return b == ffdev::DevBackend::Hip ? "hip" :
-           b == ffdev::DevBackend::Cuda ? "cuda" : "unknown";
+    return b == ffdev::DevBackend::HipAmd ? "hip-amd"
+         : b == ffdev::DevBackend::HipNv  ? "hip-nv"
+                                          : "unknown";
 }
 
 }  // namespace
@@ -207,24 +208,12 @@ int main()
         results.push_back(std::move(res));
     }
 
-    // --- Compute weightRatio: nvidia_write / amd_write ---
-    // Search results for nvidia_write and amd_write among the results.
-    double nvidia_write = 0.0, amd_write = 0.0;
-    for (const auto& r : results) {
-        if (std::strcmp(r.vendor.c_str(), "nvidia") == 0 && r.writeBandwidthGbs > 0.0)
-            nvidia_write = r.writeBandwidthGbs;
-        else if (std::strcmp(r.vendor.c_str(), "amd") == 0 && r.writeBandwidthGbs > 0.0)
-            amd_write = r.writeBandwidthGbs;
-    }
-    double weightRatio = (amd_write > 0.0) ? (nvidia_write / amd_write) : 0.0;
-
     std::fprintf(stderr, "\n=== Summary ===\n");
     for (const auto& r : results) {
         std::fprintf(stderr, "  %s (%s): write=%.1f  H2D=%.1f  D2H=%.1f GB/s\n",
                      r.name.c_str(), r.vendor.c_str(),
                      r.writeBandwidthGbs, r.h2dBandwidthGbs, r.d2hBandwidthGbs);
     }
-    std::fprintf(stderr, "  weightRatio (nvidia_write / amd_write) = %.2f\n", weightRatio);
 
     // --- Write JSON ---
     std::ofstream ofs("config/m0-benchmarks.json");
@@ -245,7 +234,6 @@ int main()
         ofs << "\n";
     }
     ofs << "  ],\n";
-    ofs << "  \"weightRatio\": " << weightRatio << "\n";
     ofs << "}\n";
     ofs.close();
 

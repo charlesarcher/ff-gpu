@@ -46,7 +46,7 @@ private:
 };
 
 void RunIt(const GpuPrime& prime, uint64_t sumStart, uint64_t sumLimit, uint64_t productLimit,
-            const uint32_t* smallPrimes, uint32_t smallPrimeCount, int& countOut);
+            const uint32_t* smallPrimes, uint32_t smallPrimeCount, int threadCount, int& countOut);
 
 // PrintOutputTags is provided by m4/gpu_search_emission.cpp (included into main.cpp).
 // cpu_search.cpp uses it for the CPU Freudenthal path — same byte-exact body.

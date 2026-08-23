@@ -65,19 +65,11 @@ uint64_t SieveEngine::run(uint64_t sumLimit, uint8_t* hostMap)
     // ---- 2. Generate small primes on host ----
     prepare(sumLimit);
 
-    // ---- 3. Resolve per-arch engine run function ----
-    // Pick the dispatch function based on the device vendor.  The old approach
-    // of trying gfx1201 first and falling back to sm_120 was broken because
-    // `hipGetDeviceCount()` in the ROCm HIP runtime returns the total device
-    // count (AMD + NVIDIA), so gfx1201 always "wins" for any deviceIndex that
-    // is valid in the combined device list.  That caused NVIDIA devices to
-    // accidentally run the AMD engine on the 9070 XT, which only has ~13 GiB
-    // backing → OOM.  Now we dispatch by vendor string.
-    SieveSlabEngineRunFn runFn = nullptr;
-    if (vendor_ && std::strcmp(vendor_, "nvidia") == 0)
-        runFn = SieveSlabEngineGetLaunchFn_sm_120(deviceIndex_);
-    else
-        runFn = SieveSlabEngineGetLaunchFn_gfx1201(deviceIndex_);
+    // ---- 3. Resolve per-arch engine run function by vendor ----
+    bool nv = vendor_ != nullptr && std::strcmp(vendor_, "nvidia") == 0;
+    SieveSlabEngineRunFn runFn = nv
+        ? SieveSlabEngineGetLaunchFn_sm_120(deviceIndex_)
+        : SieveSlabEngineGetLaunchFn_gfx1201(deviceIndex_);
     if (!runFn) {
         std::fprintf(stderr,
             "SieveEngine::run: no matching arch for device %d (vendor=%s)\n",

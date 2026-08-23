@@ -62,23 +62,34 @@ static std::vector<uint8_t> cpu_generatePrimeMap(uint64_t limit) {
     return map;
 }
 
+// ---- Odd small-prime list for the kernel (leading 2 stripped) ----
+
+static std::vector<uint32_t> cpu_oddPrimes(uint64_t limit) {
+    std::vector<uint8_t> composite(limit + 1, 0);
+    std::vector<uint32_t> primes;
+    for (uint64_t p = 2; p * p <= limit; ++p)
+        if (!composite[p])
+            for (uint64_t i = p * p; i <= limit; i += p)
+                composite[i] = 1;
+    for (uint64_t p = 3; p <= limit; p += 2)
+        if (!composite[p]) primes.push_back((uint32_t)p);
+    return primes;
+}
+
 extern "C" {
     extern int SearchKernelRun_gfx1201(int deviceIndex,
                                        const uint8_t* d_primeMap, uint64_t d_maxPrimeMapValue,
                                        uint64_t d_sumStart, uint64_t d_sumLimit,
-                                       uint32_t* d_pAtomicCount, GpuRecord* d_pRecords);
-    extern int SearchKernelRun_sm_120(int deviceIndex,
-                                      const uint8_t* d_primeMap, uint64_t d_maxPrimeMapValue,
-                                      uint64_t d_sumStart, uint64_t d_sumLimit,
-                                      uint32_t* d_pAtomicCount, GpuRecord* d_pRecords);
+                                       uint32_t* d_pAtomicCount, GpuRecord* d_pRecords,
+                                       const uint32_t* d_smallPrimes, uint32_t d_smallPrimeCount);
 }
 
 typedef int (*SearchKernelRunFn)(int, const uint8_t*, uint64_t,
                                   uint64_t, uint64_t,
-                                  uint32_t*, GpuRecord*);
+                                  uint32_t*, GpuRecord*,
+                                  const uint32_t*, uint32_t);
 
 extern "C" SearchKernelRunFn SearchKernelGetLaunchFn_gfx1201(int deviceIndex);
-extern "C" SearchKernelRunFn SearchKernelGetLaunchFn_sm_120(int deviceIndex);
 
 // ================================================================
 // Main test
@@ -146,7 +157,6 @@ int main(int /*argc*/, char** /*argv*/) {
 
     // --- 8. Resolve kernel launch function ---
     SearchKernelRunFn launchFn = SearchKernelGetLaunchFn_gfx1201(0);
-    if (!launchFn) launchFn = SearchKernelGetLaunchFn_sm_120(0);
     if (!launchFn) {
         std::printf("  Kernel launch function not available — skipping.\n");
         ffdev::DevFree(&dhRecords);
@@ -156,6 +166,17 @@ int main(int /*argc*/, char** /*argv*/) {
         return 0;
     }
 
+    // --- 8b. Upload odd small primes (kernel skips p=2; its sieve handles
+    // even values). Covers factor advancement up to any factorLimit < sumLimit. ---
+    std::vector<uint32_t> h_smallPrimes = cpu_oddPrimes(sumLimit);
+    const uint32_t* sp = h_smallPrimes.data();
+    uint32_t spCount = (uint32_t)h_smallPrimes.size();
+    ffdev::DevHandle dhSmallPrimes;
+    CHECK(ffdev::DevAlloc(0, (size_t)spCount * sizeof(uint32_t), &dhSmallPrimes));
+    CHECK(ffdev::DevCopy(&dhSmallPrimes, const_cast<uint32_t*>(sp),
+                         (size_t)spCount * sizeof(uint32_t),
+                         ffdev::DevCopyDir::H2D));
+
     std::printf("  Launching kernel: grid=%u blocks x %u threads, %llu odd sums\n",
                 numBlocks, blockSize, (unsigned long long)numOddSums);
 
@@ -163,9 +184,11 @@ int main(int /*argc*/, char** /*argv*/) {
     int rc = launchFn(0,
                       (const uint8_t*)dhPrimeMap.ptr, (uint64_t)maxPrimeMapValue,
                       (uint64_t)sumStart, (uint64_t)sumLimit,
-                      (uint32_t*)dhAtomicCount.ptr, (GpuRecord*)dhRecords.ptr);
+                      (uint32_t*)dhAtomicCount.ptr, (GpuRecord*)dhRecords.ptr,
+                      (const uint32_t*)dhSmallPrimes.ptr, spCount);
     if (rc != 0) {
         std::fprintf(stderr, "  Kernel launch failed (rc=%d)\n", rc);
+        ffdev::DevFree(&dhSmallPrimes);
         ffdev::DevFree(&dhRecords);
         ffdev::DevFree(&dhAtomicCount);
         ffdev::DevFree(&dhPrimeMap);
@@ -220,6 +243,7 @@ int main(int /*argc*/, char** /*argv*/) {
         if (fd < 0) {
             std::fprintf(stderr, "  Cannot open %s for writing\n", gpuOutputFile);
             close(savedFd);
+            ffdev::DevFree(&dhSmallPrimes);
             ffdev::DevFree(&dhRecords);
             ffdev::DevFree(&dhAtomicCount);
             ffdev::DevFree(&dhPrimeMap);
@@ -277,6 +301,7 @@ int main(int /*argc*/, char** /*argv*/) {
         std::fprintf(stderr, "  Cannot open output files for comparison\n");
         if (fpGpu) std::fclose(fpGpu);
         if (fpRef) std::fclose(fpRef);
+        ffdev::DevFree(&dhSmallPrimes);
         ffdev::DevFree(&dhRecords);
         ffdev::DevFree(&dhAtomicCount);
         ffdev::DevFree(&dhPrimeMap);
@@ -335,6 +360,7 @@ int main(int /*argc*/, char** /*argv*/) {
     // Cleanup.
     std::fclose(fpGpu);
     std::fclose(fpRef);
+    ffdev::DevFree(&dhSmallPrimes);
     ffdev::DevFree(&dhRecords);
     ffdev::DevFree(&dhAtomicCount);
     ffdev::DevFree(&dhPrimeMap);

@@ -1,13 +1,12 @@
-// Vendor-neutral device abstraction host TU (GPU_PLAN §5.2, plan todo 6).
+// Device abstraction host TU (GPU_PLAN §5.2, plan todo 6).
 // Compiled with g++ — NO vendor headers in this TU, ever. Owns:
-//   * the logical device list (todo-3 ff_enum_hip/ff_enum_cuda unioned with
-//     ff::mergeAndDedupe by PCI bus ID — a card both runtimes see counts
-//     once, so the 5090 is never double-counted),
+//   * the logical device list (both per-arch enum TUs merged + bus-deduped),
 //   * the busId -> {backend, vendor runtime index} map,
-//   * dispatch of every ffdev:: op to the right extern "C" backend TU
-//     (src/hip_devabstraction.cpp | src/cuda_devabstraction.cpp).
-// The backend TUs are selected at runtime by PCI bus ID; the mapping is
-// built from which enumeration actually reported each bus ID.
+//   * dispatch of every ffdev:: op to the arch-tagged extern "C" backend
+//     entry points (HIP-amd objects or HIP-nvidia objects).
+//
+// Both backends are the SAME HIP source compiled twice; this TU never calls
+// cuda*/hip* directly.
 
 #include <cstdio>
 #include <cstdlib>
@@ -19,8 +18,8 @@
 #include "devabstraction.h"
 #include "device_registry.h"
 
-extern "C" int ff_enum_hip(ff::DeviceInfo* out, int maxDevices, int* outCount);
-extern "C" int ff_enum_cuda(ff::DeviceInfo* out, int maxDevices, int* outCount);
+extern "C" int ff_enum_hip_gfx1201(ff::DeviceInfo* out, int maxDevices, int* outCount);
+extern "C" int ff_enum_hip_sm_120(ff::DeviceInfo* out, int maxDevices, int* outCount);
 
 namespace {
 
@@ -45,22 +44,16 @@ std::string mapKey(const ff::DeviceInfo& d)
            std::to_string(d.runtimeIndex);
 }
 
-ffdev::DevBackend backendFromVendor(const ff::DeviceInfo& d)
-{
-    return std::strcmp(d.vendor, "amd") == 0 ? ffdev::DevBackend::Hip
-                                             : ffdev::DevBackend::Cuda;
-}
-
-// Re-enumerate a single backend and return the vendor runtime index for the
+// Re-enumerate the given backend and return the vendor runtime index for the
 // given PCI bus ID. Used to remap logical-device indices to the correct
-// vendor-specific index when a backend only sees a subset of devices.
-static int findVendorIndex(ffdev::DevBackend backend, const std::string& busId)
+// vendor-specific index when the backend only sees a subset of devices.
+static int findVendorIndexFor(const std::string& busId, ffdev::DevBackend backend)
 {
-    ff::DeviceInfo buf[64] = {};
+    ff::DeviceInfo buf[kMaxDevices] = {};
     int count = 0;
-    int rc = backend == ffdev::DevBackend::Hip
-                 ? ff_enum_hip(buf, 64, &count)
-                 : ff_enum_cuda(buf, 64, &count);
+    int rc = backend == ffdev::DevBackend::HipNv
+                 ? ff_enum_hip_sm_120(buf, kMaxDevices, &count)
+                 : ff_enum_hip_gfx1201(buf, kMaxDevices, &count);
     if (rc != 0) return -1;
     for (int i = 0; i < count; ++i)
         if (std::string(buf[i].busId) == busId) return i;
@@ -85,10 +78,9 @@ int resolveLogical(int deviceIndex, DevMapEntry* e)
     auto it = g_busMap.find(key);
     if (it != g_busMap.end()) {
         // Remap: the stored vendorIndex is from the enumeration that FIRST
-        // reported this bus. Re-enumerate to get the correct index within
-        // the chosen backend (a CUDA-only run sees only 1 device at index 0,
-        // not the logical index in the merged list).
-        int remapped = findVendorIndex(it->second.backend, key);
+        // reported this bus. Re-enumerate THAT backend to get the correct
+        // index within it.
+        int remapped = findVendorIndexFor(key, it->second.backend);
         if (remapped >= 0) {
             DevMapEntry fixed = it->second;
             fixed.vendorIndex = remapped;
@@ -99,14 +91,11 @@ int resolveLogical(int deviceIndex, DevMapEntry* e)
         return 0;
     }
     // Fallback (should not happen: the map is built from the same list).
-    e->backend = backendFromVendor(g_devices[deviceIndex]);
+    e->backend = std::strcmp(g_devices[deviceIndex].vendor, "nvidia") == 0
+                     ? ffdev::DevBackend::HipNv
+                     : ffdev::DevBackend::HipAmd;
     e->vendorIndex = g_devices[deviceIndex].runtimeIndex;
     return 0;
-}
-
-const char* backendTag(ffdev::DevBackend b)
-{
-    return b == ffdev::DevBackend::Hip ? "hip" : "cuda";
 }
 
 }  // namespace
@@ -116,8 +105,8 @@ namespace ffdev {
 const char* backendName(DevBackend b)
 {
     switch (b) {
-        case DevBackend::Hip: return "hip";
-        case DevBackend::Cuda: return "cuda";
+        case DevBackend::HipAmd: return "hip-amd";
+        case DevBackend::HipNv: return "hip-nv";
         default: return "unknown";
     }
 }
@@ -126,31 +115,32 @@ int DevInit(void)
 {
     if (g_initialized) return 0;   // idempotent
 
-    ff::DeviceInfo hipBuf[kMaxDevices] = {};
-    ff::DeviceInfo cudaBuf[kMaxDevices] = {};
-    int hipCount = 0, cudaCount = 0;
-    if (ff_enum_hip(hipBuf, kMaxDevices, &hipCount) != 0)
+    ff::DeviceInfo amdBuf[kMaxDevices] = {};
+    ff::DeviceInfo nvBuf[kMaxDevices] = {};
+    int amdCount = 0, nvCount = 0;
+    if (ff_enum_hip_gfx1201(amdBuf, kMaxDevices, &amdCount) != 0)
         std::fprintf(stderr,
                      "[ffdev] warning: HIP (AMD) enumeration failed; no AMD "
                      "devices will participate\n");
-    if (ff_enum_cuda(cudaBuf, kMaxDevices, &cudaCount) != 0)
+    if (ff_enum_hip_sm_120(nvBuf, kMaxDevices, &nvCount) != 0)
         std::fprintf(stderr,
-                     "[ffdev] warning: CUDA (NVIDIA) enumeration failed; no "
-                     "NVIDIA devices will participate\n");
+                     "[ffdev] warning: HIP-NV enumeration failed; no NVIDIA "
+                     "devices will participate\n");
 
     int skipped = 0;
-    g_devices = ff::mergeAndDedupe(hipBuf, hipCount, cudaBuf, cudaCount,
-                                   &skipped);
+    g_devices = ff::mergeAndDedupe(amdBuf, amdCount, nvBuf, nvCount, &skipped);
     g_busMap.clear();
     for (size_t i = 0; i < g_devices.size(); ++i) {
         DevMapEntry e;
-        e.backend = backendFromVendor(g_devices[i]);
+        e.backend = std::strcmp(g_devices[i].vendor, "nvidia") == 0
+                        ? DevBackend::HipNv
+                        : DevBackend::HipAmd;
         e.vendorIndex = g_devices[i].runtimeIndex;
         g_busMap[mapKey(g_devices[i])] = e;
     }
 
     std::fprintf(stderr,
-                 "[ffdev] DevInit: %zu logical device(s) after bus-ID dedup, "
+                 "[ffdev] DevInit: %zu logical device(s), "
                  "%d duplicate(s) skipped\n",
                  g_devices.size(), skipped);
     g_initialized = 1;
@@ -170,9 +160,9 @@ int DevGetDeviceProperties(int deviceIndex, ff::DeviceInfo* out)
 {
     DevMapEntry e;
     if (resolveLogical(deviceIndex, &e) != 0) return -1;
-    int rc = e.backend == DevBackend::Hip
-                 ? ff_dev_hip_deviceprops(e.vendorIndex, out)
-                 : ff_dev_cuda_deviceprops(e.vendorIndex, out);
+    int rc = e.backend == DevBackend::HipNv
+                 ? ff_dev_hip_deviceprops_sm_120(e.vendorIndex, out)
+                 : ff_dev_hip_deviceprops_gfx1201(e.vendorIndex, out);
     if (rc != 0)
         std::fprintf(stderr,
                      "[ffdev] DevGetDeviceProperties(%d) failed via %s "
@@ -185,9 +175,9 @@ int DevGetMemInfo(int deviceIndex, size_t* freeBytes, size_t* totalBytes)
 {
     DevMapEntry e;
     if (resolveLogical(deviceIndex, &e) != 0) return -1;
-    int rc = e.backend == DevBackend::Hip
-                 ? ff_dev_hip_meminfo(e.vendorIndex, freeBytes, totalBytes)
-                 : ff_dev_cuda_meminfo(e.vendorIndex, freeBytes, totalBytes);
+    int rc = e.backend == DevBackend::HipNv
+                 ? ff_dev_hip_meminfo_sm_120(e.vendorIndex, freeBytes, totalBytes)
+                 : ff_dev_hip_meminfo_gfx1201(e.vendorIndex, freeBytes, totalBytes);
     if (rc != 0)
         std::fprintf(stderr,
                      "[ffdev] DevGetMemInfo(%d) failed via %s backend\n",
@@ -207,9 +197,9 @@ int DevAlloc(int deviceIndex, size_t bytes, DevHandle* out)
     DevMapEntry e;
     if (resolveLogical(deviceIndex, &e) != 0) return -1;
     void* p = nullptr;
-    int rc = e.backend == DevBackend::Hip
-                 ? ff_dev_hip_alloc(e.vendorIndex, bytes, &p)
-                 : ff_dev_cuda_alloc(e.vendorIndex, bytes, &p);
+    int rc = e.backend == DevBackend::HipNv
+                 ? ff_dev_hip_alloc_sm_120(e.vendorIndex, bytes, &p)
+                 : ff_dev_hip_alloc_gfx1201(e.vendorIndex, bytes, &p);
     if (rc != 0) {
         std::fprintf(stderr,
                      "[ffdev] DevAlloc(%d, %zu B) failed via %s backend\n",
@@ -229,9 +219,9 @@ int DevFree(DevHandle* h)
         std::fprintf(stderr, "[ffdev] DevFree: null handle\n");
         return -1;
     }
-    int rc = h->backend == DevBackend::Hip
-                 ? ff_dev_hip_free(h->vendorIndex, h->ptr)
-                 : ff_dev_cuda_free(h->vendorIndex, h->ptr);
+    int rc = h->backend == DevBackend::HipNv
+                 ? ff_dev_hip_free_sm_120(h->vendorIndex, h->ptr)
+                 : ff_dev_hip_free_gfx1201(h->vendorIndex, h->ptr);
     if (rc != 0) {
         std::fprintf(stderr,
                      "[ffdev] DevFree(%d) failed via %s backend\n",
@@ -248,15 +238,12 @@ int DevCopy(DevHandle* dev, void* host, size_t bytes, DevCopyDir dir)
         std::fprintf(stderr, "[ffdev] DevCopy: null handle/pointer\n");
         return -1;
     }
-    int rc = -1;
-    if (dev->backend == DevBackend::Hip)
-        rc = dir == DevCopyDir::H2D
-                 ? ff_dev_hip_copy_h2d(dev->vendorIndex, dev->ptr, host, bytes)
-                 : ff_dev_hip_copy_d2h(dev->vendorIndex, host, dev->ptr, bytes);
-    else
-        rc = dir == DevCopyDir::H2D
-                 ? ff_dev_cuda_copy_h2d(dev->vendorIndex, dev->ptr, host, bytes)
-                 : ff_dev_cuda_copy_d2h(dev->vendorIndex, host, dev->ptr, bytes);
+    bool nv = dev->backend == DevBackend::HipNv;
+    int rc = dir == DevCopyDir::H2D
+                  ? (nv ? ff_dev_hip_copy_h2d_sm_120(dev->vendorIndex, dev->ptr, host, bytes)
+                        : ff_dev_hip_copy_h2d_gfx1201(dev->vendorIndex, dev->ptr, host, bytes))
+                  : (nv ? ff_dev_hip_copy_d2h_sm_120(dev->vendorIndex, host, dev->ptr, bytes)
+                        : ff_dev_hip_copy_d2h_gfx1201(dev->vendorIndex, host, dev->ptr, bytes));
     if (rc != 0) {
         std::fprintf(stderr,
                      "[ffdev] DevCopy(%s, %zu B) failed via %s backend\n",
@@ -272,9 +259,9 @@ int DevStreamCreate(int deviceIndex, DevStream* out)
     DevMapEntry e;
     if (resolveLogical(deviceIndex, &e) != 0) return -1;
     void* token = nullptr;
-    int rc = e.backend == DevBackend::Hip
-                 ? ff_dev_hip_stream_create(e.vendorIndex, &token)
-                 : ff_dev_cuda_stream_create(e.vendorIndex, &token);
+    int rc = e.backend == DevBackend::HipNv
+                 ? ff_dev_hip_stream_create_sm_120(e.vendorIndex, &token)
+                 : ff_dev_hip_stream_create_gfx1201(e.vendorIndex, &token);
     if (rc != 0) {
         std::fprintf(stderr,
                      "[ffdev] DevStreamCreate(%d) failed via %s backend\n",
@@ -294,9 +281,9 @@ int DevStreamDestroy(DevStream* s)
         std::fprintf(stderr, "[ffdev] DevStreamDestroy: null stream\n");
         return -1;
     }
-    int rc = s->backend == DevBackend::Hip
-                 ? ff_dev_hip_stream_destroy(s->vendorIndex, s->token)
-                 : ff_dev_cuda_stream_destroy(s->vendorIndex, s->token);
+    int rc = s->backend == DevBackend::HipNv
+                 ? ff_dev_hip_stream_destroy_sm_120(s->vendorIndex, s->token)
+                 : ff_dev_hip_stream_destroy_gfx1201(s->vendorIndex, s->token);
     if (rc != 0) {
         std::fprintf(stderr,
                      "[ffdev] DevStreamDestroy(%d) failed via %s backend\n",
@@ -313,9 +300,9 @@ int DevStreamSync(DevStream* s)
         std::fprintf(stderr, "[ffdev] DevStreamSync: null stream\n");
         return -1;
     }
-    int rc = s->backend == DevBackend::Hip
-                 ? ff_dev_hip_stream_sync(s->vendorIndex, s->token)
-                 : ff_dev_cuda_stream_sync(s->vendorIndex, s->token);
+    int rc = s->backend == DevBackend::HipNv
+                 ? ff_dev_hip_stream_sync_sm_120(s->vendorIndex, s->token)
+                 : ff_dev_hip_stream_sync_gfx1201(s->vendorIndex, s->token);
     if (rc != 0) {
         std::fprintf(stderr,
                      "[ffdev] DevStreamSync(%d) failed via %s backend\n",
@@ -330,9 +317,9 @@ int DevEventCreate(int deviceIndex, DevEvent* out)
     DevMapEntry e;
     if (resolveLogical(deviceIndex, &e) != 0) return -1;
     void* token = nullptr;
-    int rc = e.backend == DevBackend::Hip
-                 ? ff_dev_hip_event_create(e.vendorIndex, &token)
-                 : ff_dev_cuda_event_create(e.vendorIndex, &token);
+    int rc = e.backend == DevBackend::HipNv
+                 ? ff_dev_hip_event_create_sm_120(e.vendorIndex, &token)
+                 : ff_dev_hip_event_create_gfx1201(e.vendorIndex, &token);
     if (rc != 0) {
         std::fprintf(stderr,
                      "[ffdev] DevEventCreate(%d) failed via %s backend\n",
@@ -352,9 +339,9 @@ int DevEventDestroy(DevEvent* ev)
         std::fprintf(stderr, "[ffdev] DevEventDestroy: null event\n");
         return -1;
     }
-    int rc = ev->backend == DevBackend::Hip
-                 ? ff_dev_hip_event_destroy(ev->vendorIndex, ev->token)
-                 : ff_dev_cuda_event_destroy(ev->vendorIndex, ev->token);
+    int rc = ev->backend == DevBackend::HipNv
+                 ? ff_dev_hip_event_destroy_sm_120(ev->vendorIndex, ev->token)
+                 : ff_dev_hip_event_destroy_gfx1201(ev->vendorIndex, ev->token);
     if (rc != 0) {
         std::fprintf(stderr,
                      "[ffdev] DevEventDestroy(%d) failed via %s backend\n",
@@ -372,9 +359,9 @@ int DevEventRecord(DevEvent* ev, DevStream* s)
         return -1;
     }
     void* sTok = s ? s->token : nullptr;
-    int rc = ev->backend == DevBackend::Hip
-                 ? ff_dev_hip_event_record(ev->vendorIndex, ev->token, sTok)
-                 : ff_dev_cuda_event_record(ev->vendorIndex, ev->token, sTok);
+    int rc = ev->backend == DevBackend::HipNv
+                 ? ff_dev_hip_event_record_sm_120(ev->vendorIndex, ev->token, sTok)
+                 : ff_dev_hip_event_record_gfx1201(ev->vendorIndex, ev->token, sTok);
     if (rc != 0) {
         std::fprintf(stderr,
                      "[ffdev] DevEventRecord(%d) failed via %s backend\n",
@@ -390,9 +377,9 @@ int DevEventSync(DevEvent* ev)
         std::fprintf(stderr, "[ffdev] DevEventSync: null event\n");
         return -1;
     }
-    int rc = ev->backend == DevBackend::Hip
-                 ? ff_dev_hip_event_sync(ev->vendorIndex, ev->token)
-                 : ff_dev_cuda_event_sync(ev->vendorIndex, ev->token);
+    int rc = ev->backend == DevBackend::HipNv
+                 ? ff_dev_hip_event_sync_sm_120(ev->vendorIndex, ev->token)
+                 : ff_dev_hip_event_sync_gfx1201(ev->vendorIndex, ev->token);
     if (rc != 0) {
         std::fprintf(stderr,
                      "[ffdev] DevEventSync(%d) failed via %s backend\n",
@@ -415,11 +402,11 @@ int DevEventElapsedMs(DevEvent* start, DevEvent* end, float* ms)
                      "devices/backends\n");
         return -1;
     }
-    int rc = start->backend == DevBackend::Hip
-                 ? ff_dev_hip_event_elapsed_ms(start->vendorIndex,
-                                               start->token, end->token, ms)
-                 : ff_dev_cuda_event_elapsed_ms(start->vendorIndex,
-                                                start->token, end->token, ms);
+    int rc = start->backend == DevBackend::HipNv
+                 ? ff_dev_hip_event_elapsed_ms_sm_120(start->vendorIndex,
+                                                      start->token, end->token, ms)
+                 : ff_dev_hip_event_elapsed_ms_gfx1201(start->vendorIndex,
+                                                       start->token, end->token, ms);
     if (rc != 0) {
         std::fprintf(stderr,
                      "[ffdev] DevEventElapsedMs(%d) failed via %s backend\n",
@@ -434,9 +421,9 @@ int DevLaunch(int deviceIndex, void* devBuf, int n, DevStream* s)
     DevMapEntry e;
     if (resolveLogical(deviceIndex, &e) != 0) return -1;
     void* sTok = s ? s->token : nullptr;
-    int rc = e.backend == DevBackend::Hip
-                 ? ff_dev_hip_launch(e.vendorIndex, devBuf, n, sTok)
-                 : ff_dev_cuda_launch(e.vendorIndex, devBuf, n, sTok);
+    int rc = e.backend == DevBackend::HipNv
+                 ? ff_dev_hip_launch_sm_120(e.vendorIndex, devBuf, n, sTok)
+                 : ff_dev_hip_launch_gfx1201(e.vendorIndex, devBuf, n, sTok);
     if (rc != 0) {
         std::fprintf(stderr,
                      "[ffdev] DevLaunch(%d) failed via %s backend\n",
@@ -451,9 +438,9 @@ int DevLaunchM0(int deviceIndex, int kernel_id, void* devBuf, int n, DevStream* 
     DevMapEntry e;
     if (resolveLogical(deviceIndex, &e) != 0) return -1;
     void* sTok = s ? s->token : nullptr;
-    int rc = e.backend == DevBackend::Hip
-                 ? ff_dev_hip_m0_launch(e.vendorIndex, kernel_id, devBuf, n, sTok)
-                 : ff_dev_cuda_m0_launch(e.vendorIndex, kernel_id, devBuf, n, sTok);
+    int rc = e.backend == DevBackend::HipNv
+                 ? ff_dev_hip_m0_launch_sm_120(e.vendorIndex, kernel_id, devBuf, n, sTok)
+                 : ff_dev_hip_m0_launch_gfx1201(e.vendorIndex, kernel_id, devBuf, n, sTok);
     if (rc != 0) {
         std::fprintf(stderr,
                      "[ffdev] DevLaunchM0(%d, kernel=%d) failed via %s backend\n",
@@ -469,9 +456,9 @@ int DevForceBackendForBus(const char* busId, DevBackend backend)
         std::fprintf(stderr, "[ffdev] error: DevInit() not called\n");
         return -1;
     }
-    if (backend != DevBackend::Hip && backend != DevBackend::Cuda) {
-        std::fprintf(stderr, "[ffdev] error: DevForceBackendForBus: unknown "
-                             "backend\n");
+    if (backend != DevBackend::HipAmd && backend != DevBackend::HipNv) {
+        std::fprintf(stderr, "[ffdev] error: DevForceBackendForBus: only HIP "
+                             "backends are supported\n");
         return -1;
     }
     // The bus must be a known logical device.
@@ -490,17 +477,12 @@ int DevForceBackendForBus(const char* busId, DevBackend backend)
         return -1;
     }
 
-    // Re-enumerate the forced backend and locate the bus INSIDE it. This is
-    // the no-silent-fallback gate: if the backend cannot see the bus, forcing
-    // would dispatch vendor ops at the wrong runtime index and silently run
-    // on the wrong device — refuse loudly instead. On success the vendor
-    // runtime index is recomputed within the forced backend, so the remap is
-    // genuinely correct when it applies.
+    // Re-enumerate the forced backend and locate the bus INSIDE it.
     ff::DeviceInfo buf[kMaxDevices] = {};
     int count = 0;
-    int rc = backend == DevBackend::Hip
-                 ? ff_enum_hip(buf, kMaxDevices, &count)
-                 : ff_enum_cuda(buf, kMaxDevices, &count);
+    int rc = backend == DevBackend::HipNv
+                 ? ff_enum_hip_sm_120(buf, kMaxDevices, &count)
+                 : ff_enum_hip_gfx1201(buf, kMaxDevices, &count);
     if (rc != 0) {
         std::fprintf(stderr,
                      "[ffdev] DevForceBackendForBus: re-enumerating forced "
@@ -517,9 +499,7 @@ int DevForceBackendForBus(const char* busId, DevBackend backend)
     if (vendorIndex < 0) {
         std::fprintf(stderr,
                      "[ffdev] DevForceBackendForBus: forced backend '%s' "
-                     "CANNOT see PCI bus %s (it sees: %s) — forcing would "
-                     "silently run on the wrong device; refusing (no silent "
-                     "fallback)\n",
+                     "CANNOT see PCI bus %s (it sees: %s) — refusing\n",
                      backendName(backend), bus.c_str(), seen.c_str());
         return -1;
     }

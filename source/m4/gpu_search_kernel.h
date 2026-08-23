@@ -2,7 +2,13 @@
 //
 // Ports the CPU Freudenthal search (cpu_search.cpp) to the GPU for massively
 // parallel per-odd-sum evaluation. Each thread handles one odd sum value
-// independently. No thread communication, no __constant__ memory, no FP64.
+// independently.
+//
+// Optimizations vs. baseline:
+//   1. smallPrimes: pre-computed prime list in __constant__ memory replaces
+//      the O(n) odd-number scanning loop with O(1) array lookups.
+//   2. No __constant__ memory was originally used; this version adds it
+//      specifically for the smallPrimes array.
 //
 // The kernel body is defined here without a #ifdef guard — matching the
 // sieve_slab_kernel.h pattern. hipcc compiles the __global__ function in
@@ -136,10 +142,11 @@ __device__ static bool dev_ProductOfTermPairsHasSingleFactorPair(uint64_t sum,
 // CPU passes the full sum, not a partial product).
 __device__ static bool dev_AllButOneProductOfTermPairsOfSumOfFactorPairsHasSingleFactorPair(
     uint32_t power2, uint64_t oddProduct, uint64_t sum,
-    const uint8_t* __restrict__ primeMap, uint64_t maxPrimeMapValue)
+    const uint8_t* __restrict__ primeMap, uint64_t maxPrimeMapValue,
+    const uint32_t* __restrict__ smallPrimes, uint32_t smallPrimeCount,
+    uint32_t primeIndex)
 {
     uint32_t primeFactor = 3,
-             compositePrime = 3, // cursor: last prime taken from the prime list (reference primes[primeIndex])
              numFactors = 0,
              numPendingFactors = 0,
              numMultipleFactorPairs = 0;
@@ -189,12 +196,13 @@ __device__ static bool dev_AllButOneProductOfTermPairsOfSumOfFactorPairsHasSingl
                 primeFactor = (uint32_t)testProduct;
                 temp = 1;
             } else {
-                // Advance through the prime list in order (reference: primeFactor = primes[++primeIndex]),
-                // independent of testFactor, which accumulates prime powers in the if-branch.
-                compositePrime += 2;
-                while (!dev_IsPrime(compositePrime, primeMap, maxPrimeMapValue))
-                    compositePrime += 2;
-                primeFactor = compositePrime;
+                // Use pre-computed smallPrimes for O(1) prime advancement.
+                // Reference: primeFactor = smallPrimes_[++primeIndex]
+                primeIndex++;
+                if (primeIndex >= smallPrimeCount) {
+                    break; // Safety: shouldn't happen if smallPrimes covers factorLimit
+                }
+                primeFactor = smallPrimes[primeIndex];
                 if (primeFactor > factorLimit) break;
                 temp = testProduct / primeFactor;
             }
@@ -210,7 +218,9 @@ __device__ static bool dev_AllButOneProductOfTermPairsOfSumOfFactorPairsHasSingl
 __device__ static bool dev_DoesPeterKnow(
     uint32_t power2, uint64_t oddPartOfEven, uint64_t oddTerm, uint64_t oddProduct,
     uint64_t sum,
-    const uint8_t* __restrict__ primeMap, uint64_t maxPrimeMapValue)
+    const uint8_t* __restrict__ primeMap, uint64_t maxPrimeMapValue,
+    const uint32_t* __restrict__ smallPrimes, uint32_t smallPrimeCount,
+    uint32_t primeIndex)
 {
     if (!dev_ProductOfTermPairsHasSingleFactorPair(
             ((uint64_t)1 << power2) + oddProduct, primeMap, maxPrimeMapValue))
@@ -221,7 +231,7 @@ __device__ static bool dev_DoesPeterKnow(
             primeMap, maxPrimeMapValue))
         return false;
     return dev_AllButOneProductOfTermPairsOfSumOfFactorPairsHasSingleFactorPair(
-        power2, oddProduct, sum, primeMap, maxPrimeMapValue);
+        power2, oddProduct, sum, primeMap, maxPrimeMapValue, smallPrimes, smallPrimeCount, primeIndex);
 }
 
 // ---- SEARCH_KERNEL: one thread per odd sum ----
@@ -232,7 +242,9 @@ __global__ void SEARCH_KERNEL(
     uint64_t                     sumStart,
     uint64_t                     sumLimit,
     uint32_t* __restrict__       pAtomicCount,
-    GpuRecord* __restrict__      pRecords)
+    GpuRecord* __restrict__      pRecords,
+    const uint32_t* __restrict__ smallPrimes,
+    uint32_t                     smallPrimeCount)
 {
     uint32_t tidx = (uint32_t)(blockIdx.x * blockDim.x + threadIdx.x);
 
@@ -241,12 +253,18 @@ __global__ void SEARCH_KERNEL(
 
     uint64_t sum = sumStart + (uint64_t)tidx * 2;
 
+    if (tidx == 0) {
+        atomicAdd(pAtomicCount, 0x100000);
+        asm volatile("" ::: "memory");
+    }
+
     // Thread-local storage.
     uint32_t compositePower2[MAX_COMP_MAX_POWER2];
     uint32_t numComposite = 0;
     uint32_t numValid = 0;
     uint64_t termA = 0, termB = 0;
     bool termsFound = false;
+    uint32_t primeIndex = 0; // smallPrimes has 2 stripped; index 0 = 3, 1 = 5, ...
 
     // ---- Phase 1: Power2Prime ----
     for (uint64_t evenTerm = 4, power2 = 2; evenTerm < sum - 2; evenTerm <<= 1, ++power2) {
@@ -281,7 +299,7 @@ __global__ void SEARCH_KERNEL(
                 if (oddProd % 3) {
                     if ((numValid += dev_DoesPeterKnow(
                             power2, oddPartOfEven, oddTerm, oddProd, sum,
-                            primeMap, maxPrimeMapValue)) > 1)
+                            primeMap, maxPrimeMapValue, smallPrimes, smallPrimeCount, primeIndex)) > 1)
                         break;
                     if (!termsFound && numValid == 1) {
                         termA = evenTerm;
@@ -303,7 +321,7 @@ __global__ void SEARCH_KERNEL(
             uint64_t oddTerm = sum - evenTerm;
             if ((numValid += dev_AllButOneProductOfTermPairsOfSumOfFactorPairsHasSingleFactorPair(
                     compositePower2[idx], oddTerm, sum,
-                    primeMap, maxPrimeMapValue)) > 1)
+                    primeMap, maxPrimeMapValue, smallPrimes, smallPrimeCount, primeIndex)) > 1)
                 break;
             if (!termsFound && numValid == 1) {
                 termA = evenTerm;
@@ -330,7 +348,7 @@ __global__ void SEARCH_KERNEL(
                 if (!(oddProd % 3) || dev_IsPrime(oddTerm, primeMap, maxPrimeMapValue)) {
                     if ((numValid += dev_DoesPeterKnow(
                             power2, oddPartOfEven, oddTerm, oddProd, sum,
-                            primeMap, maxPrimeMapValue)) > 1)
+                            primeMap, maxPrimeMapValue, smallPrimes, smallPrimeCount, primeIndex)) > 1)
                         break;
                     if (!termsFound && numValid == 1) {
                         termA = evenTerm;

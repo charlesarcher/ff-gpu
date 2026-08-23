@@ -27,8 +27,8 @@
 #include <chrono>
 #include <iostream>
 
-extern "C" int ff_enum_hip(ff::DeviceInfo* out, int maxDevices, int* outCount);
-extern "C" int ff_enum_cuda(ff::DeviceInfo* out, int maxDevices, int* outCount);
+extern "C" int ff_enum_hip_gfx1201(ff::DeviceInfo* out, int maxDevices, int* outCount);
+extern "C" int ff_enum_hip_sm_120(ff::DeviceInfo* out, int maxDevices, int* outCount);
 extern "C" int ff_smoke_main(void);   // todo-4 dual-runtime smoke (smoke/smoke_main.cpp)
 
 namespace {
@@ -39,7 +39,7 @@ struct RunDevices {
     std::vector<ff::DeviceInfo> devs;
     int skippedDuplicates = 0;
     bool hipFailed = false;
-    bool cudaFailed = false;
+    bool nvFailed = false;
 };
 
 double elapsedMs(const std::chrono::steady_clock::time_point& start) {
@@ -56,21 +56,21 @@ RunDevices enumerate()
 {
     RunDevices r;
     ff::DeviceInfo hipBuf[kMaxDevices] = {};
-    ff::DeviceInfo cudaBuf[kMaxDevices] = {};
-    int hipCount = 0, cudaCount = 0;
-    if (ff_enum_hip(hipBuf, kMaxDevices, &hipCount) != 0) {
+    ff::DeviceInfo nvBuf[kMaxDevices] = {};
+    int hipCount = 0, nvCount = 0;
+    if (ff_enum_hip_gfx1201(hipBuf, kMaxDevices, &hipCount) != 0) {
         std::fprintf(stderr,
                      "[ff_sieve] warning: HIP (AMD) enumeration failed; no AMD "
                      "devices will participate\n");
         r.hipFailed = true;
     }
-    if (ff_enum_cuda(cudaBuf, kMaxDevices, &cudaCount) != 0) {
+    if (ff_enum_hip_sm_120(nvBuf, kMaxDevices, &nvCount) != 0) {
         std::fprintf(stderr,
-                     "[ff_sieve] warning: CUDA (NVIDIA) enumeration failed; no "
-                     "NVIDIA devices will participate\n");
-        r.cudaFailed = true;
+                     "[ff_sieve] warning: HIP-NV (NVIDIA) enumeration failed; "
+                     "no NVIDIA devices will participate\n");
+        r.nvFailed = true;
     }
-    r.devs = ff::mergeAndDedupe(hipBuf, hipCount, cudaBuf, cudaCount,
+    r.devs = ff::mergeAndDedupe(hipBuf, hipCount, nvBuf, nvCount,
                                 &r.skippedDuplicates);
     return r;
 }
@@ -190,8 +190,10 @@ int runLeg(const ff::Config& cfg, const std::vector<std::string>& positionals)
     dumpPhaseTimer("device enumeration", enumMs);
     if (r.devs.empty()) {
         std::fprintf(stderr,
-                     "[ff_sieve] error: no devices enumerated (HIP%s, CUDA%s)\n",
-                     r.hipFailed ? " failed" : " ok", r.cudaFailed ? " failed" : " ok");
+                     "[ff_sieve] error: no devices enumerated (HIP-AMD%s, "
+                     "HIP-NV%s)\n",
+                     r.hipFailed ? " failed" : " ok",
+                     r.nvFailed ? " failed" : " ok");
         return 1;
     }
     if (r.skippedDuplicates > 0)
@@ -220,23 +222,22 @@ int runLeg(const ff::Config& cfg, const std::vector<std::string>& positionals)
         r.devs = std::move(kept);
     }
 
-    // FF_DISABLE_DEVICE=<amd|nvidia> (plan todo 10): removes a vendor's
-    // devices before budgets/scheduling (case-insensitive, enforced in
-    // loadEnv). An empty pool is a hard error — never run an unscheduled
-    // fallback path silently.
-    if (!cfg.disableVendors.empty()) {
+    // --disable-vendor=<amd|nvidia>: removes a vendor's
+    // devices before budgets/scheduling. An empty pool is a hard error —
+    // never run an unscheduled fallback path silently.
+    if (!cfg.disableVendor.empty()) {
         std::vector<ff::DeviceInfo> kept;
         for (const ff::DeviceInfo& d : r.devs) {
-            if (cfg.disableVendors != d.vendor) kept.push_back(d);
+            if (cfg.disableVendor != d.vendor) kept.push_back(d);
         }
         std::fprintf(stderr,
-                     "[ff_sieve] device filter: FF_DISABLE_DEVICE=%s kept %zu of "
+                     "[ff_sieve] device filter: --disable-vendor=%s kept %zu of "
                      "%zu logical device(s)\n",
-                     cfg.disableVendors.c_str(), kept.size(), r.devs.size());
+                     cfg.disableVendor.c_str(), kept.size(), r.devs.size());
         if (kept.empty()) {
-            std::fprintf(stderr, "[ff_sieve] ERROR: FF_DISABLE_DEVICE=%s leaves "
+            std::fprintf(stderr, "[ff_sieve] ERROR: --disable-vendor=%s leaves "
                                  "no devices (enumerated:",
-                         cfg.disableVendors.c_str());
+                         cfg.disableVendor.c_str());
             for (size_t i = 0; i < r.devs.size(); ++i)
                 std::fprintf(stderr, " %s", r.devs[i].vendor);
             std::fprintf(stderr, ")\n");
@@ -292,6 +293,33 @@ int runLeg(const ff::Config& cfg, const std::vector<std::string>& positionals)
 
     dumpPhaseTimer("budget computation", elapsedMs(t_budget));
 
+    // Print all available devices
+    std::fprintf(stderr, "[ff_sieve] available devices:\n");
+    for (size_t i = 0; i < r.devs.size(); ++i)
+        printDeviceHeader(r.devs[i], static_cast<int>(i));
+
+    // Save full device list; sieve may narrow it, search needs the original.
+    auto allDevs = r.devs;
+    auto allBudgets = budgets;
+    if (cfg.sieveDevice >= 0) {
+        if (cfg.sieveDevice >= static_cast<int>(r.devs.size())) {
+            std::fprintf(stderr,
+                         "[ff_sieve] ERROR: --sieve-device=%d but only %zu "
+                         "device(s) available\n",
+                         cfg.sieveDevice, r.devs.size());
+            return 1;
+        }
+        std::fprintf(stderr, "[ff_sieve] sieve device: device[%d] %s "
+                             "(--sieve-device=%d)\n",
+                     cfg.sieveDevice, r.devs[cfg.sieveDevice].name,
+                     cfg.sieveDevice);
+        r.devs = {r.devs[cfg.sieveDevice]};
+        budgets = {budgets[cfg.sieveDevice]};
+    } else {
+        std::fprintf(stderr, "[ff_sieve] sieve device: auto (all %zu devices)\n",
+                     r.devs.size());
+    }
+
     // AGGREGATE sieve run-gate (Oracle round-3): sum(device backing) +
     // host-tier-cap >= mapBytes(leg); host-tier-cap defaults to 0. The
     // per-device predicate mapBytes+searchWorkspace <= budget remains the M4
@@ -328,7 +356,7 @@ int runLeg(const ff::Config& cfg, const std::vector<std::string>& positionals)
                      static_cast<unsigned long long>(g.mapBytes),
                      ff::bytesToHuman(g.mapBytes).c_str());
         std::fprintf(stderr,
-                     "[ff_sieve] remediation: raise FF_VRAM_BUDGET and/or "
+                     "[ff_sieve] remediation: raise --vram-budget and/or "
                      "--host-tier-cap\n");
         return 1;
     }
@@ -409,58 +437,64 @@ maxPrimeMapValue = ff::runPullScheduler(cfg, r.devs, budgets, g,
         uint64_t recordBytes = numOddSums * sizeof(GpuRecord);
         uint64_t searchWorkspace = ff::searchWorkspaceBytes(g.sumLimit);
 
-        // GPU search is disabled: CPU search is faster than GPU search.
-        // The GPU sieve still runs (fast), but the Freudenthal search
-        // runs on CPU (31 threads, fits in L3 cache).
-        bool useGpu = false;
+        // GPU search path: when --gpu-search is requested, use the GPU Freudenthal
+        // kernel instead of CPU (31 threads). Falls back to CPU if VRAM or
+        // device allocation fails.
+        bool useGpu = cfg.gpuSearch;
         int gpuDeviceIndex = -1;
         ffdev::DevHandle dPrimeMap, dRecords, dAtomic;
 
         if (useGpu) {
             if (ffdev::DevInit() == 0) {
-                // M4 search-participation gate (plan todo 3): a device must be
-                // able to hold the map + record slots + per-thread factors[]
-                // workspace within its budgeted VRAM. The budget (min of the
-                // vram-fraction share and FF_VRAM_BUDGET) is the gate, so a
-                // small budget cap forces CPU fallback even when the raw
-                // freeBytes would fit.
                 uint64_t requiredBytes =
                     mapBytes + recordBytes + searchWorkspace;
-                for (int di = 0; di < (int)r.devs.size(); ++di) {
-                    if (budgets[di].budget >= requiredBytes) {
-                        gpuDeviceIndex = di;
+
+                // Restore full device list (sieve may have narrowed it).
+                r.devs = allDevs;
+                budgets = allBudgets;
+
+                if (cfg.gpuSearchDevice >= 0) {
+                    if (cfg.gpuSearchDevice >= static_cast<int>(r.devs.size())) {
                         std::fprintf(stderr,
-                            "[ff_sieve] GPU search: device[%d] %s — "
-                            "budget OK: map %llu B + records %llu B + "
-                            "workspace %llu B <= budget %llu B\n",
-                            di, r.devs[di].name,
-                            static_cast<unsigned long long>(mapBytes),
-                            static_cast<unsigned long long>(recordBytes),
-                            static_cast<unsigned long long>(searchWorkspace),
-                            static_cast<unsigned long long>(
-                                budgets[di].budget));
-                        break;
+                            "[ff_sieve] GPU search: ERROR: --gpu-search-device=%d "
+                            "but only %zu device(s) available\n",
+                            cfg.gpuSearchDevice, r.devs.size());
+                        useGpu = false;
+                    } else if (budgets[cfg.gpuSearchDevice].budget < requiredBytes) {
+                        std::fprintf(stderr,
+                            "[ff_sieve] GPU search: device[%d] %s skipped — "
+                            "need %llu B, budget %llu B\n",
+                            cfg.gpuSearchDevice, r.devs[cfg.gpuSearchDevice].name,
+                            static_cast<unsigned long long>(requiredBytes),
+                            static_cast<unsigned long long>(budgets[cfg.gpuSearchDevice].budget));
+                        useGpu = false;
+                    } else {
+                        gpuDeviceIndex = cfg.gpuSearchDevice;
+                        std::fprintf(stderr,
+                            "[ff_sieve] GPU search: device[%d] %s "
+                            "(--gpu-search-device=%d)\n",
+                            gpuDeviceIndex, r.devs[gpuDeviceIndex].name,
+                            cfg.gpuSearchDevice);
                     }
-                }
-                if (gpuDeviceIndex < 0) {
-                    // No device qualifies. Never reach DevAlloc with a stale
-                    // index: print the rejection and degrade to CPU search.
-                    std::fprintf(stderr,
-                        "[ff_sieve] GPU search: ERROR: insufficient VRAM for "
-                        "GPU search. Need %llu B (map=%llu + records=%llu + "
-                        "workspace=%llu), device budgets: ",
-                        static_cast<unsigned long long>(requiredBytes),
-                        static_cast<unsigned long long>(mapBytes),
-                        static_cast<unsigned long long>(recordBytes),
-                        static_cast<unsigned long long>(searchWorkspace));
-                    for (size_t di = 0; di < budgets.size(); ++di) {
-                        if (di > 0) std::fprintf(stderr, ", ");
-                        std::fprintf(stderr, "%llu B",
-                            static_cast<unsigned long long>(
-                                budgets[di].budget));
+                } else {
+                    for (int di = 0; di < (int)r.devs.size(); ++di) {
+                        if (budgets[di].budget >= requiredBytes) {
+                            gpuDeviceIndex = di;
+                            std::fprintf(stderr,
+                                "[ff_sieve] GPU search: device[%d] %s "
+                                "(auto, budget=%llu B)\n",
+                                di, r.devs[di].name,
+                                static_cast<unsigned long long>(budgets[di].budget));
+                            break;
+                        }
                     }
-                    std::fprintf(stderr, ". Falling back to CPU search.\n");
-                    useGpu = false;
+                    if (gpuDeviceIndex < 0) {
+                        std::fprintf(stderr,
+                            "[ff_sieve] GPU search: no device fits "
+                            "(need %llu B). Falling back to CPU.\n",
+                            static_cast<unsigned long long>(requiredBytes));
+                        useGpu = false;
+                    }
                 }
             } else {
                 // Only reachable when GPU search was actually requested
@@ -472,33 +506,65 @@ maxPrimeMapValue = ff::runPullScheduler(cfg, r.devs, budgets, g,
             }
         }
 
+        // GPU search: allocate via the same per-arch HIP objects that launch
+        // the kernel (GpuSearchAlloc dispatches by vendor), so the allocator
+        // and the kernel launch share one runtime context per device.
         if (useGpu) {
-            if (ffdev::DevAlloc(gpuDeviceIndex, mapBytes, &dPrimeMap) != 0 ||
-                ffdev::DevAlloc(gpuDeviceIndex, recordBytes, &dRecords) != 0 ||
-                ffdev::DevAlloc(gpuDeviceIndex, sizeof(uint32_t), &dAtomic) != 0) {
+            if (GpuSearchAlloc(r.devs[gpuDeviceIndex].runtimeIndex,
+                               r.devs[gpuDeviceIndex].vendor,
+                               mapBytes, &dPrimeMap.ptr) != 0 ||
+                GpuSearchAlloc(r.devs[gpuDeviceIndex].runtimeIndex,
+                               r.devs[gpuDeviceIndex].vendor,
+                               recordBytes, &dRecords.ptr) != 0 ||
+                GpuSearchAlloc(r.devs[gpuDeviceIndex].runtimeIndex,
+                               r.devs[gpuDeviceIndex].vendor,
+                               sizeof(uint32_t), &dAtomic.ptr) != 0) {
                 std::fprintf(stderr,
                     "[ff_sieve] GPU search: device allocation failed, using CPU fallback\n");
                 useGpu = false;
             }
         }
 
+        // Get smallPrimes from engine (needed for GPU search; skip p=2 since kernel sieve already handles it).
+        uint32_t smallPrimeCount = 0;
+        const uint32_t* smallPrimesRaw = engine.getSmallPrimes(&smallPrimeCount);
+        // GPU kernel skips p=2 (sieve already handles it); CPU AllButOne expects leading 2.
+        const uint32_t* smallPrimesGpu = smallPrimesRaw;
+        uint32_t smallPrimeCountGpu = smallPrimeCount;
+        if (smallPrimeCountGpu > 1 && smallPrimesGpu[0] == 2) {
+            smallPrimesGpu++;
+            smallPrimeCountGpu--;
+        }
+        // Device handle for smallPrimes — zero-initialized, freed in cleanup below.
+        ffdev::DevHandle dSmallPrimes;
+        dSmallPrimes.ptr = nullptr;
+
+        // Host buffers used by GPU path; declared here so they're visible in both if (useGpu) blocks.
+        uint32_t hAtomicCount = 0;
+        std::vector<GpuRecord> hRecords(numOddSums);
+
         if (useGpu) {
-            // Zero-init atomic counter
-            uint32_t hAtomicCount = 0;
-            ffdev::DevCopy(&dAtomic, &hAtomicCount, sizeof(uint32_t),
-                           ffdev::DevCopyDir::H2D);
+            int ri = r.devs[gpuDeviceIndex].runtimeIndex;
+            const char* v = r.devs[gpuDeviceIndex].vendor;
 
-            // Zero-fill the records buffer: the kernel writes one
-            // sum-indexed slot per odd sum, so unsolved slots must read
-            // zero on the host copy-back for deterministic emission.
-            std::vector<GpuRecord> hRecords(numOddSums);
-            ffdev::DevCopy(&dRecords, hRecords.data(), recordBytes,
-                           ffdev::DevCopyDir::H2D);
+            hAtomicCount = 0;
+            GpuSearchCopyH2D(ri, v, dAtomic.ptr, &hAtomicCount, sizeof(uint32_t));
 
-            // Copy host prime map to device
-            ffdev::DevCopy(&dPrimeMap, hostMap.data(), mapBytes,
-                           ffdev::DevCopyDir::H2D);
+            std::fill(hRecords.begin(), hRecords.end(), GpuRecord{});
+            GpuSearchCopyH2D(ri, v, dRecords.ptr, hRecords.data(), recordBytes);
 
+            GpuSearchCopyH2D(ri, v, dPrimeMap.ptr, hostMap.data(), mapBytes);
+
+            if (GpuSearchAlloc(ri, v, smallPrimeCountGpu * sizeof(uint32_t), &dSmallPrimes.ptr) != 0) {
+                std::fprintf(stderr, "[ff_sieve] GPU search: smallPrimes allocation failed\n");
+                useGpu = false;
+            } else {
+                GpuSearchCopyH2D(ri, v, dSmallPrimes.ptr, smallPrimesGpu,
+                                 smallPrimeCountGpu * sizeof(uint32_t));
+            }
+        }
+
+        if (useGpu) {
             // Launch GPU search.  Dispatch by vendor: both runtimes number
             // their devices from 0, so an index-only launcher would pick the
             // wrong arch (page fault when the selected device != allocator).
@@ -509,28 +575,28 @@ maxPrimeMapValue = ff::runPullScheduler(cfg, r.devs, budgets, g,
                 maxPrimeMapValue,
                 g.sumStart, g.sumLimit,
                 static_cast<GpuRecord*>(dRecords.ptr),
-                static_cast<uint32_t*>(dAtomic.ptr));
+                static_cast<uint32_t*>(dAtomic.ptr),
+                static_cast<const uint32_t*>(dSmallPrimes.ptr),
+                smallPrimeCountGpu);
 
             if (launchRet == 0) {
-                // Copy atomic count back
-                ffdev::DevCopy(&dAtomic, &hAtomicCount, sizeof(uint32_t),
-                               ffdev::DevCopyDir::D2H);
+                int ri = r.devs[gpuDeviceIndex].runtimeIndex;
+                const char* v = r.devs[gpuDeviceIndex].vendor;
 
-                // Copy the full sum-indexed record array back
-                ffdev::DevCopy(&dRecords, hRecords.data(), recordBytes,
-                               ffdev::DevCopyDir::D2H);
+                GpuSearchCopyD2H(ri, v, &hAtomicCount, dAtomic.ptr, sizeof(uint32_t));
 
-                // Format output (stdout, byte-exact)
+                GpuSearchCopyD2H(ri, v, hRecords.data(), dRecords.ptr, recordBytes);
+
                 std::cout.flush();
                 auto t1 = std::chrono::high_resolution_clock::now();
                 GpuSearchEmit(prime, hRecords.data(),
                               static_cast<uint32_t>(numOddSums));
                 auto t2 = std::chrono::high_resolution_clock::now();
 
-                // Free device memory
-                ffdev::DevFree(&dRecords);
-                ffdev::DevFree(&dAtomic);
-                ffdev::DevFree(&dPrimeMap);
+                GpuSearchFree(gpuDeviceIndex, r.devs[gpuDeviceIndex].vendor, dSmallPrimes.ptr);
+                GpuSearchFree(gpuDeviceIndex, r.devs[gpuDeviceIndex].vendor, dRecords.ptr);
+                GpuSearchFree(gpuDeviceIndex, r.devs[gpuDeviceIndex].vendor, dAtomic.ptr);
+                GpuSearchFree(gpuDeviceIndex, r.devs[gpuDeviceIndex].vendor, dPrimeMap.ptr);
 
                 // Print timing (stdout, byte-exact)
                 uint64_t searchUs = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
@@ -546,17 +612,18 @@ maxPrimeMapValue = ff::runPullScheduler(cfg, r.devs, budgets, g,
             }
         }
 
-        // Free device memory on any failure path
-        if (dPrimeMap.ptr) ffdev::DevFree(&dPrimeMap);
-        if (dRecords.ptr)  ffdev::DevFree(&dRecords);
-        if (dAtomic.ptr)   ffdev::DevFree(&dAtomic);
+        // Free device memory on any failure path (gpuDeviceIndex >= 0
+        // whenever any of these pointers was allocated).
+        const char* fv = gpuDeviceIndex >= 0 ? r.devs[gpuDeviceIndex].vendor : nullptr;
+        if (dSmallPrimes.ptr) GpuSearchFree(gpuDeviceIndex, fv, dSmallPrimes.ptr);
+        if (dPrimeMap.ptr)    GpuSearchFree(gpuDeviceIndex, fv, dPrimeMap.ptr);
+        if (dRecords.ptr)     GpuSearchFree(gpuDeviceIndex, fv, dRecords.ptr);
+        if (dAtomic.ptr)      GpuSearchFree(gpuDeviceIndex, fv, dAtomic.ptr);
 
-        // CPU fallback
+        // CPU fallback (reuses smallPrimesRaw/smallPrimeCount from outer scope).
         auto t1 = std::chrono::high_resolution_clock::now();
         int count = 0;
-        uint32_t smallPrimeCount = 0;
-        const uint32_t* smallPrimes = engine.getSmallPrimes(&smallPrimeCount);
-        RunIt(prime, g.sumStart, g.sumLimit, g.productLimit, smallPrimes, smallPrimeCount, count);
+        RunIt(prime, g.sumStart, g.sumLimit, g.productLimit, smallPrimesRaw, smallPrimeCount, cfg.threads, count);
         auto t2 = std::chrono::high_resolution_clock::now();
 
         // Print timing (stdout, byte-exact) - μ is UTF-8 micro sign.
@@ -580,7 +647,6 @@ int main(int argc, char** argv)
     int ret = 0;
     {
         ff::Config cfg;
-        if (ff::loadEnv(&cfg) != 0) { ret = 1; goto done; }
         if (ff::loadPullWeights(&cfg) != 0) { ret = 1; goto done; }
         std::vector<std::string> positionals;
         if (ff::parseArgs(argc, argv, &cfg, &positionals) != 0) { ret = 1; goto done; }

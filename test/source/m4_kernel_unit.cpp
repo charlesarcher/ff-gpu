@@ -281,19 +281,16 @@ extern "C" {
     extern int SearchKernelRun_gfx1201(int deviceIndex,
                                        const uint8_t* d_primeMap, uint64_t d_maxPrimeMapValue,
                                        uint64_t d_sumStart, uint64_t d_sumLimit,
-                                       uint32_t* d_pAtomicCount, GpuRecord* d_pRecords);
-    extern int SearchKernelRun_sm_120(int deviceIndex,
-                                      const uint8_t* d_primeMap, uint64_t d_maxPrimeMapValue,
-                                      uint64_t d_sumStart, uint64_t d_sumLimit,
-                                      uint32_t* d_pAtomicCount, GpuRecord* d_pRecords);
+                                       uint32_t* d_pAtomicCount, GpuRecord* d_pRecords,
+                                       const uint32_t* d_smallPrimes, uint32_t d_smallPrimeCount);
 }
 
 typedef int (*SearchKernelRunFn)(int, const uint8_t*, uint64_t,
                                   uint64_t, uint64_t,
-                                  uint32_t*, GpuRecord*);
+                                  uint32_t*, GpuRecord*,
+                                  const uint32_t*, uint32_t);
 
 extern "C" SearchKernelRunFn SearchKernelGetLaunchFn_gfx1201(int deviceIndex);
-extern "C" SearchKernelRunFn SearchKernelGetLaunchFn_sm_120(int deviceIndex);
 
 // ---- Test: verify kernel output against CPU reference ----
 
@@ -459,6 +456,24 @@ static int runTest(uint32_t sumStart, uint64_t sumLimit, uint32_t testInterval) 
     size_t recordSize = (size_t)numOddSums * sizeof(GpuRecord);
     CHECK(ffdev::DevAlloc(0, recordSize, &dhRecords));
 
+    // 5b. Generate smallPrimes and copy to device (kernel needs them for
+    //     prime factor advancement in AllButOneProductOfTermPairs).
+    //     Strip leading 2 to match main.cpp behavior: index 0 = 3, 1 = 5, ...
+    // cpu_generateSmallPrimes(limit) generates primes up to sqrt(limit).
+    // The kernel needs primes up to factorLimit ~ sqrt(product) ~ sumLimit/2.
+    // Pass sumLimit^2 so sqrt(sumLimit^2) = sumLimit covers the full range.
+    std::vector<uint32_t> h_smallPrimesRaw = cpu_generateSmallPrimes(sumLimit * sumLimit);
+    const uint32_t* smallPrimesPtr = h_smallPrimesRaw.data();
+    uint32_t smallPrimeCount = (uint32_t)h_smallPrimesRaw.size();
+    if (smallPrimeCount > 1 && smallPrimesPtr[0] == 2) {
+        smallPrimesPtr++;
+        smallPrimeCount--;
+    }
+    ffdev::DevHandle dhSmallPrimes;
+    CHECK(ffdev::DevAlloc(0, smallPrimeCount * sizeof(uint32_t), &dhSmallPrimes));
+    CHECK(ffdev::DevCopy(&dhSmallPrimes, const_cast<uint32_t*>(smallPrimesPtr), smallPrimeCount * sizeof(uint32_t),
+                         ffdev::DevCopyDir::H2D));
+
     // 6. Copy prime map to device.
     CHECK(ffdev::DevCopy(&dhPrimeMap, h_primeMap.data(), primeMapSize, ffdev::DevCopyDir::H2D));
 
@@ -474,10 +489,10 @@ static int runTest(uint32_t sumStart, uint64_t sumLimit, uint32_t testInterval) 
 
     // 8. Resolve kernel launch function.
     SearchKernelRunFn launchFn = SearchKernelGetLaunchFn_gfx1201(0);
-    if (!launchFn) launchFn = SearchKernelGetLaunchFn_sm_120(0);
     if (!launchFn) {
         std::printf("  Kernel launch function not available — skipping.\n");
         // Clean up.
+        ffdev::DevFree(&dhSmallPrimes);
         ffdev::DevFree(&dhRecords);
         ffdev::DevFree(&dhAtomicCount);
         ffdev::DevFree(&dhPrimeMap);
@@ -491,9 +506,11 @@ static int runTest(uint32_t sumStart, uint64_t sumLimit, uint32_t testInterval) 
     int rc = launchFn(0,
                       (const uint8_t*)dhPrimeMap.ptr, (uint64_t)maxPrimeMapValue,
                       (uint64_t)sumStart, (uint64_t)sumLimit,
-                      (uint32_t*)dhAtomicCount.ptr, (GpuRecord*)dhRecords.ptr);
+                      (uint32_t*)dhAtomicCount.ptr, (GpuRecord*)dhRecords.ptr,
+                      (const uint32_t*)dhSmallPrimes.ptr, smallPrimeCount);
     if (rc != 0) {
         std::fprintf(stderr, "  Kernel launch failed (rc=%d)\n", rc);
+        ffdev::DevFree(&dhSmallPrimes);
         ffdev::DevFree(&dhRecords);
         ffdev::DevFree(&dhAtomicCount);
         ffdev::DevFree(&dhPrimeMap);
@@ -590,6 +607,7 @@ static int runTest(uint32_t sumStart, uint64_t sumLimit, uint32_t testInterval) 
                 h_atomicCount, sumStart, (unsigned long long)sumLimit);
 
     // Clean up device memory.
+    ffdev::DevFree(&dhSmallPrimes);
     ffdev::DevFree(&dhRecords);
     ffdev::DevFree(&dhAtomicCount);
     ffdev::DevFree(&dhPrimeMap);

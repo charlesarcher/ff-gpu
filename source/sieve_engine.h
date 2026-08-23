@@ -20,15 +20,7 @@
 class SieveEngine {
 public:
     // Construct for the given logical device index (0-based) and vendor
-    // ("amd" or "nvidia").  The vendor selects the per-arch dispatch function:
-    //   amd  → gfx1201  (ROCm HIP backend)
-    //   nvidia → sm_120  (CUDA backend via HIP)
-    //
-    // The vendor is critical because the dispatch helper validates deviceIndex
-    // against hipGetDeviceCount(), which in the ROCm HIP runtime returns the
-    // total device count (AMD + NVIDIA).  Without vendor-based selection the
-    // gfx1201 path would incorrectly "win" for an NVIDIA device and run on
-    // the AMD 9070 XT, causing OOM.
+    // ("amd").  Always dispatches to the gfx1201 (AMD RDNA4) path.
     SieveEngine(int deviceIndex, const char* vendor);
     ~SieveEngine();
 

@@ -39,7 +39,7 @@ bool parseSizeImpl(const std::string& s, uint64_t* out)
     return true;
 }
 
-// FF_PULL_WEIGHTS spec: comma-separated "vendor=weight" pairs (vendor
+// --pull-weights spec: comma-separated "vendor=weight" pairs (vendor
 // case-insensitive, weight > 0). Malformed/zero/negative -> false.
 bool parsePullWeightsSpec(const std::string& spec,
                           std::map<std::string, double>* out)
@@ -153,90 +153,6 @@ bool parseDeviceFractionSpec(const std::string& spec,
     return true;
 }
 
-int loadEnv(Config* cfg)
-{
-    const char* v = nullptr;
-    double d = 0.0;
-    if ((v = std::getenv("FF_VRAM_FRACTION")) && *v) {
-        if (!parseFraction(v, &d)) {
-            std::fprintf(stderr, "[ff_sieve] error: malformed FF_VRAM_FRACTION='%s'\n", v);
-            return -1;
-        }
-        cfg->globalFraction = d;
-    }
-    if ((v = std::getenv("FF_DEVICE_VRAM_FRACTION")) && *v) {
-        std::map<std::string, double> m;
-        if (!parseDeviceFractionSpec(v, &m)) {
-            std::fprintf(stderr,
-                         "[ff_sieve] error: malformed FF_DEVICE_VRAM_FRACTION='%s' "
-                         "(expected 'amd=0.9,nvidia=0.8')\n", v);
-            return -1;
-        }
-        cfg->deviceFractions = m;
-    }
-    uint64_t sz = 0;
-    if ((v = std::getenv("FF_VRAM_BUDGET")) && *v) {
-        if (!parseSize(v, &sz)) {
-            std::fprintf(stderr, "[ff_sieve] error: malformed FF_VRAM_BUDGET='%s' "
-                         "(expected e.g. 20GiB)\n", v);
-            return -1;
-        }
-        cfg->hasBudgetCap = true;
-        cfg->budgetCapBytes = sz;
-    }
-    if ((v = std::getenv("FF_SCRATCH")) && *v) {
-        if (!parseSize(v, &sz)) {
-            std::fprintf(stderr, "[ff_sieve] error: malformed FF_SCRATCH='%s'\n", v);
-            return -1;
-        }
-        cfg->hasScratch = true;
-        cfg->scratchBytes = sz;
-    }
-    if ((v = std::getenv("FF_SLAB_SIZE")) && *v) {
-        if (!parseSize(v, &sz)) {
-            std::fprintf(stderr, "[ff_sieve] error: malformed FF_SLAB_SIZE='%s'\n", v);
-            return -1;
-        }
-        cfg->slabSizeBytes = sz;
-    }
-    if ((v = std::getenv("FF_HOST_TIER_CAP")) && *v) {
-        if (toLower(v) == "auto") {
-            cfg->hasHostTierCap = true;
-            cfg->hostTierAuto = true;
-        } else if (!parseSize(v, &sz)) {
-            std::fprintf(stderr, "[ff_sieve] error: malformed FF_HOST_TIER_CAP='%s' "
-                         "(expected a size or 'auto')\n", v);
-            return -1;
-        } else {
-            cfg->hasHostTierCap = true;
-            cfg->hostTierCapBytes = sz;
-        }
-    }
-    if ((v = std::getenv("FF_PULL_WEIGHTS")) && *v) {
-        std::map<std::string, double> w;
-        if (!parsePullWeightsSpec(v, &w)) {
-            std::fprintf(stderr,
-                         "[ff_sieve] error: malformed FF_PULL_WEIGHTS='%s' "
-                         "(expected comma-separated 'vendor=weight', e.g. "
-                         "'nvidia=1656.10,amd=598.75'; weights must be > 0)\n",
-                         v);
-            return -1;
-        }
-        cfg->pullWeights = w;
-    }
-    if ((v = std::getenv("FF_DISABLE_DEVICE")) && *v) {
-        std::string b = toLower(v);
-        if (b != "amd" && b != "nvidia") {
-            std::fprintf(stderr,
-                         "[ff_sieve] error: malformed FF_DISABLE_DEVICE='%s' "
-                         "(expected 'amd' or 'nvidia', case-insensitive)\n", v);
-            return -1;
-        }
-        cfg->disableVendors = b;
-    }
-    return 0;
-}
-
 int parseArgs(int argc, char** argv, Config* cfg,
               std::vector<std::string>* positionals)
 {
@@ -264,6 +180,46 @@ int parseArgs(int argc, char** argv, Config* cfg,
             return nullptr;
         };
 
+        if (name == "--threads") {
+            const char* v = needValue(name.c_str());
+            if (!v) return -1;
+            char* end = nullptr;
+            long n = std::strtol(v, &end, 10);
+            if (end == v || *end != '\0' || n < 0) {
+                std::fprintf(stderr, "[ff_sieve] error: --threads must be a non-negative integer\n");
+                return -1;
+            }
+            cfg->threads = static_cast<int>(n);
+            continue;
+        }
+        if (name == "--pull-weights") {
+            const char* v = needValue(name.c_str());
+            if (!v) return -1;
+            std::map<std::string, double> w;
+            if (!parsePullWeightsSpec(v, &w)) {
+                std::fprintf(stderr,
+                             "[ff_sieve] error: invalid --pull-weights '%s' "
+                             "(expected comma-separated 'vendor=weight', e.g. "
+                             "'amd=598.75'; weights must be > 0)\n",
+                             v);
+                return -1;
+            }
+            cfg->pullWeights = w;
+            continue;
+        }
+        if (name == "--disable-vendor") {
+            const char* v = needValue(name.c_str());
+            if (!v) return -1;
+            std::string b = toLower(v);
+            if (b != "amd") {
+                std::fprintf(stderr,
+                             "[ff_sieve] error: invalid --disable-vendor '%s' "
+                             "(expected 'amd')\n", v);
+                return -1;
+            }
+            cfg->disableVendor = b;
+            continue;
+        }
         if (name == "--list-devices") {
             cfg->listDevices = true;
             continue;
@@ -290,7 +246,7 @@ int parseArgs(int argc, char** argv, Config* cfg,
             if (!parseDeviceFractionSpec(v, &m)) {
                 std::fprintf(stderr,
                              "[ff_sieve] error: invalid --device-vram-fraction '%s' "
-                             "(expected 'amd=0.9,nvidia=0.8')\n", v);
+                             "(expected 'amd=0.9')\n", v);
                 return -1;
             }
             cfg->deviceFractions = m;
@@ -374,6 +330,31 @@ if (name == "--dump-map") {
         }
         if (name == "--gpu-search") {
             cfg->gpuSearch = true;
+            continue;
+        }
+        if (name == "--gpu-search-device") {
+            const char* v = needValue(name.c_str());
+            if (!v) return -1;
+            char* end = nullptr;
+            long idx = std::strtol(v, &end, 10);
+            if (end == v || *end != '\0' || idx < 0) {
+                std::fprintf(stderr, "[ff_sieve] error: --gpu-search-device must be a non-negative integer\n");
+                return -1;
+            }
+            cfg->gpuSearchDevice = static_cast<int>(idx);
+            cfg->gpuSearch = true;
+            continue;
+        }
+        if (name == "--sieve-device") {
+            const char* v = needValue(name.c_str());
+            if (!v) return -1;
+            char* end = nullptr;
+            long idx = std::strtol(v, &end, 10);
+            if (end == v || *end != '\0' || idx < 0) {
+                std::fprintf(stderr, "[ff_sieve] error: --sieve-device must be a non-negative integer\n");
+                return -1;
+            }
+            cfg->sieveDevice = static_cast<int>(idx);
             continue;
         }
         std::fprintf(stderr, "[ff_sieve] error: unknown option '%s'\n", name.c_str());

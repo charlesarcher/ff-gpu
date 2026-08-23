@@ -108,14 +108,10 @@ using SieveSlabRunFn = int (*)(int, const uint32_t*, uint32_t,
                                uint64_t, uint64_t, uint8_t*);
 
 extern "C" SieveSlabRunFn SieveSlabGetLaunchFn_gfx1201(int deviceIndex);
-extern "C" SieveSlabRunFn SieveSlabGetLaunchFn_sm_120(int deviceIndex);
 
 static SieveSlabRunFn resolveSieveSlab(int deviceIndex)
 {
-    SieveSlabRunFn fn = SieveSlabGetLaunchFn_gfx1201(deviceIndex);
-    if (fn) return fn;
-    fn = SieveSlabGetLaunchFn_sm_120(deviceIndex);
-    return fn;
+    return SieveSlabGetLaunchFn_gfx1201(deviceIndex);
 }
 
 // ---------------------------------------------------------------------------

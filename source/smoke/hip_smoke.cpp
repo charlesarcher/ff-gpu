@@ -1,9 +1,8 @@
-// AMD TU (RX 9070 XT, gfx1201) of the dual-runtime smoke test.
-//
-// Compiled with the DEFAULT HIP platform (hipcc as-is, no HIP_PLATFORM), so
-// hipGetDeviceCount sees the AMD devices only (this system: the 9070 XT).
-// Includes ONLY the HIP headers — vendor headers are never mixed in one TU
-// (ROCm/HIP#2703).
+// Per-platform TU of the dual-runtime smoke test, compiled TWICE from this
+// one HIP-only source (AMD default platform + HIP_PLATFORM=nvidia). Each
+// compile sees only its own vendor's devices and exports an arch-tagged
+// ff_smoke_hip_<arch> symbol. Includes ONLY the HIP headers — vendor headers
+// are never mixed in one TU (ROCm/HIP#2703).
 #include <hip/hip_runtime.h>
 
 #include <cstdio>
@@ -15,6 +14,22 @@ namespace {
 
 constexpr int kSmokeElems = 1 << 20;  // 4 MiB of unsigned ints
 constexpr int kBlock = 256;
+
+#define FF_TAG_CAT2(a, b) a##b
+#define FF_TAG_CAT(a, b)  FF_TAG_CAT2(a, b)
+
+#ifndef SIEVE_KERNEL_ARCH
+#error "SIEVE_KERNEL_ARCH must be defined per compile (gfx1201 or sm_120)"
+#endif
+
+// Arch-tagged entry point: ff_smoke_hip_gfx1201 / ff_smoke_hip_sm_120.
+#define FF_TAG_NAME FF_TAG_CAT(ff_smoke_hip_, SIEVE_KERNEL_ARCH)
+
+#if defined(FF_BACKEND_NV) || defined(__HIP_PLATFORM_NVIDIA__)
+#define FF_SMOKE_VENDOR "NV  [hip-nv]"
+#else
+#define FF_SMOKE_VENDOR "AMD [hip]"
+#endif
 
 #define HIP_SMOKE_CHECK(call)                                                  \
     do {                                                                       \
@@ -29,17 +44,18 @@ constexpr int kBlock = 256;
 
 }  // namespace
 
-// Runs the trivial kernel on the AMD device: alloc, memset, launch, D2H
-// verify, then prints the device name + alloc/launch OK. Returns 0 on success.
-extern "C" int ff_smoke_hip(void)
+// Runs the trivial kernel on device 0 of this compile's platform: alloc,
+// memset, launch, D2H verify, then prints the device name + alloc/launch OK.
+// Returns 0 on success.
+extern "C" int FF_TAG_NAME(void)
 {
     int devCount = 0;
     HIP_SMOKE_CHECK(hipGetDeviceCount(&devCount));
     if (devCount < 1) {
-        std::fprintf(stderr, "AMD [hip]: no HIP devices enumerated\n");
+        std::fprintf(stderr, FF_SMOKE_VENDOR ": no HIP devices enumerated\n");
         return 1;
     }
-    // Default-platform HIP runtime enumerates only the AMD GPU (the 9070 XT).
+    // This platform's runtime enumerates only its own vendor's GPUs.
     HIP_SMOKE_CHECK(hipSetDevice(0));
 
     hipDeviceProp_t props{};
@@ -65,14 +81,14 @@ extern "C" int ff_smoke_hip(void)
 
     for (int i = 0; i < kSmokeElems; ++i) {
         if (hostBuf[i] != 1u) {
-            std::fprintf(stderr, "AMD [hip]: kernel verify FAILED at %d (got %u)\n",
+            std::fprintf(stderr, FF_SMOKE_VENDOR ": kernel verify FAILED at %d (got %u)\n",
                          i, hostBuf[i]);
             return 1;
         }
     }
 
     std::fprintf(stderr,
-                 "AMD  [hip] : device %s : alloc OK launch OK verify OK (%d elems)\n",
+                 FF_SMOKE_VENDOR " : device %s : alloc OK launch OK verify OK (%d elems)\n",
                  props.name, kSmokeElems);
     return 0;
 }

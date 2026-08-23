@@ -5,7 +5,7 @@ include(cmake/prelude.cmake)
 project(
     ff-gpu
     VERSION 0.1.0
-    DESCRIPTION "Dual-arch (AMD HIP + NVIDIA CUDA) GPU prime sieve engine"
+    DESCRIPTION "AMD HIP GPU prime sieve engine"
     LANGUAGES CXX
 )
 
@@ -131,16 +131,18 @@ set_target_properties(
 add_custom_target(ff-gpu_amd_objects DEPENDS ${AMD_OBJECTS})
 
 # ---- Per-arch NVIDIA objects (custom hipcc commands, sm_120) ----
-# Same hand-rolled command the Makefile used:
+# The SAME HIP-only sources as the AMD side, compiled through hipcc's NVIDIA
+# backend — no direct CUDA calls exist anywhere in this project:
 #   HIP_PLATFORM=nvidia hipcc -x cu -arch=sm_120 -DSIEVE_KERNEL_ARCH=sm_120
-# The objects are exposed to consumers as an IMPORTED OBJECT library.
+# Each object exports arch-tagged symbols (…_gfx1201 / …_sm_120), so both
+# sets link into one binary that drives both runtimes side by side.
 
 set(
     NV_SOURCES
-    source/cuda_enum.cpp
-    source/smoke/cuda_smoke.cpp
-    source/cuda_devabstraction.cpp
-    source/cuda_m0_kernels.cpp
+    source/hip_enum.cpp
+    source/smoke/hip_smoke.cpp
+    source/hip_devabstraction.cpp
+    source/hip_m0_kernels.cpp
     source/m4/gpu_search_kernel.cpp
     source/sieve_slab_kernel.cpp
     source/sieve_slab_engine.cpp
@@ -157,6 +159,7 @@ foreach(nv_src IN LISTS NV_SOURCES)
             ${CMAKE_COMMAND} -E env HIP_PLATFORM=nvidia
             /opt/rocm/bin/hipcc -O2 -I/opt/rocm/include
             "-I${PROJECT_SOURCE_DIR}/source"
+            -DFF_BACKEND_NV=1
             -DSIEVE_KERNEL_ARCH=sm_120 -x cu -arch=sm_120
             -c "${PROJECT_SOURCE_DIR}/${nv_src}" -o "${nv_obj}"
         DEPENDS
@@ -201,16 +204,16 @@ find_package(Threads REQUIRED)
 
 set(
     FF_GPU_RUNTIME_LIBS
-    cudart
     amdhip64
+    cudart
     Threads::Threads
 )
 
 function(ff_gpu_setup_binary target)
     target_link_directories(
         ${target} PRIVATE
-        /usr/local/cuda/lib64
         /opt/rocm/lib
+        /usr/local/cuda/lib64
     )
     target_link_libraries(${target} PRIVATE ${FF_GPU_RUNTIME_LIBS})
     # Kernel bodies live in headers that multiple TUs include (smoke_kernel.h,

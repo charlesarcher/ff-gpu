@@ -1,9 +1,8 @@
 // DevAbstraction smoke test (plan todo 6): ONE process exercises the
 // vendor-neutral abstraction against BOTH GPUs — alloc, DevCopy H2D/D2H,
 // DevEvent ordering, DevLaunch (trivial kernel) on every logical device —
-// and asserts the logical device count is exactly 2 (bus-ID deduped, the
-// 5090 is never double-counted; ff::mergeAndDedupe does the union inside
-// DevInit).
+// and asserts the logical device count is exactly 2 (bus-ID deduped, each
+// card appears once; ff::mergeAndDedupe does the union inside DevInit).
 //
 // This binary is VENDOR-NEUTRAL: it includes only src/devabstraction.h and
 // touches no cuda*/hip* type. It has its own main() (it is not linked with
@@ -114,11 +113,10 @@ int main()
                  "== ffdev abstraction smoke (one process, two GPUs) ==\n");
 
     const char* force = std::getenv("FF_FORCE_BACKEND");
-    if (force && force[0] != '\0' && std::strcmp(force, "hip") != 0 &&
-        std::strcmp(force, "cuda") != 0) {
+    if (force && force[0] != '\0' && std::strcmp(force, "hip") != 0) {
         std::fprintf(stderr,
                      "[abs-smoke] error: FF_FORCE_BACKEND='%s' is not "
-                     "'hip' or 'cuda' (test-only override)\n", force);
+                     "'hip' (test-only override)\n", force);
         return 1;
     }
 
@@ -134,7 +132,7 @@ int main()
 
     std::vector<ff::DeviceInfo> devs(static_cast<size_t>(count));
     std::fprintf(stderr,
-                 "[abs-smoke] logical device count: %d (expect 2, NOT 3 — "
+                 "[abs-smoke] logical device count: %d (expect 2, NOT 3 or 4 — "
                  "deduped by PCI bus ID via ff::mergeAndDedupe)\n", count);
     for (int i = 0; i < count; ++i) {
         if (ffdev::DevGetDeviceProperties(i, &devs[static_cast<size_t>(i)]) != 0) {
@@ -165,8 +163,8 @@ int main()
 
     if (count != 2) {
         std::fprintf(stderr,
-                     "[abs-smoke] FAIL: expected exactly 2 logical devices, "
-                     "got %d\n", count);
+                     "[abs-smoke] FAIL: expected exactly 2 logical devices "
+                     "(AMD + NVIDIA), got %d\n", count);
         return 1;
     }
 
@@ -176,31 +174,24 @@ int main()
 
     // ---- TEST-ONLY failure-QA override (never affects ff_sieve) ----
     if (force && force[0] != '\0') {
-        // Force the OTHER vendor's backend onto a device: hip -> the
-        // nvidia device, cuda -> the amd device. On this machine the forced
-        // backend cannot see that PCI bus -> must refuse loudly, rc=1.
+        // Force hip backend: on this machine the forced backend cannot see
+        // the PCI bus -> must refuse loudly, rc=1.
         const ff::DeviceInfo* target = nullptr;
         for (int i = 0; i < count; ++i) {
             const ff::DeviceInfo& d = devs[static_cast<size_t>(i)];
             if (std::strcmp(force, "hip") == 0 &&
                 std::strcmp(d.vendor, "nvidia") == 0)
                 target = &d;
-            if (std::strcmp(force, "cuda") == 0 &&
-                std::strcmp(d.vendor, "amd") == 0)
-                target = &d;
         }
         if (!target) {
             std::fprintf(stderr,
                          "[abs-smoke] QA SKIP (explicit): FF_FORCE_BACKEND=%s "
-                         "but no %s device exists to force — override not "
+                         "but no nvidia device exists to force — override not "
                          "exercised, failing loudly\n",
-                         force,
-                         std::strcmp(force, "hip") == 0 ? "nvidia" : "amd");
+                         force);
             return 1;
         }
-        const ffdev::DevBackend forced =
-            std::strcmp(force, "hip") == 0 ? ffdev::DevBackend::Hip
-                                           : ffdev::DevBackend::Cuda;
+        const ffdev::DevBackend forced = ffdev::DevBackend::HipAmd;
         std::fprintf(stderr,
                      "[abs-smoke] QA: FF_FORCE_BACKEND=%s -> forcing '%s' "
                      "backend onto PCI bus %s (logical device %s)\n",
@@ -214,9 +205,6 @@ int main()
                          force, target->busId);
             return 1;
         }
-        // Defensive: if a machine DOES see the card through both runtimes,
-        // the remap applies and dispatch through the forced backend must
-        // still work — prove it with a live query.
         size_t freeBytes = 0, totalBytes = 0;
         if (ffdev::DevGetMemInfo(0, &freeBytes, &totalBytes) != 0) {
             std::fprintf(stderr, "[abs-smoke] QA FAIL: forced-backend query "
@@ -229,13 +217,15 @@ int main()
         return 0;
     }
 
-    int nHip = 0, nCuda = 0;
-    for (int i = 0; i < count; ++i)
-        (ffdev::DevBackendOf(i) == ffdev::DevBackend::Hip ? nHip : nCuda)++;
+    int nAmd = 0, nNv = 0;
+    for (int i = 0; i < count; ++i) {
+        if (ffdev::DevBackendOf(i) == ffdev::DevBackend::HipAmd) ++nAmd;
+        if (ffdev::DevBackendOf(i) == ffdev::DevBackend::HipNv) ++nNv;
+    }
     std::fprintf(stderr,
-                 "[abs-smoke] ABSTRACTION SMOKE OK: %d logical devices "
-                 "(backend hip=%d cuda=%d) exercised alloc/copy/event/launch "
-                 "in one process\n",
-                 count, nHip, nCuda);
+                 "[abs-smoke] ABSTRACTION SMOKE OK: %d logical device(s) "
+                 "(backend hip-amd=%d hip-nv=%d) exercised alloc/copy/event/"
+                 "launch in one process\n",
+                 count, nAmd, nNv);
     return 0;
 }

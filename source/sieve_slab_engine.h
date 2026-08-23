@@ -8,7 +8,6 @@
 //
 // Usage from g++ host code:
 //   SieveSlabEngineRunFn fn = SieveSlabEngineGetLaunchFn_gfx1201(deviceIndex);
-//   if (!fn) fn = SieveSlabEngineGetLaunchFn_sm_120(deviceIndex);
 //   if (!fn) { /* no matching arch */ }
 //   int rc = fn(deviceIndex, primes.data(), numPrimes, maxPrimeMapValue, hostMap);
 
@@ -30,10 +29,10 @@ typedef int (*SieveSlabEngineRunFn)(int deviceIndex,
                                      uint64_t maxPrimeMapValue,
                                      uint8_t* h_out);
 
-// Per-arch dispatch getters.  Each TU (compiled with one SIEVE_KERNEL_ARCH)
-// defines its own getter; the g++ caller queries both and picks the
-// non-null result (the arch that can see the device).
+// Per-arch dispatch getter (gfx1201 / AMD RDNA4).
 extern "C" SieveSlabEngineRunFn SieveSlabEngineGetLaunchFn_gfx1201(int deviceIndex);
+
+// Per-arch dispatch getter (sm_120 / NVIDIA, HIP-platform objects).
 extern "C" SieveSlabEngineRunFn SieveSlabEngineGetLaunchFn_sm_120(int deviceIndex);
 
 // ---------------------------------------------------------------------------
@@ -68,8 +67,8 @@ typedef struct SievePoolOps {
                        uint32_t numPrimes, uint64_t segLo, uint64_t segHi,
                        void* d_slab, uint64_t slabBytes, int primeSlab);
     // ---- M3 overlap engine (plan todo 12) ----
-    // Stream/event handles are opaque vendor pointers (hipStream_t /
-    // cudaStream_t etc.), never dereferenced in g++ host code. Every op
+    // Stream/event handles are opaque vendor pointers (hipStream_t on both
+    // platforms), never dereferenced in g++ host code. Every op
     // switches the calling thread's current device to vendorIndex first.
     void* (*createStream)(int vendorIndex);
     int (*destroyStream)(int vendorIndex, void* stream);
@@ -79,7 +78,7 @@ typedef struct SievePoolOps {
     int (*waitEvent)(int vendorIndex, void* ev, void* stream);
     int (*syncEvent)(int vendorIndex, void* ev);
     int (*elapsedEvents)(int vendorIndex, void* startEv, void* endEv, double* msOut);
-    // Host pinned tier (cudaMallocHost / hipHostMalloc).
+    // Host pinned tier (hipHostMalloc on both platforms).
     int (*allocPinned)(int vendorIndex, void** h, uint64_t bytes);
     int (*freePinned)(int vendorIndex, void* h);
     // Async copies on an explicit stream (pinned host memory required).
@@ -97,7 +96,14 @@ typedef struct SievePoolOps {
                             void* waitEvent);
 } SievePoolOps;
 
+// gfx1201 (AMD RDNA4) pool operations getter.
 extern "C" const SievePoolOps* SievePoolGet_gfx1201(int vendorIndex);
+
+// sm_120 (NVIDIA, HIP-platform objects) pool operations getter.
 extern "C" const SievePoolOps* SievePoolGet_sm_120(int vendorIndex);
+
+// Vendor-dispatch helper (g++ side): returns the ops table for the device's
+// vendor ("amd" -> gfx1201, "nvidia" -> sm_120), or NULL if unknown/unavailable.
+const SievePoolOps* SievePoolGetForVendor(const char* vendor, int vendorIndex);
 
 #endif  // FF_SIEVE_SLAB_ENGINE_H

@@ -6,7 +6,7 @@
 namespace ff {
 
 std::vector<DeviceInfo> mergeAndDedupe(const DeviceInfo* hipDevs, int hipCount,
-                                       const DeviceInfo* cudaDevs, int cudaCount,
+                                       const DeviceInfo* nvDevs, int nvCount,
                                        int* skippedDuplicates)
 {
     std::vector<DeviceInfo> out;
@@ -24,7 +24,7 @@ std::vector<DeviceInfo> mergeAndDedupe(const DeviceInfo* hipDevs, int hipCount,
     };
 
     for (int i = 0; i < hipCount; ++i) add(hipDevs[i]);
-    for (int i = 0; i < cudaCount; ++i) add(cudaDevs[i]);
+    for (int i = 0; i < nvCount; ++i) add(nvDevs[i]);
 
     if (skippedDuplicates) *skippedDuplicates = skipped;
     return out;

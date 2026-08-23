@@ -34,7 +34,7 @@ namespace ff {
 //     back into hostMap.
 //
 // devs/budgets must be index-aligned (both size N, the logical device list
-// after --devices / FF_DISABLE_DEVICE filtering). kernelPrimes is the small-
+// after --devices / --disable-vendor filtering). kernelPrimes is the small-
 // prime list WITHOUT the leading 2 (SieveEngine::kernelPrimes()). hostMap is
 // a pre-allocated g.mapBytes buffer.
 //

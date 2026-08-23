@@ -1,11 +1,15 @@
-// AMD backend TU of the device abstraction layer (GPU_PLAN §5.2, plan
-// todo 6). Compiled with the DEFAULT HIP platform (hipcc as-is, no
-// HIP_PLATFORM) so this TU sees ONLY the AMD devices (this system: the
-// RX 9070 XT). Includes ONLY the HIP headers — vendor headers are never
-// mixed in one TU (ROCm/HIP#2703) — plus the shared trivial kernel
-// (smoke/smoke_kernel.h, arch-renamed to SieveSlab_gfx1201 here) and the
-// POD-only ffdev interface. Every entry point is extern "C", takes the
-// VENDOR runtime index, and returns 0 / -1.
+// Per-arch backend TU of the device abstraction layer (GPU_PLAN §5.2, plan
+// todo 6). Compiled TWICE from this one HIP-only source — no direct CUDA
+// calls anywhere; the NVIDIA side is the SAME HIP API compiled with
+// HIP_PLATFORM=nvidia:
+//   AMD: hipcc (default platform)            -DSIEVE_KERNEL_ARCH=gfx1201
+//   NV:  HIP_PLATFORM=nvidia hipcc -x cu     -DSIEVE_KERNEL_ARCH=sm_120
+// Each compile sees only its own vendor's devices and exports uniquely
+// arch-tagged extern "C" symbols ff_dev_hip_<arch>_* so both objects link
+// into one binary without collisions. Includes ONLY the HIP headers — vendor
+// headers are never mixed in one TU (ROCm/HIP#2703) — plus the shared trivial
+// kernel (smoke/smoke_kernel.h, arch-renamed) and the POD-only ffdev
+// interface. Every entry point takes the VENDOR runtime index, returns 0/-1.
 //
 // current-device discipline (todo-3 learning): memGetInfo and default-stream
 // ops are current-device scoped — every entry point selects the device,
@@ -21,11 +25,28 @@
 
 namespace {
 
+#if defined(FF_BACKEND_NV) || defined(__HIP_PLATFORM_NVIDIA__)
+#define FF_BACKEND_VENDOR "nvidia"
+#define FF_FAIL_LABEL     "NV [dev-hip]"
+#else
+#define FF_BACKEND_VENDOR "amd"
+#define FF_FAIL_LABEL     "AMD [dev-hip]"
+#endif
+
+#define FF_TAG_CAT2(a, b) a##b
+#define FF_TAG_CAT(a, b)  FF_TAG_CAT2(a, b)
+
+#ifndef SIEVE_KERNEL_ARCH
+#error "SIEVE_KERNEL_ARCH must be defined per compile (gfx1201 or sm_120)"
+#endif
+
+#define FF_DEV_FN(name) FF_TAG_CAT(ff_dev_hip_##name##_, SIEVE_KERNEL_ARCH)
+
 constexpr int kBlock = 256;
 
 void hipFail(const char* op, int dev)
 {
-    std::fprintf(stderr, "AMD [dev-hip]: %s on device %d failed: %s (%s)\n",
+    std::fprintf(stderr, FF_FAIL_LABEL ": %s on device %d failed: %s (%s)\n",
                  op, dev, hipGetErrorName(hipGetLastError()),
                  hipGetErrorString(hipGetLastError()));
 }
@@ -62,7 +83,7 @@ int fillDeviceInfo(int dev, ff::DeviceInfo* out)
     restoreDevice(prev);
 
     std::memset(out, 0, sizeof *out);
-    std::snprintf(out->vendor, sizeof out->vendor, "%s", "amd");
+    std::snprintf(out->vendor, sizeof out->vendor, "%s", FF_BACKEND_VENDOR);
     std::snprintf(out->name, sizeof out->name, "%s", p.name);
     std::snprintf(out->busId, sizeof out->busId, "%04x:%02x:%02x",
                   p.pciDomainID, p.pciBusID, p.pciDeviceID);
@@ -87,12 +108,12 @@ int fillDeviceInfo(int dev, ff::DeviceInfo* out)
 
 }  // namespace
 
-extern "C" int ff_dev_hip_deviceprops(int dev, ff::DeviceInfo* out)
+extern "C" int FF_DEV_FN(deviceprops)(int dev, ff::DeviceInfo* out)
 {
     return fillDeviceInfo(dev, out);
 }
 
-extern "C" int ff_dev_hip_meminfo(int dev, size_t* freeBytes, size_t* totalBytes)
+extern "C" int FF_DEV_FN(meminfo)(int dev, size_t* freeBytes, size_t* totalBytes)
 {
     int prev = -1;
     (void)hipGetDevice(&prev);
@@ -110,7 +131,7 @@ extern "C" int ff_dev_hip_meminfo(int dev, size_t* freeBytes, size_t* totalBytes
     return 0;
 }
 
-extern "C" int ff_dev_hip_alloc(int dev, size_t bytes, void** out)
+extern "C" int FF_DEV_FN(alloc)(int dev, size_t bytes, void** out)
 {
     int prev = -1;
     (void)hipGetDevice(&prev);
@@ -128,7 +149,7 @@ extern "C" int ff_dev_hip_alloc(int dev, size_t bytes, void** out)
     return 0;
 }
 
-extern "C" int ff_dev_hip_free(int dev, void* p)
+extern "C" int FF_DEV_FN(free)(int dev, void* p)
 {
     hipError_t e = hipFree(p);
     if (e != hipSuccess) {
@@ -138,7 +159,7 @@ extern "C" int ff_dev_hip_free(int dev, void* p)
     return 0;
 }
 
-extern "C" int ff_dev_hip_copy_h2d(int dev, void* dst, const void* src,
+extern "C" int FF_DEV_FN(copy_h2d)(int dev, void* dst, const void* src,
                                    size_t bytes)
 {
     int prev = -1;
@@ -157,7 +178,7 @@ extern "C" int ff_dev_hip_copy_h2d(int dev, void* dst, const void* src,
     return 0;
 }
 
-extern "C" int ff_dev_hip_copy_d2h(int dev, void* dst, const void* src,
+extern "C" int FF_DEV_FN(copy_d2h)(int dev, void* dst, const void* src,
                                    size_t bytes)
 {
     int prev = -1;
@@ -176,7 +197,7 @@ extern "C" int ff_dev_hip_copy_d2h(int dev, void* dst, const void* src,
     return 0;
 }
 
-extern "C" int ff_dev_hip_stream_create(int dev, void** out)
+extern "C" int FF_DEV_FN(stream_create)(int dev, void** out)
 {
     hipStream_t s = nullptr;
     hipError_t e = hipStreamCreate(&s);
@@ -188,7 +209,7 @@ extern "C" int ff_dev_hip_stream_create(int dev, void** out)
     return 0;
 }
 
-extern "C" int ff_dev_hip_stream_destroy(int dev, void* s)
+extern "C" int FF_DEV_FN(stream_destroy)(int dev, void* s)
 {
     hipError_t e = hipStreamDestroy(static_cast<hipStream_t>(s));
     if (e != hipSuccess) {
@@ -198,7 +219,7 @@ extern "C" int ff_dev_hip_stream_destroy(int dev, void* s)
     return 0;
 }
 
-extern "C" int ff_dev_hip_stream_sync(int dev, void* s)
+extern "C" int FF_DEV_FN(stream_sync)(int dev, void* s)
 {
     hipError_t e = hipStreamSynchronize(static_cast<hipStream_t>(s));
     if (e != hipSuccess) {
@@ -208,7 +229,7 @@ extern "C" int ff_dev_hip_stream_sync(int dev, void* s)
     return 0;
 }
 
-extern "C" int ff_dev_hip_event_create(int dev, void** out)
+extern "C" int FF_DEV_FN(event_create)(int dev, void** out)
 {
     hipEvent_t ev = nullptr;
     // Default flags: timing enabled (needed for hipEventElapsedTime).
@@ -221,7 +242,7 @@ extern "C" int ff_dev_hip_event_create(int dev, void** out)
     return 0;
 }
 
-extern "C" int ff_dev_hip_event_destroy(int dev, void* e)
+extern "C" int FF_DEV_FN(event_destroy)(int dev, void* e)
 {
     hipError_t err = hipEventDestroy(static_cast<hipEvent_t>(e));
     if (err != hipSuccess) {
@@ -231,7 +252,7 @@ extern "C" int ff_dev_hip_event_destroy(int dev, void* e)
     return 0;
 }
 
-extern "C" int ff_dev_hip_event_record(int dev, void* e, void* s)
+extern "C" int FF_DEV_FN(event_record)(int dev, void* e, void* s)
 {
     hipError_t err = hipEventRecord(static_cast<hipEvent_t>(e),
                                     static_cast<hipStream_t>(s));
@@ -242,7 +263,7 @@ extern "C" int ff_dev_hip_event_record(int dev, void* e, void* s)
     return 0;
 }
 
-extern "C" int ff_dev_hip_event_sync(int dev, void* e)
+extern "C" int FF_DEV_FN(event_sync)(int dev, void* e)
 {
     hipError_t err = hipEventSynchronize(static_cast<hipEvent_t>(e));
     if (err != hipSuccess) {
@@ -252,7 +273,7 @@ extern "C" int ff_dev_hip_event_sync(int dev, void* e)
     return 0;
 }
 
-extern "C" int ff_dev_hip_event_elapsed_ms(int dev, void* e0, void* e1,
+extern "C" int FF_DEV_FN(event_elapsed_ms)(int dev, void* e0, void* e1,
                                            float* ms)
 {
     // hipEventElapsedTime is only defined for ordered, completed events —
@@ -267,7 +288,7 @@ extern "C" int ff_dev_hip_event_elapsed_ms(int dev, void* e0, void* e1,
     return 0;
 }
 
-extern "C" int ff_dev_hip_launch(int dev, void* buf, int n, void* s)
+extern "C" int FF_DEV_FN(launch)(int dev, void* buf, int n, void* s)
 {
     int prev = -1;
     (void)hipGetDevice(&prev);

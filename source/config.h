@@ -1,6 +1,5 @@
-// GPU_PLAN §4 configuration surface (plan todo 3): CLI flags + FF_* env vars,
-// precedence CLI > env > default. Hand-rolled parsing — no third-party
-// libraries (guardrail).
+// GPU_PLAN §4 configuration surface: CLI flags only. Hand-rolled parsing —
+// no third-party libraries (guardrail).
 
 #ifndef FF_CONFIG_H
 #define FF_CONFIG_H
@@ -13,29 +12,32 @@
 namespace ff {
 
 struct Config {
-    double globalFraction = 0.90;                    // --vram-fraction / FF_VRAM_FRACTION
+    int threads = 0;                                 // --threads=N (0 = auto: min(31, hardware_concurrency))
+    double globalFraction = 0.90;                    // --vram-fraction
     std::map<std::string, double> deviceFractions;   // --device-vram-fraction: "amd"|"nvidia"|<logical index> -> f
-    bool hasBudgetCap = false;                       // --vram-budget / FF_VRAM_BUDGET
+    bool hasBudgetCap = false;                       // --vram-budget
     uint64_t budgetCapBytes = 0;                     // absolute per-device cap
-    bool hasScratch = false;                         // --scratch / FF_SCRATCH
+    bool hasScratch = false;                         // --scratch
     uint64_t scratchBytes = 0;
     uint64_t slabSizeBytes = 1ull << 30;             // --slab-size, default 1 GiB
-    bool hasHostTierCap = false;                     // --host-tier-cap / FF_HOST_TIER_CAP
+    bool hasHostTierCap = false;                     // --host-tier-cap
     bool hostTierAuto = false;                       // "auto" = host RAM - 4 GiB (resolved in validateConfig)
     uint64_t hostTierCapBytes = 0;                   // 0 = disabled (default)
     bool noHostTier = false;                         // --no-host-tier: force-disable the host overflow tier
     bool listDevices = false;                        // --list-devices (recon flag, plan-defined)
     std::string deviceFilter;                        // --devices <backend>: "amd"|"nvidia" ("" = all)
-    // M2 weighted pulls (plan todo 10): vendor name -> bandwidth weight (> 0).
+        // M2 weighted pulls: vendor name -> bandwidth weight (> 0).
     // Populated by loadPullWeights() from config/m0-benchmarks.json
-    // (writeBandwidthGbs), overridden by FF_PULL_WEIGHTS. Vendors absent from
+    // (writeBandwidthGbs), overridden by --pull-weights. Vendors absent from
     // the map fall back to weight 1.0 (uniform pulls).
     std::map<std::string, double> pullWeights;
     double pullWeightRatio = 0.0;                    // max/min of pullWeights (0 = not loaded)
-    std::string disableVendors;                      // FF_DISABLE_DEVICE: "amd"|"nvidia" ("" = none)
+    std::string disableVendor;                       // --disable-vendor: "amd"|"nvidia" ("" = none)
     std::string dumpMapFile;                        // --dump-map <file> (todo 13)
     bool noGpu = false;                             // --no-gpu: force CPU-only search
     bool gpuSearch = false;                         // --gpu-search: try GPU when VRAM allows
+    int gpuSearchDevice = -1;                       // --gpu-search-device=N: explicit device index for search (-1 = auto)
+    int sieveDevice = -1;                           // --sieve-device=N: explicit device index for sieve (-1 = auto/all)
 };
 
 // Size parser: "<num>[unit]" — unit in {b, k, m, g, ki, mi, gi, kib, mib, gib}
@@ -53,19 +55,6 @@ bool parseFraction(const std::string& s, double* out);
 bool parseDeviceFractionSpec(const std::string& spec,
                              std::map<std::string, double>* out);
 
-// Reads the FF_* env vars into cfg (defaults already set). Non-empty but
-// malformed values are a HARD error (message written to stderr) — a silently
-// ignored budget env could oversubscribe; never silently oversubscribe (§4.3).
-// Returns 0 on success, -1 on error.
-int loadEnv(Config* cfg);
-
-// Loads pull weights (M2, plan todo 10) into cfg->pullWeights: per-vendor
-// writeBandwidthGbs from config/m0-benchmarks.json (hand-rolled scanner, no
-// third-party libraries — guardrail). FF_PULL_WEIGHTS values already merged by
-// loadEnv() take precedence; vendors absent from both fall back to 1.0 at use
-// time. A missing/unreadable JSON file is a warning (uniform pulls), but a
-// weight <= 0 from any source is a HARD error. Returns 0 on success, -1 on
-// error (message on stderr).
 int loadPullWeights(Config* cfg);
 
 // Parses the CLI: flags (+ optional =value form) and positionals. CLI values

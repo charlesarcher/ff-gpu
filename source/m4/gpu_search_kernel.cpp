@@ -15,6 +15,8 @@
 
 #include <hip/hip_runtime.h>
 
+#include <cstdio>
+
 #include "gpu_search_kernel.h"
 
 extern "C" {
@@ -26,15 +28,22 @@ extern "C" {
 #define SEARCH_KERNEL_GET_LAUNCH_FN FF_HOST_CAT(SearchKernelGetLaunchFn_, SIEVE_KERNEL_ARCH)
 
 // Launch SEARCH_KERNEL on the given device.
-// All memory (primeMap, atomicCount, records) is pre-allocated on device
+// All memory (primeMap, atomicCount, records, smallPrimes) is pre-allocated on device
 // by the caller; this function just launches the kernel.
 int SEARCH_KERNEL_RUN_NAME(
     int deviceIndex,
     const uint8_t* d_primeMap, uint64_t d_maxPrimeMapValue,
     uint64_t d_sumStart, uint64_t d_sumLimit,
-    uint32_t* d_pAtomicCount, GpuRecord* d_pRecords)
+    uint32_t* d_pAtomicCount, GpuRecord* d_pRecords,
+    const uint32_t* d_smallPrimes, uint32_t d_smallPrimeCount)
 {
-    (void)deviceIndex;
+    int prevDevice = -1;
+    hipGetDevice(&prevDevice);
+    if (hipSetDevice(deviceIndex) != hipSuccess) {
+        std::fprintf(stderr, "  [ffdev] kernel: hipSetDevice(%d) failed\n", deviceIndex);
+        if (prevDevice >= 0) hipSetDevice(prevDevice);
+        return -1;
+    }
 
     uint64_t numOddSums = (d_sumLimit - d_sumStart) / 2 + 1;
     uint32_t blockSize = 256;
@@ -44,8 +53,19 @@ int SEARCH_KERNEL_RUN_NAME(
                        dim3(numBlocks), dim3(blockSize), 0, 0,
                        d_primeMap, d_maxPrimeMapValue,
                        d_sumStart, d_sumLimit,
-                       d_pAtomicCount, d_pRecords);
+                       d_pAtomicCount, d_pRecords,
+                       d_smallPrimes, d_smallPrimeCount);
 
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess) {
+        std::fprintf(stderr, "  [ffdev] kernel launch failed: %s\n", hipGetErrorString(err));
+        hipSetDevice(prevDevice);
+        return -1;
+    }
+
+    hipDeviceSynchronize();
+
+    hipSetDevice(prevDevice);
     return 0;
 }
 
@@ -54,7 +74,8 @@ int SEARCH_KERNEL_RUN_NAME(
 // and uses whichever returns non-null.
 typedef int (*SearchKernelRunFn)(int, const uint8_t*, uint64_t,
                                   uint64_t, uint64_t,
-                                  uint32_t*, GpuRecord*);
+                                  uint32_t*, GpuRecord*,
+                                  const uint32_t*, uint32_t);
 
 SearchKernelRunFn SEARCH_KERNEL_GET_LAUNCH_FN(int deviceIndex)
 {
@@ -63,6 +84,57 @@ SearchKernelRunFn SEARCH_KERNEL_GET_LAUNCH_FN(int deviceIndex)
     if (hipGetDeviceCount(&devCount) != hipSuccess) return nullptr;
     if (deviceIndex < 0 || deviceIndex >= devCount) return nullptr;
     return &SEARCH_KERNEL_RUN_NAME;
+}
+
+// ---- Arch-tagged HIP memory-management wrappers ----
+// main.cpp is compiled with g++ and cannot include hip/hip_runtime.h, so
+// these wrappers live here (compiled with hipcc per-arch) and are called
+// through the vendor-dispatching helpers in gpu_search_launcher.cpp.
+
+#define MEM_WRAPPER_CAT2(a, b) a##b
+#define MEM_WRAPPER_CAT(a, b)  MEM_WRAPPER_CAT2(a, b)
+#define GpuSearchMemAlloc   MEM_WRAPPER_CAT(GpuSearchMemAlloc_,   SIEVE_KERNEL_ARCH)
+#define GpuSearchMemCopyH2D MEM_WRAPPER_CAT(GpuSearchMemCopyH2D_, SIEVE_KERNEL_ARCH)
+#define GpuSearchMemCopyD2H MEM_WRAPPER_CAT(GpuSearchMemCopyD2H_, SIEVE_KERNEL_ARCH)
+#define GpuSearchMemFree    MEM_WRAPPER_CAT(GpuSearchMemFree_,    SIEVE_KERNEL_ARCH)
+
+int GpuSearchMemAlloc(int deviceIndex, uint64_t bytes, void** outPtr)
+{
+    int prevDev = -1;
+    hipGetDevice(&prevDev);
+    if (hipSetDevice(deviceIndex) != hipSuccess) return -1;
+    void* p = nullptr;
+    hipError_t rc = hipMalloc(&p, static_cast<size_t>(bytes));
+    hipSetDevice(prevDev);
+    if (rc != hipSuccess) return -1;
+    *outPtr = p;
+    return 0;
+}
+
+int GpuSearchMemCopyH2D(int deviceIndex, void* dst, const void* src, uint64_t bytes)
+{
+    int prevDev = -1;
+    hipGetDevice(&prevDev);
+    if (hipSetDevice(deviceIndex) != hipSuccess) return -1;
+    hipError_t rc = hipMemcpy(dst, src, static_cast<size_t>(bytes), hipMemcpyHostToDevice);
+    hipSetDevice(prevDev);
+    return (rc == hipSuccess) ? 0 : -1;
+}
+
+int GpuSearchMemCopyD2H(int deviceIndex, void* dst, const void* src, uint64_t bytes)
+{
+    int prevDev = -1;
+    hipGetDevice(&prevDev);
+    if (hipSetDevice(deviceIndex) != hipSuccess) return -1;
+    hipError_t rc = hipMemcpy(dst, src, static_cast<size_t>(bytes), hipMemcpyDeviceToHost);
+    hipSetDevice(prevDev);
+    return (rc == hipSuccess) ? 0 : -1;
+}
+
+int GpuSearchMemFree(void* ptr)
+{
+    if (ptr == nullptr) return 0;
+    return (hipFree(ptr) == hipSuccess) ? 0 : -1;
 }
 
 }  // extern "C"

@@ -15,9 +15,17 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <thread>
 #include <vector>
+
+const SievePoolOps* SievePoolGetForVendor(const char* vendor, int vendorIndex)
+{
+    if (vendor != nullptr && std::strcmp(vendor, "nvidia") == 0)
+        return SievePoolGet_sm_120(vendorIndex);
+    return SievePoolGet_gfx1201(vendorIndex);
+}
 
 namespace ff {
 namespace {
@@ -326,10 +334,8 @@ uint64_t runPullScheduler(const Config& cfg,
         pd.dev = &devs[i];
         pd.budget = &budgets[i];
         pd.weight = weightFor(cfg, devs[i]);
-        const SievePoolOps* ops =
-            std::string(devs[i].vendor) == "nvidia"
-                ? SievePoolGet_sm_120(devs[i].runtimeIndex)
-                : SievePoolGet_gfx1201(devs[i].runtimeIndex);
+        const SievePoolOps* ops = SievePoolGetForVendor(devs[i].vendor,
+                                                        devs[i].runtimeIndex);
         if (!ops) {
             std::fprintf(stderr,
                          "[ff_sieve] error: no pool ops for device[%zu] %s "
