@@ -835,6 +835,15 @@ inline void FreudenthalThreads::RunIt(const ThreadData& thread)
 int main (int argc, char* argv[])
  {uint32_t sumStart,
            sumLimit;
+  bool noDiag=false; // --no-diag: skip footer probes that want sudo (dmidecode) or sweep /proc/cpuinfo
+  for (int i=1; i<argc; )
+   {if (string(argv[i])=="--no-diag")
+     {noDiag=true;
+      for (int j=i; j<argc-1; ++j) argv[j]=argv[j+1];
+      --argc;
+     }
+    else ++i;
+   }
   if (argc>2)
    {sumStart=atoi(argv[1])|1;
     sumLimit=atoi(argv[2]);
@@ -914,6 +923,9 @@ int main (int argc, char* argv[])
   cout<<endl<<"Prime time: "<<pTime.count()<<" μs"<<endl<<"Total Freudenthal time: "<<fTime.count()<<" μs"<<endl
       <<"  Freudenthal-Prime-Calculations-Mostly-In-Primemap Time: "<<duration_cast<microseconds>(fpmTime).count()<<" μs"<<endl
       <<"  Freudenthal-Prime-Calculations-Mostly-Not-In-Primemap Time: "<<duration_cast<microseconds>(fnpmTime).count()<<" μs"<<endl
-      <<"Threads: "<<threads<<",  Average CPU Speed: "<<getCpuSpeedMhz()<<",  Memory "<<getMemorySpeed()<<endl;
+      <<"Threads: "<<threads;
+  if (!noDiag)
+    cout<<",  Average CPU Speed: "<<getCpuSpeedMhz()<<",  Memory "<<getMemorySpeed();
+  cout<<endl;
   return 0;
  }
