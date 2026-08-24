@@ -29,6 +29,7 @@
 #include "m4/gpu_search_emission.cpp"
 #include <chrono>
 #include <iostream>
+#include <unistd.h>   // sysconf: aggregate-gate auto host-tier resolution
 
 extern "C" int ff_enum_hip_gfx1201(ff::DeviceInfo* out, int maxDevices, int* outCount);
 extern "C" int ff_enum_hip_sm_120(ff::DeviceInfo* out, int maxDevices, int* outCount);
@@ -43,6 +44,8 @@ struct RunDevices {
     int skippedDuplicates = 0;
     bool hipFailed = false;
     bool nvFailed = false;
+    bool hipSkipped = false;   // vendor-level pre-filter skipped the enum call
+    bool nvSkipped = false;
 };
 
 double elapsedMs(const std::chrono::steady_clock::time_point& start) {
@@ -55,23 +58,53 @@ void dumpPhaseTimer(const char* phase, double ms) {
     std::fprintf(stderr, "ff_sieve timing: %s = %.3f ms\n", phase, ms);
 }
 
-RunDevices enumerate()
+// Task 14a filtered single-pass enumeration: consult ONLY the vendor-level
+// filters (cfg.deviceFilter / disableVendor) BEFORE any enum call, so e.g.
+// --devices=amd never initializes the NVIDIA runtime (~halves the startup
+// floor). --sieve-device=N is an INDEX into enumeration results and is
+// deliberately NOT consulted here — it resolves post-enumeration exactly as
+// before. mergeAndDedupe (and its duplicate skip) stays for the unfiltered
+// path; with one backend skipped there is simply nothing to dedupe against.
+RunDevices enumerate(const ff::Config& cfg)
 {
     RunDevices r;
+    bool wantAmd = true, wantNv = true;
+    if (!cfg.deviceFilter.empty()) {
+        wantAmd = cfg.deviceFilter == "amd";
+        wantNv = cfg.deviceFilter == "nvidia";
+    }
+    if (!cfg.disableVendor.empty()) {
+        wantAmd = wantAmd && cfg.disableVendor != "amd";
+        wantNv = wantNv && cfg.disableVendor != "nvidia";
+    }
     ff::DeviceInfo hipBuf[kMaxDevices] = {};
     ff::DeviceInfo nvBuf[kMaxDevices] = {};
     int hipCount = 0, nvCount = 0;
-    if (ff_enum_hip_gfx1201(hipBuf, kMaxDevices, &hipCount) != 0) {
+    if (wantAmd) {
+        if (ff_enum_hip_gfx1201(hipBuf, kMaxDevices, &hipCount) != 0) {
+            std::fprintf(stderr,
+                         "[ff_sieve] warning: HIP (AMD) enumeration failed; no AMD "
+                         "devices will participate\n");
+            r.hipFailed = true;
+        }
+    } else {
+        r.hipSkipped = true;
         std::fprintf(stderr,
-                     "[ff_sieve] warning: HIP (AMD) enumeration failed; no AMD "
-                     "devices will participate\n");
-        r.hipFailed = true;
+                     "[ff_sieve] device filter: skipping AMD-side enumeration "
+                     "(vendor-level pre-filter)\n");
     }
-    if (ff_enum_hip_sm_120(nvBuf, kMaxDevices, &nvCount) != 0) {
+    if (wantNv) {
+        if (ff_enum_hip_sm_120(nvBuf, kMaxDevices, &nvCount) != 0) {
+            std::fprintf(stderr,
+                         "[ff_sieve] warning: HIP-NV (NVIDIA) enumeration failed; "
+                         "no NVIDIA devices will participate\n");
+            r.nvFailed = true;
+        }
+    } else {
+        r.nvSkipped = true;
         std::fprintf(stderr,
-                     "[ff_sieve] warning: HIP-NV (NVIDIA) enumeration failed; "
-                     "no NVIDIA devices will participate\n");
-        r.nvFailed = true;
+                     "[ff_sieve] device filter: skipping NVIDIA-side enumeration "
+                     "(vendor-level pre-filter)\n");
     }
     r.devs = ff::mergeAndDedupe(hipBuf, hipCount, nvBuf, nvCount,
                                 &r.skippedDuplicates);
@@ -95,10 +128,10 @@ void printDeviceHeader(const ff::DeviceInfo& d, int idx)
                  d.multiProcessorCount);
 }
 
-int runListDevices()
+int runListDevices(const ff::Config& cfg)
 {
     auto t_list = std::chrono::steady_clock::now();
-    RunDevices r = enumerate();
+    RunDevices r = enumerate(cfg);
     double listMs = elapsedMs(t_list);
     dumpPhaseTimer("device enumeration (--list-devices)", listMs);
     if (r.devs.empty()) {
@@ -142,6 +175,18 @@ static uint64_t isqrt64(uint64_t n) {
     while ((x + 1) * (x + 1) <= n) ++x;
     while (x * x > n) --x;
     return x;
+}
+
+// Host-RAM-derived overflow-tier cap for the aggregate-gate auto-remediation
+// (task 14b): same formula as validateConfig's "--host-tier-cap auto"
+// resolution — physical RAM minus a 4 GiB reserve, 0 when RAM is smaller.
+// Local copy because config.{h,cpp} are outside this task's file charter.
+uint64_t hostTierAutoCapBytes() {
+    long pages = sysconf(_SC_PHYS_PAGES);
+    long psz = sysconf(_SC_PAGE_SIZE);
+    uint64_t ram = (pages > 0 && psz > 0) ? uint64_t(pages) * uint64_t(psz) : 0;
+    const uint64_t kReserve = 4ull << 30;   // "auto" = host RAM - 4 GiB
+    return ram > kReserve ? ram - kReserve : 0;
 }
 
 // FF_GPU_RESIDENCY=0 forces the legacy copy path (full-map H2D); absent or
@@ -214,15 +259,17 @@ int runLeg(const ff::Config& cfg, const std::vector<std::string>& positionals)
                                                               : "");
 
     auto t_enum = std::chrono::steady_clock::now();
-    RunDevices r = enumerate();
+    RunDevices r = enumerate(cfg);
     double enumMs = elapsedMs(t_enum);
     dumpPhaseTimer("device enumeration", enumMs);
     if (r.devs.empty()) {
         std::fprintf(stderr,
                      "[ff_sieve] error: no devices enumerated (HIP-AMD%s, "
                      "HIP-NV%s)\n",
-                     r.hipFailed ? " failed" : " ok",
-                     r.nvFailed ? " failed" : " ok");
+                     r.hipFailed ? " failed"
+                         : (r.hipSkipped ? " filtered-out" : " ok"),
+                     r.nvFailed ? " failed"
+                         : (r.nvSkipped ? " filtered-out" : " ok"));
         return 1;
     }
     if (r.skippedDuplicates > 0)
@@ -352,42 +399,78 @@ int runLeg(const ff::Config& cfg, const std::vector<std::string>& positionals)
     // AGGREGATE sieve run-gate (Oracle round-3): sum(device backing) +
     // host-tier-cap >= mapBytes(leg); host-tier-cap defaults to 0. The
     // per-device predicate mapBytes+searchWorkspace <= budget remains the M4
-    // SEARCH-participation gate (defined as searchWorkspaceBytes(), todo 14).
+    // SEARCH-participation gate. Task 14b: when the gate fails and the user
+    // gave NO explicit host-tier choice (--host-tier-cap / --no-host-tier),
+    // the existing host overflow tier is auto-enabled ("--host-tier-cap
+    // auto") with a stderr notice instead of refusing; an explicit choice is
+    // always honored, including --no-host-tier's refusal.
+    unsigned long long hostTierBytes = cfg.hostTierCapBytes;
     unsigned long long capacity = aggregateBacking;
-    if (cfg.hostTierCapBytes >
+    if (hostTierBytes >
         std::numeric_limits<unsigned long long>::max() - capacity)
         capacity = std::numeric_limits<unsigned long long>::max();
     else
-        capacity += cfg.hostTierCapBytes;
+        capacity += hostTierBytes;
 
-    std::fprintf(stderr,
-                 "[ff_sieve] aggregate: deviceBacking=%llu B (%s) hostTier=%llu B "
-                 "(%s) capacity=%llu B (%s) mapBytes=%llu B (%s) -> %s\n",
-                 static_cast<unsigned long long>(aggregateBacking),
-                 ff::bytesToHuman(aggregateBacking).c_str(),
-                 static_cast<unsigned long long>(cfg.hostTierCapBytes),
-                 ff::bytesToHuman(cfg.hostTierCapBytes).c_str(),
-                 static_cast<unsigned long long>(capacity),
-                 ff::bytesToHuman(capacity).c_str(),
-                 static_cast<unsigned long long>(g.mapBytes),
-                 ff::bytesToHuman(g.mapBytes).c_str(),
-                 capacity >= g.mapBytes ? "GATE PASS" : "GATE FAIL");
-
-    if (capacity < g.mapBytes) {
+    auto printAggregateLine = [&](unsigned long long ht,
+                                  unsigned long long cap) {
         std::fprintf(stderr,
-                     "[ff_sieve] ERROR: no device fits leg %llu (map %llu B = %s): "
-                     "aggregate capacity %llu B (%s) < map %llu B (%s)\n",
-                     static_cast<unsigned long long>(g.sumLimit),
+                     "[ff_sieve] aggregate: deviceBacking=%llu B (%s) "
+                     "hostTier=%llu B (%s) capacity=%llu B (%s) mapBytes=%llu B "
+                     "(%s) -> %s\n",
+                     static_cast<unsigned long long>(aggregateBacking),
+                     ff::bytesToHuman(aggregateBacking).c_str(),
+                     static_cast<unsigned long long>(ht),
+                     ff::bytesToHuman(ht).c_str(),
+                     static_cast<unsigned long long>(cap),
+                     ff::bytesToHuman(cap).c_str(),
                      static_cast<unsigned long long>(g.mapBytes),
                      ff::bytesToHuman(g.mapBytes).c_str(),
-                     static_cast<unsigned long long>(capacity),
-                     ff::bytesToHuman(capacity).c_str(),
-                     static_cast<unsigned long long>(g.mapBytes),
-                     ff::bytesToHuman(g.mapBytes).c_str());
-        std::fprintf(stderr,
-                     "[ff_sieve] remediation: raise --vram-budget and/or "
-                     "--host-tier-cap\n");
-        return 1;
+                     cap >= g.mapBytes ? "GATE PASS" : "GATE FAIL");
+    };
+    printAggregateLine(hostTierBytes, capacity);
+
+    if (capacity < g.mapBytes) {
+        const bool explicitTierChoice = cfg.hasHostTierCap || cfg.noHostTier;
+        const unsigned long long autoCap =
+            explicitTierChoice ? 0 : hostTierAutoCapBytes();
+        unsigned long long remedied = aggregateBacking;
+        if (autoCap >
+            std::numeric_limits<unsigned long long>::max() - remedied)
+            remedied = std::numeric_limits<unsigned long long>::max();
+        else
+            remedied += autoCap;
+        if (remedied >= g.mapBytes) {
+            std::fprintf(stderr,
+                         "[ff_sieve] note: aggregate capacity %llu B (%s) < map "
+                         "%llu B (%s); auto-enabling the host overflow tier "
+                         "(--host-tier-cap auto => %llu B (%s)) to complete this "
+                         "leg — pass --no-host-tier to refuse instead\n",
+                         static_cast<unsigned long long>(capacity),
+                         ff::bytesToHuman(capacity).c_str(),
+                         static_cast<unsigned long long>(g.mapBytes),
+                         ff::bytesToHuman(g.mapBytes).c_str(),
+                         static_cast<unsigned long long>(autoCap),
+                         ff::bytesToHuman(autoCap).c_str());
+            hostTierBytes = autoCap;
+            capacity = remedied;
+            printAggregateLine(hostTierBytes, capacity);
+        } else {
+            std::fprintf(stderr,
+                         "[ff_sieve] ERROR: no device fits leg %llu (map %llu B = %s): "
+                         "aggregate capacity %llu B (%s) < map %llu B (%s)\n",
+                         static_cast<unsigned long long>(g.sumLimit),
+                         static_cast<unsigned long long>(g.mapBytes),
+                         ff::bytesToHuman(g.mapBytes).c_str(),
+                         static_cast<unsigned long long>(capacity),
+                         ff::bytesToHuman(capacity).c_str(),
+                         static_cast<unsigned long long>(g.mapBytes),
+                         ff::bytesToHuman(g.mapBytes).c_str());
+            std::fprintf(stderr,
+                         "[ff_sieve] remediation: raise --vram-budget and/or "
+                         "--host-tier-cap\n");
+            return 1;
+        }
     }
 
     // Allocate host map
@@ -506,7 +589,14 @@ maxPrimeMapValue = ff::runPullScheduler(cfg, r.devs, budgets, g,
         ffdev::DevHandle dPrimeMap, dRecords, dAtomic;
 
         if (useGpu) {
-            if (ffdev::DevInit() == 0) {
+            // Task 14a: seed the abstraction from the ALREADY-ENUMERATED
+            // filtered list (allDevs) — zero re-enumeration, where legacy
+            // DevInit() re-enumerated BOTH backends here. Seeding verbatim
+            // also keeps g_devices ordering identical to every logical index
+            // used below (with a vendor filter the two lists used to
+            // diverge). allDevs is non-empty: runLeg returned earlier
+            // otherwise, and DevInitFromDevices refuses empty lists.
+            if (ffdev::DevInitFromDevices(allDevs) == 0) {
                 uint64_t requiredBytes =
                     mapBytes + recordBytes + searchWorkspace;
 
@@ -667,8 +757,9 @@ maxPrimeMapValue = ff::runPullScheduler(cfg, r.devs, budgets, g,
                     fillBytes += cb;
                 }
                 std::fprintf(stderr,
-                    "[ff_sieve] GPU search: residency fill: %llu foreign/"
-                    "homeless slab(s), %llu B H2D\n",
+                    "[ff_sieve] GPU search: residency fill on device[%d] %s: "
+                    "%llu foreign/homeless slab(s), %llu B H2D\n",
+                    gpuDeviceIndex, r.devs[gpuDeviceIndex].name,
                     static_cast<unsigned long long>(fillSlabs),
                     static_cast<unsigned long long>(fillBytes));
             } else {
@@ -802,7 +893,16 @@ int main(int argc, char** argv)
         std::vector<std::string> positionals;
         if (ff::parseArgs(argc, argv, &cfg, &positionals) != 0) { ret = 1; goto done; }
         if (ff::validateConfig(&cfg) != 0) { ret = 1; goto done; }
-        if (cfg.listDevices) { ret = runListDevices(); goto done; }
+        if (cfg.hasHostTierCap && cfg.noHostTier) {
+            std::fprintf(stderr,
+                         "[ff_sieve] validation error: --host-tier-cap and "
+                         "--no-host-tier are contradictory; give at most one "
+                         "of them (omit both for the default: tier disabled, "
+                         "auto-enabled only when the aggregate gate needs "
+                         "it)\n");
+            ret = 1; goto done;
+        }
+        if (cfg.listDevices) { ret = runListDevices(cfg); goto done; }
         if (positionals.empty()) { ret = ff_smoke_main(); goto done; }
         ret = runLeg(cfg, positionals);
     }

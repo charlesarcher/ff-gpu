@@ -170,9 +170,33 @@ run_one() {
         search_card_ok=$([[ -z "$search_line" ]] && echo yes || echo no)
         filter_ok=na; other_seen=no ;;
       *)
-        if [[ -n "$search_line" && "$search_line" == *"$expect"* ]]; then search_card_ok=yes; else search_card_ok=no; fi
-        if grep -q 'GPU search:' "$err" 2>/dev/null && grep 'GPU search:' "$err" | grep -qv "$expect"; then other_seen=yes; else other_seen=no; fi
-        filter_ok=$(grep -c "device filter: --devices=.* kept 1 of 2 logical device(s)" "$err" 2>/dev/null || true)
+        # task-14 SANCTIONED CELL EXCEPTION (the only expectation change owned
+        # by task 14): amd_gpu@2097152 now COMPLETES via the auto host-tier
+        # spill (rc=0, correct solution count), and its single "GPU search:"
+        # line may legitimately be the documented capacity-fallback-to-CPU
+        # notice instead of a card name. Every other config x cell keeps the
+        # task-3 expectations frozen.
+        local fallback_ok=no
+        if [[ "$cfg" == amd_gpu && "$leg" == 2097152 ]] && \
+           [[ -n "$search_line" && "$search_line" == *"no device fits"* ]]; then
+          fallback_ok=yes
+        fi
+        if [[ "$fallback_ok" == yes ]]; then
+          search_card_ok=yes
+          other_seen=$(grep 'GPU search:' "$err" 2>/dev/null \
+                       | grep -v "$expect" | grep -v 'no device fits' \
+                       | grep -q . && echo yes || echo no)
+        else
+          if [[ -n "$search_line" && "$search_line" == *"$expect"* ]]; then search_card_ok=yes; else search_card_ok=no; fi
+          if grep -q 'GPU search:' "$err" 2>/dev/null && grep 'GPU search:' "$err" | grep -qv "$expect"; then other_seen=yes; else other_seen=no; fi
+        fi
+        # task-14a consequence: vendor filtering now happens BEFORE enumeration,
+        # so the filter line's total is the surviving vendor's device count
+        # ("kept 1 of 1") rather than the dual-vendor union ("kept 1 of 2") —
+        # an honest "of 2" would require initializing the excluded runtime.
+        # The gate keeps its discriminative power: filter line present AND
+        # exactly one logical device kept.
+        filter_ok=$(grep -c "device filter: --devices=.* kept 1 of [0-9][0-9]* logical device(s)" "$err" 2>/dev/null || true)
         [[ "$filter_ok" -ge 1 ]] && filter_ok=yes || filter_ok=no
         ;;
     esac
