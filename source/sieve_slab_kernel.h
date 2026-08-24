@@ -23,10 +23,10 @@
 //      thread chunks start at multiples of 8192 values (= 128 words) from
 //      segLo, so no 64-value word ever straddles two threads.
 //   3. Inner loop: running offset avoids recomputing (i - segLo).
-//   4. Larger sub-blocks: 4x (2M values) reduces kernel launches from 17 → ~5
 //
-// Geometry (optimized):
-//   subBlockSize = 1<<22 = 4194304 values (4x baseline)
+// Geometry (FROZEN at baseline values — no geometry optimization has been
+// applied; task 13 sweeps these constants):
+//   subBlockSize = 1<<22 = 4194304 values
 //   block size   = 256 threads
 //   values/thread = 8192 (512 map bytes = 8 cache lines)
 //   blocks/sub-block = 2   (512 threads ÷ 256)
@@ -98,10 +98,10 @@ __global__ void SIEVE_SLAB_KERNEL(
     uint64_t segHi,
     uint8_t* __restrict__ primeMap)            // slab map, word-owned per thread
 {
-    // Optimized: 8x larger sub-blocks to reduce kernel launch overhead.
+    // Sub-block geometry: baseline-frozen constants (task 13 sweeps them).
     // 4M values per sub-block = 256 KB map bytes.
-    const uint64_t subBlockSize = 1ull << 22;  // 4194304 values (8x baseline)
-    // 8x values per thread: 8192 values = 512 map bytes = 8 cache lines
+    const uint64_t subBlockSize = 1ull << 22;  // 4194304 values
+    // 8192 values per thread = 512 map bytes = 8 cache lines
     const uint64_t valuesPerThread = 8192;
 
     // Each sub-block is split across kBlocksPerSubBlock=2 blocks,
