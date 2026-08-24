@@ -543,7 +543,12 @@ maxPrimeMapValue = ff::runPullScheduler(cfg, r.devs, budgets, g,
         uint32_t hAtomicCount = 0;
         std::vector<GpuRecord> hRecords(numOddSums);
 
+        // Outer scope: summed into the "search phase" total printed before
+        // the GPU path's early return 0 below.
+        double gpuH2dMs = 0.0;
+
         if (useGpu) {
+            auto tH2d = std::chrono::steady_clock::now();
             int ri = r.devs[gpuDeviceIndex].runtimeIndex;
             const char* v = r.devs[gpuDeviceIndex].vendor;
 
@@ -562,12 +567,15 @@ maxPrimeMapValue = ff::runPullScheduler(cfg, r.devs, budgets, g,
                 GpuSearchCopyH2D(ri, v, dSmallPrimes.ptr, smallPrimesGpu,
                                  smallPrimeCountGpu * sizeof(uint32_t));
             }
+            gpuH2dMs = elapsedMs(tH2d);
+            dumpPhaseTimer("search H2D copies", gpuH2dMs);
         }
 
         if (useGpu) {
             // Launch GPU search.  Dispatch by vendor: both runtimes number
             // their devices from 0, so an index-only launcher would pick the
             // wrong arch (page fault when the selected device != allocator).
+            auto tKernel = std::chrono::steady_clock::now();
             int launchRet = GpuSearchLaunch(
                 r.devs[gpuDeviceIndex].runtimeIndex,
                 r.devs[gpuDeviceIndex].vendor,
@@ -578,20 +586,28 @@ maxPrimeMapValue = ff::runPullScheduler(cfg, r.devs, budgets, g,
                 static_cast<uint32_t*>(dAtomic.ptr),
                 static_cast<const uint32_t*>(dSmallPrimes.ptr),
                 smallPrimeCountGpu);
+            double kernelMs = elapsedMs(tKernel);
 
             if (launchRet == 0) {
+                dumpPhaseTimer("search kernel", kernelMs);
                 int ri = r.devs[gpuDeviceIndex].runtimeIndex;
                 const char* v = r.devs[gpuDeviceIndex].vendor;
 
+                auto tD2h = std::chrono::steady_clock::now();
                 GpuSearchCopyD2H(ri, v, &hAtomicCount, dAtomic.ptr, sizeof(uint32_t));
 
                 GpuSearchCopyD2H(ri, v, hRecords.data(), dRecords.ptr, recordBytes);
+                double d2hMs = elapsedMs(tD2h);
+                dumpPhaseTimer("search D2H copies", d2hMs);
 
                 std::cout.flush();
                 auto t1 = std::chrono::high_resolution_clock::now();
                 GpuSearchEmit(prime, hRecords.data(),
                               static_cast<uint32_t>(numOddSums));
                 auto t2 = std::chrono::high_resolution_clock::now();
+                double emitMs =
+                    std::chrono::duration<double, std::milli>(t2 - t1).count();
+                dumpPhaseTimer("search emit", emitMs);
 
                 GpuSearchFree(gpuDeviceIndex, r.devs[gpuDeviceIndex].vendor, dSmallPrimes.ptr);
                 GpuSearchFree(gpuDeviceIndex, r.devs[gpuDeviceIndex].vendor, dRecords.ptr);
@@ -602,6 +618,12 @@ maxPrimeMapValue = ff::runPullScheduler(cfg, r.devs, budgets, g,
                 uint64_t searchUs = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
                 std::cout << "Prime time: " << sieveUs << " \u03bcs" << std::endl;
                 std::cout << "Freudenthal time: " << searchUs << " \u03bcs" << std::endl;
+
+                // The GPU path returns here, skipping the CPU-path
+                // dumpPhaseTimer("search phase", ...) tail; report the total
+                // as the sum of the per-stage timers.
+                dumpPhaseTimer("search phase",
+                               gpuH2dMs + kernelMs + d2hMs + emitMs);
 
                 return 0;
             } else {
