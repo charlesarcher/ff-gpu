@@ -42,14 +42,14 @@ struct PerDevice {
     uint64_t cap = 0;                 // max slabs this device may pull
     std::vector<void*> region;        // one device buffer per home slab
     void* stagingDev = nullptr;       // 1-slab device scratch (non-home pulls)
-    std::vector<uint8_t> stagingHost; // 1-slab host landing buffer
+    void* stagingHost = nullptr;      // pinned host landing buffer (allocPinned)
     uint64_t pulled = 0;
     uint64_t staged = 0;
     // M3 overlap engine (todo 12)
     void* computeStream = nullptr;
     void* copyStream = nullptr;
-    void* evEndA = nullptr;
-    void* evEndB = nullptr;
+    void* evEndA = nullptr;           // compute-end marker; reused post-join to
+                                      // fence copyStream before hostMap reads
     double overlapComputeMs = 0;
     double overlapCopyMs = 0;
     double overlapTotalMs = 0;
@@ -172,56 +172,71 @@ void deviceWorker(Shared& sh, size_t i)
         int rc = 0;
         if (owner == static_cast<int>(i)) {
             void* buf = d.region[s - d.homeBase];
-            // M3: async compute on computeStream with double-buffer events
+            // M3: async compute on computeStream, then async D2H into hostMap
+            // on copyStream — this copy is the SOLE producer of hostMap for
+            // home slabs (the old assemble() re-copy is gone); runPullScheduler
+            // fences every copyStream after the join before anyone reads.
             rc = d.ops->slabComputeAsync(ri, sh.kernelPrimes, sh.kernelPrimeCount,
                                           segLo, segHi, buf, sh.slabBytes,
                                           d.computeStream, nullptr);
-            // Record end of compute for overlap tracking
-            d.ops->recordEvent(ri, d.evEndA, d.computeStream);
-            // Async copy back to hostMap on copyStream
-            rc = d.ops->copyD2HAsync(ri, sh.hostMap + off, buf, copyBytes, d.copyStream);
-            // Copy stream waits for compute to finish
-            d.ops->waitEvent(ri, d.evEndA, d.copyStream);
+            if (rc == 0) {
+                // Record end of compute, then gate the copy stream on it
+                // BEFORE enqueueing the D2H — a wait enqueued after the copy
+                // on the same stream would gate nothing (stream ops run in
+                // enqueue order; the old assemble() re-copy used to mask
+                // exactly that race with a correct synchronous overwrite).
+                d.ops->recordEvent(ri, d.evEndA, d.computeStream);
+                rc = d.ops->waitEvent(ri, d.evEndA, d.copyStream);
+                if (rc == 0)
+                    rc = d.ops->copyD2HAsync(ri, sh.hostMap + off, buf,
+                                             copyBytes, d.copyStream);
+                if (rc != 0) {
+                    // Async path failed: synchronous fallback (error path
+                    // only — poolCopyD2H device-syncs, so ordering holds).
+                    rc = d.ops->copyD2H(ri, sh.hostMap + off, buf, copyBytes);
+                }
+            }
         } else {
             ++d.staged;
+            // Prime only the bytes this slab actually spans (the kernel never
+            // touches beyond ceil((segHi-segLo)/16) = copyBytes).
             rc = d.ops->slabCompute(ri, sh.kernelPrimes, sh.kernelPrimeCount,
-                                    segLo, segHi, d.stagingDev, sh.slabBytes, 1);
-            if (rc == 0) {
-                if (owner >= 0) {
-                    const size_t oi = static_cast<size_t>(owner);
-                    const PerDevice& od = sh.devs[oi];
-                    void* obuf = od.region[s - od.homeBase];
-                    rc = d.ops->copyD2H(ri, d.stagingHost.data(), d.stagingDev,
-                                        copyBytes);
-                    if (rc == 0)
-                        rc = od.ops->copyH2D(od.dev->runtimeIndex, obuf,
-                                             d.stagingHost.data(), copyBytes);
-                } else {
-                    rc = d.ops->copyD2H(ri, sh.hostMap + off, d.stagingDev,
-                                        copyBytes);
+                                    segLo, segHi, d.stagingDev, copyBytes, 1);
+            if (rc == 0 && owner < 0) {
+                // Homeless slab: straight into hostMap (sync copy
+                // self-completes before the API returns).
+                rc = d.ops->copyD2H(ri, sh.hostMap + off, d.stagingDev,
+                                    copyBytes);
+            } else if (rc == 0) {
+                // Foreign-owned slab: relay through the pinned host landing
+                // into the owner's resident buffer (kept for the task-12
+                // residency handoff), then enqueue the final D2H into hostMap
+                // on the OWNER's copyStream — the post-join fence drains it.
+                // Enqueueing from this thread is safe: the stream serializes,
+                // and slab destinations are disjoint.
+                const size_t oi = static_cast<size_t>(owner);
+                PerDevice& od = sh.devs[oi];
+                const int ori = od.dev->runtimeIndex;
+                void* obuf = od.region[s - od.homeBase];
+                rc = d.ops->copyD2H(ri, d.stagingHost, d.stagingDev,
+                                    copyBytes);
+                if (rc == 0)
+                    rc = od.ops->copyH2D(ori, obuf, d.stagingHost, copyBytes);
+                if (rc == 0 && od.copyStream) {
+                    rc = od.ops->copyD2HAsync(ori, sh.hostMap + off, obuf,
+                                              copyBytes, od.copyStream);
+                    if (rc != 0)   // enqueue failed: synchronous fallback
+                        rc = od.ops->copyD2H(ori, sh.hostMap + off, obuf,
+                                             copyBytes);
+                } else if (rc == 0) {
+                    rc = od.ops->copyD2H(ori, sh.hostMap + off, obuf,
+                                         copyBytes);
                 }
             }
         }
         if (rc != 0) {
             sh.failed.store(1, std::memory_order_relaxed);
             return;
-        }
-    }
-}
-
-void assemble(Shared& sh)
-{
-    for (size_t i = 0; i < sh.devs.size(); ++i) {
-        PerDevice& d = sh.devs[i];
-        const int ri = d.dev->runtimeIndex;
-        for (uint64_t k = 0; k < d.homeCount; ++k) {
-            const uint64_t s = d.homeBase + k;
-            const uint64_t off = s * sh.slabBytes;
-            const uint64_t copyBytes = std::min(sh.slabBytes, sh.totalMapBytes - off);
-            if (d.ops->copyD2H(ri, sh.hostMap + off, d.region[k], copyBytes) != 0) {
-                sh.failed.store(1, std::memory_order_relaxed);
-                return;
-            }
         }
     }
 }
@@ -237,6 +252,10 @@ void teardown(Shared& sh)
             (void)d.ops->free(ri, d.stagingDev);
             d.stagingDev = nullptr;
         }
+        if (d.stagingHost) {
+            (void)d.ops->freePinned(ri, d.stagingHost);
+            d.stagingHost = nullptr;
+        }
         // M3 overlap: free streams and events
         if (d.computeStream) {
             (void)d.ops->destroyStream(d.dev->runtimeIndex, d.computeStream);
@@ -249,10 +268,6 @@ void teardown(Shared& sh)
         if (d.evEndA) {
             (void)d.ops->destroyEvent(d.dev->runtimeIndex, d.evEndA);
             d.evEndA = nullptr;
-        }
-        if (d.evEndB) {
-            (void)d.ops->destroyEvent(d.dev->runtimeIndex, d.evEndB);
-            d.evEndB = nullptr;
         }
     }
 }
@@ -361,7 +376,16 @@ uint64_t runPullScheduler(const Config& cfg,
         const int ri = d.dev->runtimeIndex;
         d.region.reserve(d.homeCount);
         for (uint64_t k = 0; k < d.homeCount; ++k) {
-            void* buf = d.ops->alloc(ri, sh.slabBytes);
+            const uint64_t s = d.homeBase + k;
+            // Right-size to this slab's actual byte extent: every slab except
+            // the last is a full slabBytes, the final one may be tiny. This
+            // equals the kernel tail-policy floor ceil((segHi-segLo)/16)
+            // exactly (sieve_slab_kernel.h), so word/byte marking stays in
+            // bounds and buffer geometry per launch site is unchanged.
+            const uint64_t off = s * sh.slabBytes;
+            const uint64_t slabCap = std::min(sh.slabBytes,
+                                              sh.totalMapBytes - off);
+            void* buf = d.ops->alloc(ri, slabCap);
             if (!buf) {
                 std::fprintf(stderr,
                              "[ff_sieve] error: backing alloc failed on "
@@ -372,11 +396,11 @@ uint64_t runPullScheduler(const Config& cfg,
                 return 0;
             }
             d.region.push_back(buf);
-            if (d.ops->memset(ri, buf, 0xff, sh.slabBytes) != 0) {
+            if (d.ops->memset(ri, buf, 0xff, slabCap) != 0) {
                 teardown(sh);
                 return 0;
             }
-            if (d.homeBase + k == 0) {
+            if (s == 0) {
                 const uint8_t notOne = 0x7f;
                 if (d.ops->copyH2D(ri, buf, &notOne, 1) != 0) {
                     teardown(sh);
@@ -385,6 +409,8 @@ uint64_t runPullScheduler(const Config& cfg,
             }
         }
         if (d.cap > 0) {
+            // Staging scratch must hold ANY pulled slab, so it stays full
+            // slabBytes; only the host landing buffer is bounded by the map.
             d.stagingDev = d.ops->alloc(ri, sh.slabBytes);
             if (!d.stagingDev) {
                 std::fprintf(stderr,
@@ -394,16 +420,26 @@ uint64_t runPullScheduler(const Config& cfg,
                 teardown(sh);
                 return 0;
             }
-            d.stagingHost.resize(sh.slabBytes);
+            void* ph = nullptr;
+            if (d.ops->allocPinned(ri, &ph,
+                                   std::min(sh.slabBytes, sh.totalMapBytes)) != 0 ||
+                !ph) {
+                std::fprintf(stderr,
+                             "[ff_sieve] error: pinned staging alloc failed "
+                             "on device[%zu] %s\n",
+                             i, d.dev->name);
+                teardown(sh);
+                return 0;
+            }
+            d.stagingHost = ph;
         }
     }
-    // M3 overlap: create per-device streams and double-buffer events
+    // M3 overlap: create per-device streams and the compute-end event
     for (size_t i = 0; i < sh.devs.size(); ++i) {
         PerDevice& d = sh.devs[i];
         d.computeStream = d.ops->createStream(d.dev->runtimeIndex);
         d.copyStream = d.ops->createStream(d.dev->runtimeIndex);
         d.evEndA = d.ops->createEvent(d.dev->runtimeIndex);
-        d.evEndB = d.ops->createEvent(d.dev->runtimeIndex);
     }
 
     std::fprintf(stderr, "[ff_sieve] pull scheduler: %llu slab(s) of %llu B "
@@ -429,7 +465,21 @@ uint64_t runPullScheduler(const Config& cfg,
             threads.emplace_back(deviceWorker, std::ref(sh), i);
     }
     for (auto& th : threads) th.join();
-    if (sh.failed.load() == 0) assemble(sh);
+    // SYNC MANDATE: with assemble() gone, hostMap is produced exclusively by
+    // async copyStream D2Hs (home slabs on the owning device's stream, relayed
+    // slabs on the owner's stream) plus self-completing sync copies for
+    // homeless slabs. Fence every copy stream AFTER the join (all copies
+    // enqueued) and BEFORE hostMap is consumed or teardown destroys the
+    // streams/events: record on the copyStream, then host-wait. Runs even on
+    // the failure path so teardown never frees buffers under in-flight copies.
+    for (size_t i = 0; i < sh.devs.size(); ++i) {
+        PerDevice& d = sh.devs[i];
+        if (!d.copyStream || !d.evEndA) continue;
+        if (d.ops->recordEvent(d.dev->runtimeIndex, d.evEndA, d.copyStream) != 0 ||
+            d.ops->syncEvent(d.dev->runtimeIndex, d.evEndA) != 0) {
+            sh.failed.store(1, std::memory_order_relaxed);
+        }
+    }
     const auto t1 = std::chrono::steady_clock::now();
     const uint64_t us =
         static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
