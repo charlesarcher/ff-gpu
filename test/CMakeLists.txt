@@ -91,8 +91,62 @@ target_link_libraries(
 
 ff_gpu_setup_binary(m4_mr_diff_bin)
 
-# ---- CTest registration ----
+# ---- Slab geometry bench (task 13): per-arch self-contained hipcc TUs ----
+# Unlike the g++ host drivers above, this harness launches SieveSlabKernel
+# directly (event-bracketed timing), so each binary is compiled BY hipcc for
+# exactly one arch — same flags as the product object blocks, but the binary
+# links only its own single object. Built here at the baked geometry defaults;
+# the task-13 sweep builds scratch copies with the FF_SIEVE_* macros
+# overridden via -D (see .omo/evidence/gpu-speedup/task-13-gpu-kernel-speedup/).
 
+set(SLAB_BENCH_SRC test/source/slab_geom_bench.cpp)
+
+# Absolute header-dep paths: this file is processed from test/, where the
+# parent scope's relative AMD_SRC_HEADERS entries would resolve wrong.
+set(SLAB_BENCH_DEPS "")
+foreach(hdr IN LISTS AMD_SRC_HEADERS)
+    list(APPEND SLAB_BENCH_DEPS "${PROJECT_SOURCE_DIR}/${hdr}")
+endforeach()
+
+add_custom_command(
+    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/slab_geom_bench_amd"
+    COMMAND
+        ${CMAKE_COMMAND} -E env HIP_PLATFORM=amd
+        /opt/rocm/bin/hipcc -O3 --offload-arch=gfx1201
+        -I/opt/rocm/include
+        "-I${PROJECT_SOURCE_DIR}/source"
+        -DSIEVE_KERNEL_ARCH=gfx1201
+        "${PROJECT_SOURCE_DIR}/${SLAB_BENCH_SRC}"
+        -o "${CMAKE_CURRENT_BINARY_DIR}/slab_geom_bench_amd"
+    DEPENDS "${PROJECT_SOURCE_DIR}/${SLAB_BENCH_SRC}" ${SLAB_BENCH_DEPS}
+    COMMENT "hipcc (AMD, gfx1201): slab_geom_bench"
+    VERBATIM
+)
+
+add_custom_command(
+    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/slab_geom_bench_nv"
+    COMMAND
+        ${CMAKE_COMMAND} -E env HIP_PLATFORM=nvidia
+        /opt/rocm/bin/hipcc -O3
+        -I/opt/rocm/include
+        "-I${PROJECT_SOURCE_DIR}/source"
+        -DSIEVE_KERNEL_ARCH=sm_120 -x cu -arch=sm_120
+        "${PROJECT_SOURCE_DIR}/${SLAB_BENCH_SRC}"
+        -o "${CMAKE_CURRENT_BINARY_DIR}/slab_geom_bench_nv"
+    DEPENDS "${PROJECT_SOURCE_DIR}/${SLAB_BENCH_SRC}" ${SLAB_BENCH_DEPS}
+    COMMENT "hipcc (NVIDIA, sm_120): slab_geom_bench"
+    VERBATIM
+)
+
+add_custom_target(slab_geom_bench_binaries ALL
+    DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/slab_geom_bench_amd"
+            "${CMAKE_CURRENT_BINARY_DIR}/slab_geom_bench_nv"
+)
+
+add_test(NAME slab_geom_bench_amd
+         COMMAND "${CMAKE_CURRENT_BINARY_DIR}/slab_geom_bench_amd" --reps=3)
+add_test(NAME slab_geom_bench_nv
+         COMMAND "${CMAKE_CURRENT_BINARY_DIR}/slab_geom_bench_nv" --reps=3)
 add_test(NAME abstraction_smoke COMMAND abstraction_smoke)
 add_test(NAME ff_budget_selftest COMMAND ff_budget_selftest)
 add_test(NAME slab_cmp COMMAND slab_cmp)

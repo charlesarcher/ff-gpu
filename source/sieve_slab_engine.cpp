@@ -33,9 +33,9 @@
 namespace {
 
 constexpr uint64_t SLAB_SIZE_BYTES = 1ull << 30;   // 1 GiB
-constexpr uint32_t kBlockSize = 256;
-constexpr uint64_t kSubBlockSize = 1ull << 22;     // 4194304 values (8x baseline)
-constexpr uint32_t kBlocksPerSubBlock = 2;
+// Launch geometry (sub-block size, blocks per sub-block, threads per block)
+// comes from the compile-time table in sieve_slab_kernel.h so the engine's
+// grid math and the kernel body can never disagree.
 
 #define ENGINE_HIP_CHECK(call)                                                 \
     do {                                                                       \
@@ -166,11 +166,11 @@ extern "C" int SIEVE_ENGINE_RUN_NAME(int deviceIndex,
         // Launch SieveSlabKernel for this slab, passing this slab's device ptr.
         const uint64_t numValues = segHi - segLo;
         const uint32_t numSubBlocks = static_cast<uint32_t>(
-            (numValues + kSubBlockSize - 1) / kSubBlockSize);
-        const uint32_t totalBlocks = numSubBlocks * kBlocksPerSubBlock;
+            (numValues + kSieveSubBlockSize - 1) / kSieveSubBlockSize);
+        const uint32_t totalBlocks = numSubBlocks * kSieveBlocksPerSubBlock;
 
         hipLaunchKernelGGL(SIEVE_SLAB_KERNEL,
-                           dim3(totalBlocks), dim3(kBlockSize), 0, 0,
+                           dim3(totalBlocks), dim3(kSieveThreadsPerBlock), 0, 0,
                            d_primes, numPrimes, segLo, segHi, d_slabs[slabIdx]);
         ENGINE_HIP_CHECK(hipGetLastError());
         ENGINE_HIP_CHECK(hipDeviceSynchronize());
@@ -298,11 +298,11 @@ int poolSlabCompute(int vendorIndex, const uint32_t* h_primes, uint32_t numPrime
 
     const uint64_t numValues = segHi - segLo;
     const uint32_t numSubBlocks = static_cast<uint32_t>(
-        (numValues + kSubBlockSize - 1) / kSubBlockSize);
-    const uint32_t totalBlocks = numSubBlocks * kBlocksPerSubBlock;
+        (numValues + kSieveSubBlockSize - 1) / kSieveSubBlockSize);
+    const uint32_t totalBlocks = numSubBlocks * kSieveBlocksPerSubBlock;
 
     hipLaunchKernelGGL(SIEVE_SLAB_KERNEL,
-                       dim3(totalBlocks), dim3(kBlockSize), 0, 0,
+                       dim3(totalBlocks), dim3(kSieveThreadsPerBlock), 0, 0,
                        d_primes, numPrimes, segLo, segHi,
                        static_cast<uint8_t*>(d_slab));
     POOL_HIP_CHECK(hipGetLastError());
@@ -435,9 +435,9 @@ int poolSlabComputeAsync(int vendorIndex, const uint32_t* h_primes, uint32_t num
     }
     const uint64_t numValues = segHi - segLo;
     const uint32_t numSubBlocks = static_cast<uint32_t>(
-        (numValues + kSubBlockSize - 1) / kSubBlockSize);
-    const uint32_t totalBlocks = numSubBlocks * kBlocksPerSubBlock;
-    hipLaunchKernelGGL(SIEVE_SLAB_KERNEL, dim3(totalBlocks), dim3(kBlockSize), 0, cs,
+        (numValues + kSieveSubBlockSize - 1) / kSieveSubBlockSize);
+    const uint32_t totalBlocks = numSubBlocks * kSieveBlocksPerSubBlock;
+    hipLaunchKernelGGL(SIEVE_SLAB_KERNEL, dim3(totalBlocks), dim3(kSieveThreadsPerBlock), 0, cs,
                        g_dPrimes, numPrimes, segLo, segHi,
                        static_cast<uint8_t*>(d_slab));
     POOL_HIP_CHECK(hipGetLastError());

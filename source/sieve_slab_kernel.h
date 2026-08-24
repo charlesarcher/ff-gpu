@@ -24,13 +24,13 @@
 //      segLo, so no 64-value word ever straddles two threads.
 //   3. Inner loop: running offset avoids recomputing (i - segLo).
 //
-// Geometry (FROZEN at baseline values — no geometry optimization has been
-// applied; task 13 sweeps these constants):
-//   subBlockSize = 1<<22 = 4194304 values
-//   block size   = 256 threads
-//   values/thread = 8192 (512 map bytes = 8 cache lines)
-//   blocks/sub-block = 2   (512 threads ÷ 256)
-//   grid = numSubBlocks per slab, one kernel launch per slab
+// Geometry (compile-time table below; per-arch defaults measured by the
+// task-13 sweep — evidence under .omo/evidence/gpu-speedup/task-13-gpu-kernel-speedup/):
+//   subBlockSize     = 1 << FF_SIEVE_SUB_BLOCK_LOG2   (values)
+//   threads/block    = FF_SIEVE_THREADS_PER_BLOCK
+//   values/thread    = FF_SIEVE_VALUES_PER_THREAD
+//   blocks/sub-block = FF_SIEVE_BLOCKS_PER_SUB_BLOCK
+//   grid = numSubBlocks * blocksPerSubBlock per slab, one kernel launch per slab
 //
 // Per-arch kernel name: SieveSlab_<arch> via two-level macro pasting.
 
@@ -45,6 +45,91 @@
 #endif
 
 #define SIEVE_SLAB_KERNEL FF_KERN_CAT(SieveSlab_, SIEVE_KERNEL_ARCH)
+
+// ---- Launch-geometry table (compile-time) -----------------------------------
+//
+// Four knobs, resolved at compile time so the kernel body, the engine launch
+// loop, and the test driver can never disagree:
+//   FF_SIEVE_SUB_BLOCK_LOG2        log2 of the sub-block span, in values
+//   FF_SIEVE_VALUES_PER_THREAD     values covered by one thread chunk
+//   FF_SIEVE_BLOCKS_PER_SUB_BLOCK  blocks sharing one sub-block
+//   FF_SIEVE_THREADS_PER_BLOCK     threads launched per block
+//
+// Invariants (statically enforced below):
+//   exact cover — VALUES_PER_THREAD * THREADS_PER_BLOCK * BLOCKS_PER_SUB_BLOCK
+//                 == sub-block span. Any other combination leaves values
+//                 permanently unmarked (coverage holes); there is no runtime
+//                 recovery for it.
+//   word alignment — VALUES_PER_THREAD % 64 == 0. Chunk starts are multiples
+//                 of VALUES_PER_THREAD from segLo, so no 64-value word ever
+//                 straddles two threads and word ownership stays exclusive.
+//
+// Defaults are per backend platform, chosen by measurement (task 13):
+// median-of-5 kernel time over a fixed 1-GiB region, byte-exactness gated
+// per combo on both cards, then finalists re-ranked by end-to-end
+// `--devices <vendor> 5 1048576` sieve-phase A/B through the real pipeline.
+// A compile may override any subset via -D. Evidence:
+// .omo/evidence/gpu-speedup/task-13-gpu-kernel-speedup/sweep.csv
+//
+//   sm_120:  sub=1<<22 vpt=4096 bps=4 tpb=256
+//            sweep median 179.9 ms (old default 382.7); pipeline 1M
+//            sieve phase 1440-1454 ms vs 1876-1885 (-23%). Baked winner.
+//   gfx1201: sub=1<<22 vpt=8192 bps=2 tpb=256 (task-9 baseline KEPT).
+//            The sweep preferred vpt=4096 there (640.7 vs 1069.1 ms), but
+//            EVERY vpt=4096 combo REGRESSED the real pipeline (+12..26%);
+//            no swept candidate beat the incumbent (3737-3778 ms vs next
+//            best 3787+). Kept by measurement, not assumption.
+//
+// Lesson recorded for tasks 15/16: the isolated cold-launch harness
+// overrates small-chunk geometries on AMD vs the copy-overlapped pipeline;
+// confirm sweep finalists end-to-end before baking.
+
+#if defined(__HIP_PLATFORM_NVIDIA__)
+#define FF_SIEVE_GEOM_DEFAULT_SUB_LOG2        22
+#define FF_SIEVE_GEOM_DEFAULT_VALUES_PER_THREAD   4096
+#define FF_SIEVE_GEOM_DEFAULT_BLOCKS_PER_SUB_BLOCK 4
+#define FF_SIEVE_GEOM_DEFAULT_THREADS_PER_BLOCK  256
+#elif defined(__HIP_PLATFORM_AMD__)
+#define FF_SIEVE_GEOM_DEFAULT_SUB_LOG2        22
+#define FF_SIEVE_GEOM_DEFAULT_VALUES_PER_THREAD   8192
+#define FF_SIEVE_GEOM_DEFAULT_BLOCKS_PER_SUB_BLOCK 2
+#define FF_SIEVE_GEOM_DEFAULT_THREADS_PER_BLOCK  256
+#else
+// Host-only inclusion (no vendor platform): baseline values.
+#define FF_SIEVE_GEOM_DEFAULT_SUB_LOG2        22
+#define FF_SIEVE_GEOM_DEFAULT_VALUES_PER_THREAD   8192
+#define FF_SIEVE_GEOM_DEFAULT_BLOCKS_PER_SUB_BLOCK 2
+#define FF_SIEVE_GEOM_DEFAULT_THREADS_PER_BLOCK  256
+#endif
+
+#ifndef FF_SIEVE_SUB_BLOCK_LOG2
+#define FF_SIEVE_SUB_BLOCK_LOG2 FF_SIEVE_GEOM_DEFAULT_SUB_LOG2
+#endif
+#ifndef FF_SIEVE_VALUES_PER_THREAD
+#define FF_SIEVE_VALUES_PER_THREAD FF_SIEVE_GEOM_DEFAULT_VALUES_PER_THREAD
+#endif
+#ifndef FF_SIEVE_BLOCKS_PER_SUB_BLOCK
+#define FF_SIEVE_BLOCKS_PER_SUB_BLOCK FF_SIEVE_GEOM_DEFAULT_BLOCKS_PER_SUB_BLOCK
+#endif
+#ifndef FF_SIEVE_THREADS_PER_BLOCK
+#define FF_SIEVE_THREADS_PER_BLOCK FF_SIEVE_GEOM_DEFAULT_THREADS_PER_BLOCK
+#endif
+
+inline constexpr uint64_t kSieveSubBlockSize =
+    1ull << FF_SIEVE_SUB_BLOCK_LOG2;
+inline constexpr uint64_t kSieveValuesPerThread = FF_SIEVE_VALUES_PER_THREAD;
+inline constexpr uint32_t kSieveBlocksPerSubBlock =
+    FF_SIEVE_BLOCKS_PER_SUB_BLOCK;
+inline constexpr uint32_t kSieveThreadsPerBlock = FF_SIEVE_THREADS_PER_BLOCK;
+
+static_assert((kSieveValuesPerThread & 63ull) == 0,
+              "thread chunks must start on 64-value word boundaries");
+static_assert(kSieveValuesPerThread <= kSieveSubBlockSize,
+              "a thread chunk cannot exceed the sub-block span");
+static_assert(kSieveValuesPerThread * kSieveThreadsPerBlock *
+                      kSieveBlocksPerSubBlock ==
+                  kSieveSubBlockSize,
+              "geometry must exactly cover the sub-block span");
 
 // ---- Word flush helper ------------------------------------------------------
 //
@@ -98,15 +183,12 @@ __global__ void SIEVE_SLAB_KERNEL(
     uint64_t segHi,
     uint8_t* __restrict__ primeMap)            // slab map, word-owned per thread
 {
-    // Sub-block geometry: baseline-frozen constants (task 13 sweeps them).
-    // 4M values per sub-block = 256 KB map bytes.
-    const uint64_t subBlockSize = 1ull << 22;  // 4194304 values
-    // 8192 values per thread = 512 map bytes = 8 cache lines
-    const uint64_t valuesPerThread = 8192;
+    // Sub-block geometry from the compile-time table above.
+    const uint64_t subBlockSize = kSieveSubBlockSize;
+    const uint64_t valuesPerThread = kSieveValuesPerThread;
 
-    // Each sub-block is split across kBlocksPerSubBlock=2 blocks,
-    // each block owning subBlockSize/2 values (1048576).
-    const uint32_t blocksPerSubBlock = 2;
+    // Each sub-block is split across kSieveBlocksPerSubBlock blocks.
+    const uint32_t blocksPerSubBlock = kSieveBlocksPerSubBlock;
     uint64_t subBlockIdx = blockIdx.x / blocksPerSubBlock;
     uint64_t bLo = segLo + subBlockIdx * subBlockSize
                  + (blockIdx.x % blocksPerSubBlock) * (subBlockSize / blocksPerSubBlock);

@@ -16,11 +16,9 @@
 
 namespace {
 
-constexpr uint32_t kBlockSize = 256;
-constexpr uint64_t kSubBlockSize = 1ull << 19;   // 524288 values
-constexpr uint64_t kValuesPerThread = 1024;      // 64 map bytes = 1 cache line
-constexpr uint32_t kThreadsPerSubBlock = 512;    // kSubBlockSize / kValuesPerThread
-constexpr uint32_t kBlocksPerSubBlock = 2;       // kThreadsPerSubBlock / kBlockSize
+// Launch geometry comes from the compile-time table in sieve_slab_kernel.h
+// (kSieveSubBlockSize / kSieveBlocksPerSubBlock / kSieveThreadsPerBlock) so
+// this driver's grid math matches the kernel body exactly.
 
 #define SLAB_HIP_CHECK(call)                                                 \
     do {                                                                     \
@@ -93,14 +91,14 @@ extern "C" int SIEVE_SLAB_RUN_NAME(int deviceIndex,
                              hipMemcpyHostToDevice));
 
     // ---- 5. Launch kernel ----
-    // Flat block grid: each sub-block uses kBlocksPerSubBlock blocks.
+    // Flat block grid: each sub-block uses kSieveBlocksPerSubBlock blocks.
     const uint64_t numValues = segHi - segLo;
     const uint32_t numSubBlocks = static_cast<uint32_t>(
-        (numValues + kSubBlockSize - 1) / kSubBlockSize);
-    const uint32_t totalBlocks = numSubBlocks * kBlocksPerSubBlock;
+        (numValues + kSieveSubBlockSize - 1) / kSieveSubBlockSize);
+    const uint32_t totalBlocks = numSubBlocks * kSieveBlocksPerSubBlock;
 
     hipLaunchKernelGGL(SIEVE_SLAB_KERNEL,
-                       dim3(totalBlocks), dim3(kBlockSize), 0, 0,
+                       dim3(totalBlocks), dim3(kSieveThreadsPerBlock), 0, 0,
                        d_primes, numPrimes, segLo, segHi, d_map);
     SLAB_HIP_CHECK(hipGetLastError());
     SLAB_HIP_CHECK(hipDeviceSynchronize());
