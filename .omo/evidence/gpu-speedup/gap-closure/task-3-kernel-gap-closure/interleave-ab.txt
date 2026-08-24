@@ -1,0 +1,77 @@
+# task-3 kernel-gap-closure — 2-wide witness interleave: A/B + KEEP-OR-REVERT verdict
+
+Date: 2026-08-24 (fixer). Base state: task-2 clamp, commit 25ca82f.
+Base binary snapshotted BEFORE editing: /tmp/opencode/t3-base/ff_sieve_base
+(md5 b8f02fccdd1a0d3555743ebb8fd5a9e2). Protocol: median-of-3 INTERLEAVED
+same-session pairs (base,new,base,new,...) after one untimed warmup per
+variant; stderr `search kernel = <ms>` (GpuSearchLaunch synchronizes
+internally => true kernel exec time).
+
+## What was built
+dev_IsPrime MR branch restructured: dev_MRPairComposite() evaluates TWO
+witnesses in lockstep (shared minv/r2/oneM/nm1M/n/nDiv2Odd/power2; exponent is
+identical for every witness so both square-and-multiply chains run under ONE
+loop control; each chain adds only accM/sqM/xM). Composite verdicts OR'd;
+early-exit became pair-granularity skip. Schedule: {2,3},{5,7} unconditional
+(maxTests>=4 always); tail predicated per-pair — maxTests 5 => {11,11},
+6 => {11,13}, 7 => {11,13} then {17,17} (odd tails passed as duplicated pair
+(p,p): deterministic pure function => OR(flag,flag)==flag, idempotent).
+Witness list (:207) and maxTests thresholds (:212-215) untouched.
+m4_mr_diff on the interleaved build: 200391 samples, divergences=0, PASS.
+
+## Resource state (remarks readback, gfx1201 -Rpass-analysis=kernel-resource-usage)
+                       BASE (task-2)      INTERLEAVE         N=16 override
+  FFSearchKernel_gfx1201 100 SGPR/100 VGPR  80 SGPR/92 VGPR   identical to N=12
+  ScratchSize            544 B/lane         528 B/lane        (92 VGPR/16 waves)
+  Occupancy              12 waves/SIMD      16 waves/SIMD      0 spills
+  Spills                 0/0                0/0
+  NV sm_120 ptxas        78 regs/512B/0sp   90 regs/512B/0sp
+LADDER OUTCOME: the interleave SHRANK natural VGPR demand 100 -> 92, landing
+UNDER the 96-VGPR boundary => occupancy 12 -> 16 waves/SIMD at baked N=12,
+zero spills. -DFF_SEARCH_MIN_BLOCKS_PER_SM=16 compiles byte-identical
+resources (demand already sits at the 16-wave allocation point), so NO re-pick
+was needed: N=12 kept (floor-pinning semantics intact per task-2 rationale).
+NV grew 78 -> 90 regs (second chain), unclamped as before, 0 spills.
+
+## Paired A/B results (medians of 3 interleaved same-session pairs)
+
+AMD @1M (--devices amd, .omo/.../ab_amd_1m.txt):
+  base 2291.835 ms | new 2383.771 ms  =>  +4.01% REGRESSION
+NV @1M (--devices nvidia, ab_nv_1m.txt):
+  base 718.474 ms  | new 903.671 ms   =>  +25.78% REGRESSION
+NV @2M spot (ab_nv_2m.txt):
+  base 2704.278 ms | new 3475.413 ms  =>  +28.52% REGRESSION
+
+## VERDICT: REVERT (explicit)
+REGRESSION ON BOTH CARDS => interleave reverted ENTIRELY; task-2 clamp kept.
+Header restored from pre-task backup (md5 0f6700c7c92023e59aa9e8ab2e4a30db ==
+pre-edit state; git diff vs HEAD empty).
+
+Why it lost despite FREE occupancy (+4 waves AMD):
+1. Production MR calls are overwhelmingly COMPOSITE and are decided by the
+   FIRST witness (base 2 fails fast). Pairing forces chain B (base 3) to
+   complete anyway — pure added latency on the dominant path. The baseline's
+   single-witness early-return was load-bearing for the composite case.
+2. NV paid an occupancy rung on top: 78 -> 90 regs drops resident blocks/SM
+   3 -> 2 (~-33% threads/SM), compounding the extra work (+25.8%).
+3. The ILP win (two independent mul-high chains per iteration) is real but
+   only pays on PRIME n (full witness sweep); primes are rare among MR calls,
+   and even there the trailing-squaring phase serialized on flags.
+
+## Post-revert gates (isolated worktree at HEAD == final product state;
+shared tree was mid-WIP by concurrent task-5 on geometry/main/sieve_engine —
+their WIP ff_budget_selftest briefly segfaulted, unrelated to this task)
+- ctest --preset dev: 8/8 PASS (mr_diff 200391 samples divergences=0 MATCH)
+- verify.sh --all-legs: ALL LEGS PASS rc=0 (CPU-search mode)
+- verify.sh --all-legs --gpu-search: ALL LEGS PASS rc=0
+- dump-map sha256 (amd, leg 1M): 4e4cc9807d471abd6140427a235da0d748000c9b4e40824accc3a57fa449de51 == frozen contract
+
+## Mutation scenario (interleave-mutation.log)
+Witness-B r2-conversion operand swapped r2->minv in a SCRATCH copy (header+TU
+in /tmp/opencode/t3-scratch/mut; quoted-include rule respected). Rebuilt both
+per-arch objects, relinked scratch m4_mr_diff via ninja -t commands with
+object/-o substitution. Result: DIVERGENCE rc=1 on BOTH devices (n=13, n=19:
+host=PRIME device=composite) => differential oracle is sensitive to interleave
+restructuring. Product tree never carried the mutation.
+
+Raw logs: ab_amd_1m.txt, ab_nv_1m.txt, ab_nv_2m.txt, interleave-mutation.log.

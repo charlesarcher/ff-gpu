@@ -1,0 +1,44 @@
+# task-3 interleave mutation log — differential sensitivity proof
+
+Scenario: swap ONE witness's r2-conversion operand in the 2-wide interleave
+helper, in a SCRATCH build (product tree untouched). m4_mr_diff MUST diverge.
+
+## Setup
+- Scratch dir: /tmp/opencode/t3-scratch/mut
+  - gpu_search_kernel.h  (copy of interleaved header + mutation)
+  - gpu_search_kernel.cpp (copied TU — quoted #include resolves to including
+    file's dir first, so -I tricks alone are insufficient; task-13 lesson)
+- Mutation (line 230 of scratch header):
+    BEFORE: uint64_t sqB = dev_MontMul(pB, r2, n, minv);
+    AFTER:  uint64_t sqB = dev_MontMul(pB, minv, n, minv);
+      /* MUTATION: witness-B r2 operand swapped to minv */
+  (witness B of pair {2,3} gets its Montgomery encoding corrupted: converts
+   pB into the M-domain with minv instead of r2)
+- Mutated line verified present via grep BEFORE building.
+- Per-arch objects rebuilt from the mutated TU mirroring CMake flags exactly:
+    HIP_PLATFORM=amd    hipcc -O3 -Wall --offload-arch=gfx1201 ... -DSIEVE_KERNEL_ARCH=gfx1201
+    HIP_PLATFORM=nvidia hipcc -O3 ... -DFF_BACKEND_NV=1 -DSIEVE_KERNEL_ARCH=sm_120 -x cu -arch=sm_120
+  both rc=0.
+- Scratch m4_mr_diff relinked from build/ with `ninja -t commands` output,
+  substituting ONLY the two kernel objects + -o path (relative object paths
+  require cwd=build/ — repo-root invocation fails ld, known gotcha).
+
+## Result: DIVERGENCE as required (rc=1)
+  device[0] AMD RX 9070 XT:  TOTAL tested=200391 divergences=2 -> MISMATCH
+  device[1] RTX 5090:        TOTAL tested=200391 divergences=2 -> MISMATCH
+  Catch location: bucket T:E odd sweep 5..119 @bound4
+    DIVERGENCE n=13 host=PRIME device=composite
+    DIVERGENCE n=19 host=PRIME device=composite
+  Mechanism: corrupted chain-B encoding yields xB outside {oneM, nm1M}; the
+  trailing-squaring loop never lands on oneM/nm1M within power2 steps, so the
+  combined flag reports composite for these true primes. Larger-n buckets show
+  0 divergences because chain A (witness 2) already decides nearly everything
+  there — the OR makes a broken B invisible unless A passes; tiny primes are
+  where B is decisive. Both cards identical => the differential oracle is
+  sensitive to interleave restructuring on BOTH backends.
+
+## Cleanup
+- Product header NEVER carried the mutation (scratch-only edit).
+- Interleave itself REVERTED in the product tree by restoring the pre-task
+  backup (see interleave-ab.txt verdict); post-revert mr_diff green:
+  200391 samples, divergences=0 -> MATCH, rc=0 (both devices).

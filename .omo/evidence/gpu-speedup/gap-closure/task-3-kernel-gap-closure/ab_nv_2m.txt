@@ -1,0 +1,5 @@
+== A/B devices=nvidia limit=2097152 15:47:17 ==
+pair1 base=2660.780 new=3475.564
+pair2 base=2704.278 new=3475.413
+pair3 base=2704.816 new=3453.485
+MEDIAN base=2704.278 new=3475.413 delta_pct=+28.52

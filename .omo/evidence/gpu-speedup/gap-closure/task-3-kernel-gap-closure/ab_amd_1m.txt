@@ -1,0 +1,5 @@
+== A/B devices=amd limit=1048576 15:45:34 ==
+pair1 base=2260.996 new=2383.771
+pair2 base=2332.014 new=2462.747
+pair3 base=2291.835 new=2381.879
+MEDIAN base=2291.835 new=2383.771 delta_pct=+4.01
