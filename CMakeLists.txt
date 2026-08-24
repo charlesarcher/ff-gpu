@@ -70,6 +70,20 @@ target_include_directories(
 
 target_compile_features(ff-gpu_cpu_search PUBLIC cxx_std_17)
 
+# ---- Device build flags ----
+# Device objects compile at -O3 (host code keeps the Makefile's -O2 -Wall).
+# Each vendor side pins its GPU ISA explicitly: AMD --offload-arch=gfx1201,
+# NVIDIA -arch=sm_120 — no reliance on the ROCm install's default target.
+# FF_GPU_LINEINFO=ON appends -lineinfo to BOTH device compiles (profiler
+# source correlation; no numerical effect on results).
+
+option(FF_GPU_LINEINFO "Append -lineinfo to both vendor device compiles" OFF)
+
+set(FF_GPU_LINEINFO_FLAGS "")
+if(FF_GPU_LINEINFO)
+    set(FF_GPU_LINEINFO_FLAGS -lineinfo)
+endif()
+
 # ---- Per-arch AMD objects (custom hipcc commands, gfx1201) ----
 # Same hand-rolled command the Makefile used. CMake's HIP language driver
 # rejects the hipcc wrapper on this machine (CMake >= 4.0 wants raw Clang),
@@ -108,7 +122,9 @@ foreach(amd_src IN LISTS AMD_SOURCES)
         OUTPUT "${amd_obj}"
         COMMAND
             ${CMAKE_COMMAND} -E env HIP_PLATFORM=amd
-            /opt/rocm/bin/hipcc -O2 -Wall -I/opt/rocm/include
+            /opt/rocm/bin/hipcc -O3 -Wall --offload-arch=gfx1201
+            ${FF_GPU_LINEINFO_FLAGS}
+            -I/opt/rocm/include
             "-I${PROJECT_SOURCE_DIR}/source"
             -DSIEVE_KERNEL_ARCH=gfx1201
             -c "${PROJECT_SOURCE_DIR}/${amd_src}" -o "${amd_obj}"
@@ -157,7 +173,8 @@ foreach(nv_src IN LISTS NV_SOURCES)
         OUTPUT "${nv_obj}"
         COMMAND
             ${CMAKE_COMMAND} -E env HIP_PLATFORM=nvidia
-            /opt/rocm/bin/hipcc -O2 -I/opt/rocm/include
+            /opt/rocm/bin/hipcc -O3 ${FF_GPU_LINEINFO_FLAGS}
+            -I/opt/rocm/include
             "-I${PROJECT_SOURCE_DIR}/source"
             -DFF_BACKEND_NV=1
             -DSIEVE_KERNEL_ARCH=sm_120 -x cu -arch=sm_120
