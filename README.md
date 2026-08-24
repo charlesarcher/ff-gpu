@@ -181,9 +181,6 @@ ff_sieve [options] <sumStart> <sumLimit>
 ./build/ff_sieve --devices=nvidia 5 2097152
 ./build/ff_sieve --devices=amd 5 1048576     # AMD cannot handle 2M (VRAM)
 
-# CPU-only (no GPU sieve, no GPU search)
-./build/ff_sieve --no-gpu 5 65536
-
 # List detected GPUs and exit
 ./build/ff_sieve --list-devices
 ```
@@ -196,7 +193,7 @@ ff_sieve [options] <sumStart> <sumLimit>
 | `--gpu-search` | Use GPU search instead of CPU search |
 | `--gpu-search-device=N` | Run GPU search on device index N (see `--list-devices`) |
 | `--sieve-device=N` | Run sieve on device index N (see `--list-devices`) |
-| `--no-gpu` | Disable all GPU work (CPU-only mode) |
+| `--no-gpu` | Rejected with an error (no CPU-only mode exists); omit it for the default GPU-sieve + CPU-search path, or restrict vendors via `--devices=<amd\|nvidia>` |
 | `--devices=<amd\|nvidia>` | Restrict GPU participation to one vendor |
 | `--list-devices` | Print detected GPUs and exit |
 | `--vram-fraction=<0.10–1.0>` | Fraction of each GPU's free VRAM used for the sieve (default 0.90) |
@@ -214,8 +211,7 @@ Sizes accept suffixes like `KiB`/`MiB`/`GiB` or raw byte counts.
 
 | Variable | Effect |
 |----------|--------|
-| `FF_THREADS=<n>` | CPU search thread count (default 31; max = `hardware_concurrency`) |
-| `FF_DISABLE_DEVICE=amd\|nvidia` | Remove a vendor at startup (diagnostics still print) |
+| `FF_THREADS=<n>` | CPU search thread count, clamped to [1, `hardware_concurrency`] (default 31; ignored when `--threads=N` is given) |
 
 ## Verification
 

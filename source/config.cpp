@@ -371,6 +371,14 @@ bool slabSizeValueAligned(uint64_t slabSizeBytes)
 
 int validateConfig(Config* cfg)
 {
+    if (cfg->noGpu) {
+        std::fprintf(stderr,
+                     "[ff_sieve] validation error: --no-gpu is not supported "
+                     "(there is no CPU-only mode); omit it for the default "
+                     "GPU-sieve + CPU-search path, or restrict GPUs with "
+                     "--devices=<amd|nvidia>\n");
+        return -1;
+    }
     if (cfg->globalFraction < 0.10 || cfg->globalFraction > 1.0) {
         std::fprintf(stderr,
                      "[ff_sieve] validation error: --vram-fraction %.6g is outside "
