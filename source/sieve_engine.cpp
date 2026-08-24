@@ -58,6 +58,17 @@ uint64_t isqrt64(uint64_t x) {
     while (r * r > x) --r;
     return r;
 }
+
+// Wheel-30 structural strip sanity (task 5, INERT): compile-time checks only
+// — nothing here touches the live list build; see sieve_engine.h.
+static_assert(kWheelStructuralPrimeCount == 3,
+              "wheel-30 structural strip is exactly {2,3,5}");
+static_assert(kWheelStructuralPrimes[0] == 2 && kWheelStructuralPrimes[1] == 3 &&
+                  kWheelStructuralPrimes[2] == 5,
+              "wheel-30 structural primes must be 2, 3, 5");
+static_assert(isWheelStructuralPrime(2) && isWheelStructuralPrime(3) &&
+                  isWheelStructuralPrime(5) && !isWheelStructuralPrime(7),
+              "isWheelStructuralPrime must match kWheelStructuralPrimes");
 }  // namespace
 
 SieveEngine::SieveEngine(int deviceIndex, const char* vendor)
@@ -95,6 +106,9 @@ uint64_t SieveEngine::run(uint64_t sumLimit, uint8_t* hostMap)
     // the leading 2 for the kernel: with p=2 its odd-only adjustment is a
     // no-op, so it clears every value == 2 (mod 4), wiping all ==3 (mod 4)
     // primes from the map.
+    // Wheel-30 note (task 5): under the FUTURE wheel kernel (task 7) this
+    // marking list additionally drops kWheelStructuralPrimes {3,5}; today the
+    // strip is INERT and the list content below is unchanged.
     const uint32_t* kernelPrimes = smallPrimes_.data();
     uint32_t kernelPrimeCount = static_cast<uint32_t>(smallPrimes_.size());
     if (kernelPrimeCount > 1 && kernelPrimes[0] == 2) {
@@ -127,6 +141,8 @@ uint64_t SieveEngine::prepare(uint64_t sumLimit)
     // isqrt((mapBytes<<4)-1) — same geometry chain as everywhere else.  At 2M
     // this halves the H2D upload (~328 KB → ~172 KB).  The search phase keeps
     // reading the FULL list through getSmallPrimes().
+    // (Task 5: the {2,3,5} wheel strip is NOT applied here — inert until the
+    // task-7 wheel kernel; getSmallPrimes()/kernelPrimes() content unchanged.)
     const uint64_t kernelPrimeMax = isqrt64((geom.mapBytes << 4) - 1);
     uint32_t kCount = 0;
     for (uint32_t v : smallPrimes_) {

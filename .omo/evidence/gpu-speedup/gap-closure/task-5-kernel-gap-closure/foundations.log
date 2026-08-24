@@ -1,0 +1,99 @@
+# task-5 wheel-30 foundations — gate log (2026-08-24)
+
+## Scope
+Pure plumbing + inert preparation, ZERO user-visible behavior change:
+(a) geometry internal/canonical sizing split, (b) inert {2,3,5} strip constants,
+(c) main.cpp comment-only {3,5}-kept rationale, (d) expand/compact helper pair +
+round-trip units in ff_budget_selftest.
+
+## New API (source/geometry.{h,cpp})
+  inline constexpr uint64_t kWheelModulus = 30;                  // 2*3*5
+  inline constexpr unsigned kWheelResidueCount = 8;
+  inline constexpr uint8_t  kWheelResidues[8] = {1,7,11,13,17,19,23,29}; // bit i <-> 30k+res[i]
+  uint64_t canonicalMapBytes(uint64_t span);   // ceil(span/16) — --dump-map/hostMap sizing (unchanged chain)
+  uint64_t internalMapBytes(uint64_t span);    // ceil(span/30) — plan's bufMin, honest 1.875x vs canonical
+  void expandWheel30ToCanonical(const uint8_t* src, uint8_t* dst, uint64_t span);
+  void compactCanonicalToWheel30(const uint8_t* src, uint8_t* dst, uint64_t span);
+  LegGeometry gains: uint64_t internalMapBytes (= internalMapBytes(mapBytes<<4));
+  mapBytes/maxPrimeMapValue numeric semantics UNCHANGED.
+Expand semantics: dst fully defined — coprime-residue bits copied from src; odd multiples
+of 3/5 set iff v==3||v==5; padding cleared. compact = inverse (never reads 3/5-multiple bits).
+Round-trip: compact(expand(x))==x for zero-padding x; expand(compact(y))==y for residue-valid y.
+
+## Inert strip constants (source/sieve_engine.h)
+  inline constexpr uint32_t kWheelStructuralPrimeCount = 3;
+  inline constexpr uint32_t kWheelStructuralPrimes[3] = {2,3,5};
+  inline constexpr bool isWheelStructuralPrime(uint32_t p);
+Referenced ONLY by static_asserts in sieve_engine.cpp — see grep proof below.
+
+## Gate 1: build + ctest (count stays 8)
+
+100% tests passed out of 8
+
+Total Test time (real) =  74.65 sec
+
+## Gate 2: verify.sh BOTH modes ALL legs byte-identical
+cpu mode rc=0: verify.sh: ALL LEGS PASS
+gpu-search mode rc=0: verify.sh: ALL LEGS PASS
+
+## Gate 3: dump-map sha256 (flags BEFORE positionals, ./ffPlayground rm'd under lock first)
+$ rm -f /tmp/t5.map && rm -rf ./ffPlayground && ./build/ff_sieve --devices amd --dump-map /tmp/t5.map 5 1048576
+rc=0
+sha256 = 4e4cc9807d471abd6140427a235da0d748000c9b4e40824accc3a57fa449de51
+expect = 4e4cc9807d471abd6140427a235da0d748000c9b4e40824accc3a57fa449de51
+=== grep proof: wheel strip constants NOT referenced by any live list-build path ===
+
+$ grep -rn "kWheelStructural\|isWheelStructural" source/ test/
+source/sieve_engine.cpp:64:static_assert(kWheelStructuralPrimeCount == 3,
+source/sieve_engine.cpp:66:static_assert(kWheelStructuralPrimes[0] == 2 && kWheelStructuralPrimes[1] == 3 &&
+source/sieve_engine.cpp:67:                  kWheelStructuralPrimes[2] == 5,
+source/sieve_engine.cpp:69:static_assert(isWheelStructuralPrime(2) && isWheelStructuralPrime(3) &&
+source/sieve_engine.cpp:70:                  isWheelStructuralPrime(5) && !isWheelStructuralPrime(7),
+source/sieve_engine.cpp:71:              "isWheelStructuralPrime must match kWheelStructuralPrimes");
+source/sieve_engine.cpp:110:    // marking list additionally drops kWheelStructuralPrimes {3,5}; today the
+source/sieve_engine.h:30:inline constexpr uint32_t kWheelStructuralPrimeCount = 3;
+source/sieve_engine.h:31:inline constexpr uint32_t kWheelStructuralPrimes[kWheelStructuralPrimeCount] = {
+source/sieve_engine.h:34:inline constexpr bool isWheelStructuralPrime(uint32_t p)
+source/sieve_engine.h:67:    // the same trim applies to smallPrimes_ minus kWheelStructuralPrimes —
+
+$ grep -n "kernelPrimes\|smallPrimes_\|getSmallPrimes" source/sieve_engine.cpp | grep -v "^.*//"
+112:    const uint32_t* kernelPrimes = smallPrimes_.data();
+113:    uint32_t kernelPrimeCount = static_cast<uint32_t>(smallPrimes_.size());
+114:    if (kernelPrimeCount > 1 && kernelPrimes[0] == 2) {
+115:        ++kernelPrimes;
+119:                   kernelPrimes,
+137:    hostSievePrimes(primeLimit, smallPrimes_);
+148:    for (uint32_t v : smallPrimes_) {
+157:const uint32_t* SieveEngine::kernelPrimes(uint32_t* count) const
+159:    const uint32_t* p = smallPrimes_.data();
+160:    uint32_t n = static_cast<uint32_t>(smallPrimes_.size());
+170:const uint32_t* SieveEngine::getSmallPrimes(uint32_t* count) const
+172:    if (count) *count = static_cast<uint32_t>(smallPrimes_.size());
+173:    return smallPrimes_.data();
+
+== every reference above is either the constant definition (sieve_engine.h),
+== compile-time static_assert (sieve_engine.cpp), or the UNCHANGED leading-2-skip /
+== sqrt-trim list build: no code path removes 2, 3, or 5 from any list. ==
+
+$ grep -n "smallPrimesGpu\|smallPrimesRaw" source/main.cpp
+711:        const uint32_t* smallPrimesRaw = engine.getSmallPrimes(&smallPrimeCount);
+713:        const uint32_t* smallPrimesGpu = smallPrimesRaw;
+715:        if (smallPrimeCountGpu > 1 && smallPrimesGpu[0] == 2) {
+716:            smallPrimesGpu++;
+786:                GpuSearchCopyH2D(ri, v, dSmallPrimes.ptr, smallPrimesGpu,
+872:        // CPU fallback (reuses smallPrimesRaw/smallPrimeCount from outer scope).
+875:        RunIt(prime, g.sumStart, g.sumLimit, g.productLimit, smallPrimesRaw, smallPrimeCount, cfg.threads, count);
+
+== search-side prep (:702-711) only skips the leading 2 — {3,5} KEPT (factor-advancement). ==
+
+## Round-trip unit coverage (test/source/budget_selftest.cpp)
+- sizing edges: internalMapBytes {0,1,29,30,31,959,960,961} + 2M-span == 9162596899;
+  LegGeometry.internalMapBytes @2M/1M/64K = {9162596899, 2290649226, 8947850}; density 30/16=1.875x
+- hardcoded layout oracles (mutation-discriminating, independent of kWheelResidues):
+  span=64 slot2->v11 byte0=0x64; span=240 superblock v239->byte14=0x01; span=245 tail v241->byte15=0x80
+- property round-trips both directions over edge spans {0..7,15,16,17,29,30,31,32,45,59,60,61,
+  89,90,91,95,239,240,241,255,256,959,960,961,1023,1024,4095,4096} + 128 random spans [1,60000]
+  + large {1048577, 2400001}; exhaustive residue-oracle scan for span<=20000, probed above
+- runtime: full selftest 0.02 s (pure host); ASan -O1 clean (rc=0, 0 errors)
+
+## Helper mutation scenario -> see helper-mutation.log

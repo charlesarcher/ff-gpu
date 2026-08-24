@@ -1,0 +1,26 @@
+# task-5 helper mutation scenario (scratch /tmp/opencode/t5-mut)
+
+Setup: copied geometry.{h,cpp} + budget_selftest.cpp into scratch TU dir (quoted-include
+gotcha: TU must sit NEXT TO the mutated header). Corrupted ONE residue constant:
+  kWheelResidues slot 2: 11 -> 13  (duplicate 13, missing 11)
+
+Rebuild: g++ -O2 -Wall -I<mutdir> -I<source> <mutdir>/budget_selftest.cpp <mutdir>/geometry.cpp ...
+
+== MUTATED RUN ==
+exit code: 1
+failure count: 10325
+first failures:
+FAIL /tmp/opencode/t5-mut/budget_selftest.cpp:105: std::memcmp(y.data(), wantY, 4) == 0
+FAIL /tmp/opencode/t5-mut/budget_selftest.cpp:109: std::memcmp(x2.data(), wantX, 3) == 0
+FAIL /tmp/opencode/t5-mut/budget_selftest.cpp:142: std::memcmp(x2.data(), x.data(), nInt) == 0
+FAIL /tmp/opencode/t5-mut/budget_selftest.cpp:155: set == ((x[v / 30] >> slot) & 1u)
+...
+ff_budget_selftest: 10325 FAILURE(S)
+
+Key: hardcoded layout oracles (selftest :105 wantY=={0x64,0,0,0}, :109 wantX=={0x04,0,0,0}) fail
+FIRST — they pin value->bit placement independent of the corrupted table, so a self-consistent
+corruption cannot sneak through pure round-trip alone.
+
+== RESTORED RUN (original geometry.h recopied, rebuilt) ==
+ff_budget_selftest: ALL PASS
+exit code: 0

@@ -1,9 +1,10 @@
 // Pure-logic self-test for the todo-3 modules (plan todo 3): leg geometry
 // chain (mapBytes at 2M/1M/64K legs), searchWorkspaceBytes (M4 gate), size
 // parser (GiB/MiB), fraction + device-vram-fraction spec parsing, §4.3
-// config validation, PCI-bus-ID dedup (Metis MUST-COVER), §4.2 budget math and
-// the §4.3 alloc-failure fraction shrink. No vendor headers, no GPU needed —
-// links with g++ only: `make selftest`.
+// config validation, PCI-bus-ID dedup (Metis MUST-COVER), §4.2 budget math,
+// the §4.3 alloc-failure fraction shrink, and the task-5 wheel-30
+// canonical<->internal sizing/layout round-trip. No vendor headers, no GPU
+// needed — links with g++ only: `make selftest`.
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -59,6 +60,137 @@ int main()
 
     // M4 SEARCH-participation workspace (todo 14): 24960 B at 2M
     CHECK(ff::searchWorkspaceBytes(2097152) == 24960ull);
+
+    // ---- wheel-30 foundations (task 5): sizing split + expand/compact ----
+    // Deliberately independent copy of the residue table: if geometry.h's
+    // kWheelResidues is corrupted, these literals keep the oracles honest.
+    static const unsigned kR[8] = {1, 7, 11, 13, 17, 19, 23, 29};
+    auto isCoprime30 = [](uint64_t v) {
+        for (unsigned r : kR)
+            if (v % 30 == r) return true;
+        return false;
+    };
+
+    CHECK(ff::canonicalMapBytes(64) == 4);
+    CHECK(ff::canonicalMapBytes(274877906960ull) == 17179869185ull);
+    CHECK(ff::internalMapBytes(0) == 0);
+    CHECK(ff::internalMapBytes(1) == 1);
+    CHECK(ff::internalMapBytes(29) == 1);
+    CHECK(ff::internalMapBytes(30) == 1);
+    CHECK(ff::internalMapBytes(31) == 2);
+    CHECK(ff::internalMapBytes(959) == 32);
+    CHECK(ff::internalMapBytes(960) == 32);
+    CHECK(ff::internalMapBytes(961) == 33);
+    CHECK(ff::internalMapBytes(274877906960ull) == 9162596899ull);
+    // Honest density: 30/16 = 1.875x vs canonical (NOT 3.75x).
+    CHECK(g2m.internalMapBytes == 9162596899ull);
+    CHECK(g1m.internalMapBytes == 2290649226ull);
+    CHECK(g64k.internalMapBytes == 8947850ull);
+    CHECK(g2m.internalMapBytes * 30 >= 274877906960ull);
+    CHECK(g2m.mapBytes > g2m.internalMapBytes);
+
+    uint32_t rng = 0x12345678u;
+    auto next = [&rng]() {
+        rng = rng * 1664525u + 1013904223u;
+        return rng >> 8;
+    };
+
+    // Hardcoded layout oracles (mutation-discriminating: they pin value ->
+    // canonical-bit placement independent of kWheelResidues).
+    {
+        std::vector<uint8_t> x(3, 0), y(4, 0xAA);
+        x[0] = 1u << 2;  // block 0, slot 2 -> value 11
+        ff::expandWheel30ToCanonical(x.data(), y.data(), 64);
+        const uint8_t wantY[4] = {0x64, 0x00, 0x00, 0x00};  // 3,5 forced + 11
+        CHECK(std::memcmp(y.data(), wantY, 4) == 0);
+        std::vector<uint8_t> x2(3, 0xAA);
+        ff::compactCanonicalToWheel30(y.data(), x2.data(), 64);
+        const uint8_t wantX[3] = {0x04, 0x00, 0x00};
+        CHECK(std::memcmp(x2.data(), wantX, 3) == 0);
+    }
+    {
+        // Superblock boundary: span 240 = one full 8-byte -> 15-byte group;
+        // block 7 slot 7 -> value 239 -> canonical byte 14, mask 0x01.
+        std::vector<uint8_t> x(8, 0), y(15, 0);
+        x[7] = 1u << 7;
+        ff::expandWheel30ToCanonical(x.data(), y.data(), 240);
+        CHECK(y[0] == 0x60 && y[14] == 0x01);
+        bool restClear = true;
+        for (unsigned b = 1; b < 14; ++b) restClear = restClear && y[b] == 0;
+        CHECK(restClear);
+    }
+    {
+        // Tail block: span 245, block 8 slot 0 -> value 241 -> byte 15, 0x80.
+        std::vector<uint8_t> x(9, 0), y(16, 0);
+        x[8] = 1u << 0;
+        ff::expandWheel30ToCanonical(x.data(), y.data(), 245);
+        CHECK(y[0] == 0x60 && y[15] == 0x80);
+    }
+
+    // Property round-trips: edge spans + random spans + one large sample.
+    auto checkSpan = [&](uint64_t span) {
+        const uint64_t nInt = ff::internalMapBytes(span);
+        const uint64_t nCan = ff::canonicalMapBytes(span);
+        std::vector<uint8_t> x(nInt), y1(nCan), x2(nInt), y(nCan), xp(nInt), y2(nCan);
+        for (uint64_t i = 0; i < nInt; ++i) x[i] = static_cast<uint8_t>(next());
+        for (uint64_t k = 0; k < nInt; ++k)          // zero padding slots
+            for (unsigned i = 0; i < 8; ++i)
+                if (30ull * k + kR[i] >= span) x[k] &= static_cast<uint8_t>(~(1u << i));
+
+        ff::expandWheel30ToCanonical(x.data(), y1.data(), span);
+        ff::compactCanonicalToWheel30(y1.data(), x2.data(), span);
+        if (nInt) CHECK(std::memcmp(x2.data(), x.data(), nInt) == 0);
+
+        // Residue oracle on y1 (independent of kWheelResidues).
+        auto probe = [&](uint64_t v) {
+            if (!(v & 1) || v >= span) return;
+            const uint8_t mask = static_cast<uint8_t>(0x80u >> ((v >> 1) & 7));
+            const bool set = (y1[v >> 4] & mask) != 0;
+            if (!isCoprime30(v)) {
+                CHECK(set == (v == 3 || v == 5));
+            } else {
+                unsigned slot = 8;
+                for (unsigned i = 0; i < 8; ++i)
+                    if (v % 30 == kR[i]) slot = i;
+                CHECK(set == ((x[v / 30] >> slot) & 1u));
+            }
+        };
+        if (span <= 20000) {
+            for (uint64_t v = 1; v < span; v += 2) probe(v);
+        } else {
+            probe(1); probe(3); probe(5); probe(29); probe(31);
+            probe(span - 1); probe(span - 2); probe(span - 31);
+            for (unsigned t = 0; t < 128; ++t) probe(next() % span);
+        }
+
+        // Inverse direction: valid canonical y -> compact -> expand == y.
+        for (uint64_t b = 0; b < nCan; ++b) y[b] = static_cast<uint8_t>(next());
+        for (uint64_t v = 1; v < span; v += 2) {
+            const uint8_t mask = static_cast<uint8_t>(0x80u >> ((v >> 1) & 7));
+            if (!isCoprime30(v)) y[v >> 4] &= static_cast<uint8_t>(~mask);
+            if (v == 3 && span > 3) y[0] |= 0x40u;
+            if (v == 5 && span > 5) y[0] |= 0x20u;
+        }
+        for (uint64_t v = span; v < nCan * 16ull; ++v) {            // zero padding
+            if (!(v & 1)) continue;
+            const uint8_t mask = static_cast<uint8_t>(0x80u >> ((v >> 1) & 7));
+            y[v >> 4] &= static_cast<uint8_t>(~mask);
+        }
+        ff::compactCanonicalToWheel30(y.data(), xp.data(), span);
+        ff::expandWheel30ToCanonical(xp.data(), y2.data(), span);
+        if (nCan) CHECK(std::memcmp(y2.data(), y.data(), nCan) == 0);
+    };
+
+    for (uint64_t s : {0ull, 1ull, 2ull, 3ull, 4ull, 5ull, 6ull, 7ull, 15ull,
+                       16ull, 17ull, 29ull, 30ull, 31ull, 32ull, 45ull, 59ull,
+                       60ull, 61ull, 89ull, 90ull, 91ull, 95ull, 239ull,
+                       240ull, 241ull, 255ull, 256ull, 959ull, 960ull,
+                       961ull, 1023ull, 1024ull, 4095ull, 4096ull})
+        checkSpan(s);
+    for (unsigned t = 0; t < 128; ++t) checkSpan(1 + next() % 60000);
+    checkSpan(1048577ull);
+    checkSpan(2400001ull);
+
 
     // ---- size parser ----
     uint64_t v = 0;

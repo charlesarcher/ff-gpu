@@ -700,6 +700,13 @@ maxPrimeMapValue = ff::runPullScheduler(cfg, r.devs, budgets, g,
         }
 
         // Get smallPrimes from engine (needed for GPU search; skip p=2 since kernel sieve already handles it).
+        // Wheel-30 note (task 5): THIS list intentionally KEEPS {3,5}. It is
+        // the FACTOR-ADVANCEMENT list for Freudenthal enumeration —
+        // gpu_search_kernel.h walks primeFactor = smallPrimes[++primeIndex]
+        // starting at 3 (index 0 = 3, 1 = 5, ...), so dropping 5 would skip
+        // factor-5 enumeration entirely and corrupt verdicts. Only the SIEVE
+        // MARKING list drops {2,3,5} under wheel-30 (structural primes, task
+        // 7); the search list must stay whole.
         uint32_t smallPrimeCount = 0;
         const uint32_t* smallPrimesRaw = engine.getSmallPrimes(&smallPrimeCount);
         // GPU kernel skips p=2 (sieve already handles it); CPU AllButOne expects leading 2.
