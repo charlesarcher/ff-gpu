@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -41,6 +42,8 @@ struct PerDevice {
     uint64_t homeCount = 0;           // number of home slabs
     uint64_t cap = 0;                 // max slabs this device may pull
     std::vector<void*> region;        // one device buffer per home slab
+    void* contigBase = nullptr;       // residency: single map-sized buffer;
+                                      // region[] entries are interior offsets
     void* stagingDev = nullptr;       // 1-slab device scratch (non-home pulls)
     void* stagingHost = nullptr;      // pinned host landing buffer (allocPinned)
     uint64_t pulled = 0;
@@ -246,8 +249,15 @@ void teardown(Shared& sh)
     for (size_t i = 0; i < sh.devs.size(); ++i) {
         PerDevice& d = sh.devs[i];
         const int ri = d.dev->runtimeIndex;
-        for (void* buf : d.region) (void)d.ops->free(ri, buf);
-        d.region.clear();
+        if (d.contigBase) {
+            // region[] are interior offsets of contigBase — free the base only
+            (void)d.ops->free(ri, d.contigBase);
+            d.contigBase = nullptr;
+            d.region.clear();
+        } else {
+            for (void* buf : d.region) (void)d.ops->free(ri, buf);
+            d.region.clear();
+        }
         if (d.stagingDev) {
             (void)d.ops->free(ri, d.stagingDev);
             d.stagingDev = nullptr;
@@ -322,7 +332,9 @@ uint64_t runPullScheduler(const Config& cfg,
                           const uint32_t* kernelPrimes,
                           uint32_t kernelPrimeCount,
                           uint8_t* hostMap,
-                          uint64_t* wallUs)
+                          uint64_t* wallUs,
+                          int residencyDev,
+                          PullMapResidency* residencyOut)
 {
     if (devs.size() > static_cast<size_t>(kMaxDevices) ||
         devs.size() != budgets.size()) {
@@ -333,7 +345,11 @@ uint64_t runPullScheduler(const Config& cfg,
         return 0;
     }
 
-    Shared sh;
+    // Heap-anchored so a deferred-teardown run can hand the whole state to
+    // the residency consumer (releasePullScheduler deletes it); every other
+    // path tears down internally and lets the unique_ptr free the shell.
+    std::unique_ptr<Shared> shp = std::make_unique<Shared>();
+    Shared& sh = *shp;
     sh.slabBytes = cfg.slabSizeBytes;
     sh.totalMapBytes = g.mapBytes;
     sh.numSlabs = (sh.totalMapBytes + sh.slabBytes - 1) / sh.slabBytes;
@@ -362,6 +378,29 @@ uint64_t runPullScheduler(const Config& cfg,
         sh.devs.push_back(std::move(pd));
     }
 
+    // Residency feasibility: the candidate device must back the contiguous
+    // map plus its staging scratch within its own budget envelope; otherwise
+    // the run proceeds on the legacy per-slab shape and reports no handoff.
+    bool residencyActive = false;
+    if (residencyOut != nullptr && residencyDev >= 0 &&
+        residencyDev < static_cast<int>(sh.devs.size())) {
+        PerDevice& rd = sh.devs[static_cast<size_t>(residencyDev)];
+        const uint64_t need =
+            sh.totalMapBytes +
+            (rd.budget->slabCount > 0 ? sh.slabBytes : 0);
+        if (need <= rd.budget->backing) {
+            residencyActive = true;
+        } else {
+            std::fprintf(stderr,
+                         "[ff_sieve] residency: device[%d] %s cannot back "
+                         "%llu B contiguously (backing %llu B) — legacy copy "
+                         "path\n",
+                         residencyDev, rd.dev->name,
+                         static_cast<unsigned long long>(need),
+                         static_cast<unsigned long long>(rd.budget->backing));
+        }
+    }
+
     assignHome(sh);
     assignCaps(sh);
 
@@ -375,34 +414,61 @@ uint64_t runPullScheduler(const Config& cfg,
         PerDevice& d = sh.devs[i];
         const int ri = d.dev->runtimeIndex;
         d.region.reserve(d.homeCount);
+        if (residencyActive && static_cast<int>(i) == residencyDev) {
+            // One contiguous map-sized allocation; home slabs become interior
+            // offsets so the consumer sees [0, totalMapBytes) behind a single
+            // device pointer. Same aggregate footprint as the per-slab shape
+            // (its right-sized caps summed to totalMapBytes).
+            d.contigBase = d.ops->alloc(ri, sh.totalMapBytes);
+            if (d.contigBase != nullptr) {
+                uint8_t* base = static_cast<uint8_t*>(d.contigBase);
+                for (uint64_t k = 0; k < d.homeCount; ++k)
+                    d.region.push_back(base + (d.homeBase + k) * sh.slabBytes);
+            } else {
+                std::fprintf(stderr,
+                             "[ff_sieve] residency: contiguous %llu B alloc "
+                             "failed on device[%zu] %s — legacy copy path\n",
+                             static_cast<unsigned long long>(sh.totalMapBytes),
+                             i, d.dev->name);
+                residencyActive = false;
+            }
+        }
+        if (d.contigBase == nullptr) {
+            for (uint64_t k = 0; k < d.homeCount; ++k) {
+                const uint64_t s = d.homeBase + k;
+                // Right-size to this slab's actual byte extent: every slab except
+                // the last is a full slabBytes, the final one may be tiny. This
+                // equals the kernel tail-policy floor ceil((segHi-segLo)/16)
+                // exactly (sieve_slab_kernel.h), so word/byte marking stays in
+                // bounds and buffer geometry per launch site is unchanged.
+                const uint64_t off = s * sh.slabBytes;
+                const uint64_t slabCap = std::min(sh.slabBytes,
+                                                  sh.totalMapBytes - off);
+                void* buf = d.ops->alloc(ri, slabCap);
+                if (!buf) {
+                    std::fprintf(stderr,
+                                 "[ff_sieve] error: backing alloc failed on "
+                                 "device[%zu] %s (home slab %llu of %llu)\n",
+                                 i, d.dev->name, static_cast<unsigned long long>(k),
+                                 static_cast<unsigned long long>(d.homeCount));
+                    teardown(sh);
+                    return 0;
+                }
+                d.region.push_back(buf);
+            }
+        }
         for (uint64_t k = 0; k < d.homeCount; ++k) {
             const uint64_t s = d.homeBase + k;
-            // Right-size to this slab's actual byte extent: every slab except
-            // the last is a full slabBytes, the final one may be tiny. This
-            // equals the kernel tail-policy floor ceil((segHi-segLo)/16)
-            // exactly (sieve_slab_kernel.h), so word/byte marking stays in
-            // bounds and buffer geometry per launch site is unchanged.
             const uint64_t off = s * sh.slabBytes;
             const uint64_t slabCap = std::min(sh.slabBytes,
                                               sh.totalMapBytes - off);
-            void* buf = d.ops->alloc(ri, slabCap);
-            if (!buf) {
-                std::fprintf(stderr,
-                             "[ff_sieve] error: backing alloc failed on "
-                             "device[%zu] %s (home slab %llu of %llu)\n",
-                             i, d.dev->name, static_cast<unsigned long long>(k),
-                             static_cast<unsigned long long>(d.homeCount));
-                teardown(sh);
-                return 0;
-            }
-            d.region.push_back(buf);
-            if (d.ops->memset(ri, buf, 0xff, slabCap) != 0) {
+            if (d.ops->memset(ri, d.region[k], 0xff, slabCap) != 0) {
                 teardown(sh);
                 return 0;
             }
             if (s == 0) {
                 const uint8_t notOne = 0x7f;
-                if (d.ops->copyH2D(ri, buf, &notOne, 1) != 0) {
+                if (d.ops->copyH2D(ri, d.region[k], &notOne, 1) != 0) {
                     teardown(sh);
                     return 0;
                 }
@@ -496,12 +562,59 @@ uint64_t runPullScheduler(const Config& cfg,
     }
 
     printStats(sh);
-    teardown(sh);
+
+    // Either hand the scheduler state to the residency consumer (deferred
+    // teardown; released via releasePullScheduler after search) or tear down
+    // internally as before. The post-join fence above already drained every
+    // copy stream, so hostMap AND the contiguous residency buffer are final
+    // at this point — including the producing kernels, since each copy was
+    // enqueued behind its compute-end event.
+    const bool deferTeardown = residencyOut != nullptr && residencyActive &&
+                               sh.failed.load(std::memory_order_relaxed) == 0;
+    if (deferTeardown) {
+        PerDevice& rd = sh.devs[static_cast<size_t>(residencyDev)];
+        uint64_t foreign = 0;
+        for (size_t s = 0; s < sh.ownerOf.size(); ++s)
+            if (sh.ownerOf[s] != residencyDev) ++foreign;
+        residencyOut->valid = true;
+        residencyOut->deviceIndex = residencyDev;
+        residencyOut->devPtr = static_cast<uint8_t*>(rd.contigBase);
+        residencyOut->mapBytes = sh.totalMapBytes;
+        residencyOut->ownerOf = sh.ownerOf;
+        residencyOut->handle = shp.release();
+        std::fprintf(stderr,
+                     "[ff_sieve] residency: map handed off on device[%d] %s "
+                     "(%llu B contiguous, %llu/%llu slab(s) resident, %llu "
+                     "foreign/homeless to fill); teardown deferred\n",
+                     residencyDev, rd.dev->name,
+                     static_cast<unsigned long long>(sh.totalMapBytes),
+                     static_cast<unsigned long long>(sh.numSlabs - foreign),
+                     static_cast<unsigned long long>(sh.numSlabs),
+                     static_cast<unsigned long long>(foreign));
+    } else {
+        if (residencyOut != nullptr) residencyOut->valid = false;
+        teardown(sh);
+    }
     if (sh.failed.load() != 0) {
         std::fprintf(stderr, "[ff_sieve] error: pull scheduler device op failed\n");
         return 0;
     }
     return g.maxPrimeMapValue;
+}
+
+void releasePullScheduler(PullMapResidency* residency)
+{
+    if (residency == nullptr || residency->handle == nullptr) {
+        if (residency != nullptr) residency->valid = false;
+        return;
+    }
+    Shared* sh = static_cast<Shared*>(residency->handle);
+    teardown(*sh);
+    delete sh;
+    residency->handle = nullptr;
+    residency->valid = false;
+    residency->devPtr = nullptr;
+    residency->ownerOf.clear();
 }
 
 }  // namespace ff

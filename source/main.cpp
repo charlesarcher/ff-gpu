@@ -6,8 +6,10 @@
 // -> GpuPrime -> RunIt Freudenthal search. STDOUT carries byte-exact headers
 // and Freudenthal results; STDERR carries all budget/diagnostic/audit output.
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <string>
 #include <vector>
@@ -20,6 +22,7 @@
 #include "geometry.h"
 #include "gpu_prime.h"
 #include "sieve_engine.h"
+#include "sieve_slab_engine.h"
 #include "pull_scheduler.h"
 #include "cpu_search.h"
 #include "m4/gpu_search_launcher.h"
@@ -139,6 +142,32 @@ static uint64_t isqrt64(uint64_t n) {
     while ((x + 1) * (x + 1) <= n) ++x;
     while (x * x > n) --x;
     return x;
+}
+
+// FF_GPU_RESIDENCY=0 forces the legacy copy path (full-map H2D); absent or
+// any other value keeps the residency handoff enabled.
+bool residencyToggleOn() {
+    const char* e = std::getenv("FF_GPU_RESIDENCY");
+    return !(e != nullptr && std::strcmp(e, "0") == 0);
+}
+
+// Deterministic GPU-search device choice from budgets alone — no device calls,
+// no output. The explicit --gpu-search-device=N when it fits, else the first
+// device whose budget covers requiredBytes, else -1. Used both for pre-sieve
+// residency planning and for the authoritative post-DevInit selection, so the
+// two answers cannot diverge.
+int selectSearchDevice(const ff::Config& cfg,
+                       const std::vector<ff::DeviceInfo>& devs,
+                       const std::vector<ff::DeviceBudget>& budgets,
+                       unsigned long long requiredBytes) {
+    if (cfg.gpuSearchDevice >= 0) {
+        if (cfg.gpuSearchDevice >= static_cast<int>(devs.size())) return -1;
+        if (budgets[cfg.gpuSearchDevice].budget < requiredBytes) return -1;
+        return cfg.gpuSearchDevice;
+    }
+    for (int di = 0; di < static_cast<int>(devs.size()); ++di)
+        if (budgets[di].budget >= requiredBytes) return di;
+    return -1;
 }
 
 int runLeg(const ff::Config& cfg, const std::vector<std::string>& positionals)
@@ -365,6 +394,37 @@ int runLeg(const ff::Config& cfg, const std::vector<std::string>& positionals)
     uint64_t mapBytes = (g.maxPrimeMapValue + 1 + 15) >> 4;
     std::vector<uint8_t> hostMap(mapBytes, 0);
 
+    // Residency planning, BEFORE the sieve: pick the GPU-search device now
+    // (pure budget math via selectSearchDevice) and ask the scheduler to
+    // leave the map resident on it. The scheduler re-validates feasibility
+    // against its own budgets; an invalid report simply means legacy copies.
+    ff::PullMapResidency residency;
+    int plannedSearchDev = -1;
+    if (cfg.gpuSearch && dumpMapFile.empty() && residencyToggleOn()) {
+        const uint64_t oddSumsPlan = (g.sumLimit - g.sumStart) / 2 + 1;
+        const unsigned long long reqBytesPlan =
+            static_cast<unsigned long long>(mapBytes) +
+            static_cast<unsigned long long>(oddSumsPlan * sizeof(GpuRecord)) +
+            static_cast<unsigned long long>(
+                ff::searchWorkspaceBytes(g.sumLimit));
+        plannedSearchDev =
+            selectSearchDevice(cfg, allDevs, allBudgets, reqBytesPlan);
+    }
+    int residencyDev = -1;   // scheduler-scope index (into r.devs)
+    if (plannedSearchDev >= 0) {
+        for (size_t i = 0; i < r.devs.size(); ++i) {
+            if (r.devs[i].runtimeIndex ==
+                    allDevs[plannedSearchDev].runtimeIndex &&
+                std::string(r.devs[i].vendor) ==
+                    std::string(allDevs[plannedSearchDev].vendor)) {
+                residencyDev = static_cast<int>(i);
+                break;
+            }
+        }
+    }
+    ff::PullMapResidency* residencyReq =
+        (cfg.gpuSearch && residencyDev >= 0) ? &residency : nullptr;
+
     // M2 backing pool + weighted dynamic pulls (plan todo 10): device-
     // independent prep (geometry + host primes), then the pull scheduler
     // sieves the full map across ALL logical devices. SieveEngine's ctor
@@ -382,7 +442,8 @@ int runLeg(const ff::Config& cfg, const std::vector<std::string>& positionals)
     uint64_t sieveUs = 0;
 maxPrimeMapValue = ff::runPullScheduler(cfg, r.devs, budgets, g,
                                              kernelPrimes, kernelPrimeCount,
-                                             hostMap.data(), &sieveUs);
+                                             hostMap.data(), &sieveUs,
+                                             residencyDev, residencyReq);
     double sieveMs = elapsedMs(t_sieve);
     dumpPhaseTimer("sieve phase", sieveMs);
     if (maxPrimeMapValue == 0) {
@@ -453,6 +514,10 @@ maxPrimeMapValue = ff::runPullScheduler(cfg, r.devs, budgets, g,
                 r.devs = allDevs;
                 budgets = allBudgets;
 
+                // Same deterministic choice the residency planner made; the
+                // branches below only render its outcome.
+                gpuDeviceIndex = selectSearchDevice(cfg, r.devs, budgets,
+                                                    requiredBytes);
                 if (cfg.gpuSearchDevice >= 0) {
                     if (cfg.gpuSearchDevice >= static_cast<int>(r.devs.size())) {
                         std::fprintf(stderr,
@@ -460,7 +525,7 @@ maxPrimeMapValue = ff::runPullScheduler(cfg, r.devs, budgets, g,
                             "but only %zu device(s) available\n",
                             cfg.gpuSearchDevice, r.devs.size());
                         useGpu = false;
-                    } else if (budgets[cfg.gpuSearchDevice].budget < requiredBytes) {
+                    } else if (gpuDeviceIndex < 0) {
                         std::fprintf(stderr,
                             "[ff_sieve] GPU search: device[%d] %s skipped — "
                             "need %llu B, budget %llu B\n",
@@ -477,18 +542,13 @@ maxPrimeMapValue = ff::runPullScheduler(cfg, r.devs, budgets, g,
                             cfg.gpuSearchDevice);
                     }
                 } else {
-                    for (int di = 0; di < (int)r.devs.size(); ++di) {
-                        if (budgets[di].budget >= requiredBytes) {
-                            gpuDeviceIndex = di;
-                            std::fprintf(stderr,
-                                "[ff_sieve] GPU search: device[%d] %s "
-                                "(auto, budget=%llu B)\n",
-                                di, r.devs[di].name,
-                                static_cast<unsigned long long>(budgets[di].budget));
-                            break;
-                        }
-                    }
-                    if (gpuDeviceIndex < 0) {
+                    if (gpuDeviceIndex >= 0) {
+                        std::fprintf(stderr,
+                            "[ff_sieve] GPU search: device[%d] %s "
+                            "(auto, budget=%llu B)\n",
+                            gpuDeviceIndex, r.devs[gpuDeviceIndex].name,
+                            static_cast<unsigned long long>(budgets[gpuDeviceIndex].budget));
+                    } else {
                         std::fprintf(stderr,
                             "[ff_sieve] GPU search: no device fits "
                             "(need %llu B). Falling back to CPU.\n",
@@ -509,20 +569,44 @@ maxPrimeMapValue = ff::runPullScheduler(cfg, r.devs, budgets, g,
         // GPU search: allocate via the same per-arch HIP objects that launch
         // the kernel (GpuSearchAlloc dispatches by vendor), so the allocator
         // and the kernel launch share one runtime context per device.
+        bool useResidentMap = false;
+        bool primeMapOwned = false;
         if (useGpu) {
-            if (GpuSearchAlloc(r.devs[gpuDeviceIndex].runtimeIndex,
-                               r.devs[gpuDeviceIndex].vendor,
-                               mapBytes, &dPrimeMap.ptr) != 0 ||
-                GpuSearchAlloc(r.devs[gpuDeviceIndex].runtimeIndex,
-                               r.devs[gpuDeviceIndex].vendor,
-                               recordBytes, &dRecords.ptr) != 0 ||
-                GpuSearchAlloc(r.devs[gpuDeviceIndex].runtimeIndex,
-                               r.devs[gpuDeviceIndex].vendor,
-                               sizeof(uint32_t), &dAtomic.ptr) != 0) {
+            // Residency handoff: when the scheduler left the map resident on
+            // THIS device, borrow its contiguous buffer and skip both the
+            // dPrimeMap allocation and the full-map H2D. Lifetime is safe:
+            // scheduler teardown is deferred until releasePullScheduler()
+            // below, after the internally synchronizing launch returns.
+            useResidentMap = residency.valid &&
+                             plannedSearchDev == gpuDeviceIndex;
+            if (useResidentMap) {
+                dPrimeMap.ptr = residency.devPtr;
+                std::fprintf(stderr,
+                    "[ff_sieve] GPU search: residency handoff — reading the "
+                    "sieve-resident map in place on device[%d] %s (%llu B, "
+                    "no map H2D)\n",
+                    gpuDeviceIndex, r.devs[gpuDeviceIndex].name,
+                    static_cast<unsigned long long>(residency.mapBytes));
+            } else if (GpuSearchAlloc(r.devs[gpuDeviceIndex].runtimeIndex,
+                                      r.devs[gpuDeviceIndex].vendor,
+                                      mapBytes, &dPrimeMap.ptr) != 0) {
                 std::fprintf(stderr,
                     "[ff_sieve] GPU search: device allocation failed, using CPU fallback\n");
                 useGpu = false;
+            } else {
+                primeMapOwned = true;
             }
+        }
+        if (useGpu &&
+            (GpuSearchAlloc(r.devs[gpuDeviceIndex].runtimeIndex,
+                            r.devs[gpuDeviceIndex].vendor,
+                            recordBytes, &dRecords.ptr) != 0 ||
+             GpuSearchAlloc(r.devs[gpuDeviceIndex].runtimeIndex,
+                            r.devs[gpuDeviceIndex].vendor,
+                            sizeof(uint32_t), &dAtomic.ptr) != 0)) {
+            std::fprintf(stderr,
+                "[ff_sieve] GPU search: device allocation failed, using CPU fallback\n");
+            useGpu = false;
         }
 
         // Get smallPrimes from engine (needed for GPU search; skip p=2 since kernel sieve already handles it).
@@ -552,13 +636,50 @@ maxPrimeMapValue = ff::runPullScheduler(cfg, r.devs, budgets, g,
             int ri = r.devs[gpuDeviceIndex].runtimeIndex;
             const char* v = r.devs[gpuDeviceIndex].vendor;
 
-            hAtomicCount = 0;
-            GpuSearchCopyH2D(ri, v, dAtomic.ptr, &hAtomicCount, sizeof(uint32_t));
+            if (useResidentMap) {
+                // Resident path: no map upload. Zero the record/atomic slots
+                // device-side (same bytes the legacy host-filled upload
+                // produces) and fill only slabs the sieve did NOT leave on
+                // this device (foreign-owned or homeless).
+                const SievePoolOps* pops = SievePoolGetForVendor(v, ri);
+                if (pops != nullptr &&
+                    pops->memset(ri, dRecords.ptr, 0, recordBytes) == 0 &&
+                    pops->memset(ri, dAtomic.ptr, 0, sizeof(uint32_t)) == 0) {
+                    hAtomicCount = 0;
+                } else {
+                    hAtomicCount = 0;
+                    std::fill(hRecords.begin(), hRecords.end(), GpuRecord{});
+                    GpuSearchCopyH2D(ri, v, dAtomic.ptr, &hAtomicCount,
+                                     sizeof(uint32_t));
+                    GpuSearchCopyH2D(ri, v, dRecords.ptr, hRecords.data(),
+                                     recordBytes);
+                }
+                uint64_t fillSlabs = 0, fillBytes = 0;
+                const uint64_t slabB = cfg.slabSizeBytes;
+                for (uint64_t s = 0; s < residency.ownerOf.size(); ++s) {
+                    if (residency.ownerOf[s] == residency.deviceIndex) continue;
+                    const uint64_t off = s * slabB;
+                    if (off >= mapBytes) break;
+                    const uint64_t cb = std::min(slabB, mapBytes - off);
+                    GpuSearchCopyH2D(ri, v, residency.devPtr + off,
+                                     hostMap.data() + off, cb);
+                    ++fillSlabs;
+                    fillBytes += cb;
+                }
+                std::fprintf(stderr,
+                    "[ff_sieve] GPU search: residency fill: %llu foreign/"
+                    "homeless slab(s), %llu B H2D\n",
+                    static_cast<unsigned long long>(fillSlabs),
+                    static_cast<unsigned long long>(fillBytes));
+            } else {
+                hAtomicCount = 0;
+                GpuSearchCopyH2D(ri, v, dAtomic.ptr, &hAtomicCount, sizeof(uint32_t));
 
-            std::fill(hRecords.begin(), hRecords.end(), GpuRecord{});
-            GpuSearchCopyH2D(ri, v, dRecords.ptr, hRecords.data(), recordBytes);
+                std::fill(hRecords.begin(), hRecords.end(), GpuRecord{});
+                GpuSearchCopyH2D(ri, v, dRecords.ptr, hRecords.data(), recordBytes);
 
-            GpuSearchCopyH2D(ri, v, dPrimeMap.ptr, hostMap.data(), mapBytes);
+                GpuSearchCopyH2D(ri, v, dPrimeMap.ptr, hostMap.data(), mapBytes);
+            }
 
             if (GpuSearchAlloc(ri, v, smallPrimeCountGpu * sizeof(uint32_t), &dSmallPrimes.ptr) != 0) {
                 std::fprintf(stderr, "[ff_sieve] GPU search: smallPrimes allocation failed\n");
@@ -600,6 +721,10 @@ maxPrimeMapValue = ff::runPullScheduler(cfg, r.devs, budgets, g,
                 double d2hMs = elapsedMs(tD2h);
                 dumpPhaseTimer("search D2H copies", d2hMs);
 
+                // The launch synchronized internally, so the resident map has
+                // been fully consumed — end the deferred scheduler lifetime.
+                if (residency.valid) ff::releasePullScheduler(&residency);
+
                 std::cout.flush();
                 auto t1 = std::chrono::high_resolution_clock::now();
                 GpuSearchEmit(prime, hRecords.data(),
@@ -612,7 +737,8 @@ maxPrimeMapValue = ff::runPullScheduler(cfg, r.devs, budgets, g,
                 GpuSearchFree(gpuDeviceIndex, r.devs[gpuDeviceIndex].vendor, dSmallPrimes.ptr);
                 GpuSearchFree(gpuDeviceIndex, r.devs[gpuDeviceIndex].vendor, dRecords.ptr);
                 GpuSearchFree(gpuDeviceIndex, r.devs[gpuDeviceIndex].vendor, dAtomic.ptr);
-                GpuSearchFree(gpuDeviceIndex, r.devs[gpuDeviceIndex].vendor, dPrimeMap.ptr);
+                if (primeMapOwned)
+                    GpuSearchFree(gpuDeviceIndex, r.devs[gpuDeviceIndex].vendor, dPrimeMap.ptr);
 
                 // Print timing (stdout, byte-exact)
                 uint64_t searchUs = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
@@ -638,9 +764,12 @@ maxPrimeMapValue = ff::runPullScheduler(cfg, r.devs, budgets, g,
         // whenever any of these pointers was allocated).
         const char* fv = gpuDeviceIndex >= 0 ? r.devs[gpuDeviceIndex].vendor : nullptr;
         if (dSmallPrimes.ptr) GpuSearchFree(gpuDeviceIndex, fv, dSmallPrimes.ptr);
-        if (dPrimeMap.ptr)    GpuSearchFree(gpuDeviceIndex, fv, dPrimeMap.ptr);
+        if (dPrimeMap.ptr && primeMapOwned) GpuSearchFree(gpuDeviceIndex, fv, dPrimeMap.ptr);
         if (dRecords.ptr)     GpuSearchFree(gpuDeviceIndex, fv, dRecords.ptr);
         if (dAtomic.ptr)      GpuSearchFree(gpuDeviceIndex, fv, dAtomic.ptr);
+        // Any non-success flow (DevInit, alloc, launch failures) still owes
+        // the scheduler its deferred teardown.
+        if (residency.valid) ff::releasePullScheduler(&residency);
 
         // CPU fallback (reuses smallPrimesRaw/smallPrimeCount from outer scope).
         auto t1 = std::chrono::high_resolution_clock::now();
