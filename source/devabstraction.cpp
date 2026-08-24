@@ -25,9 +25,26 @@ namespace {
 
 constexpr int kMaxDevices = 64;
 
+// Test-visible count of ff_enum_hip_* invocations (DevTestEnumCallCount).
+// Every enumeration in this TU is routed through enumBackend() so the count
+// is exhaustive; production behavior is unchanged (same ternary per site).
+long long g_enumCalls = 0;
+
+int enumBackend(ffdev::DevBackend backend, ff::DeviceInfo* buf,
+                int maxDevices, int* outCount)
+{
+    ++g_enumCalls;
+    return backend == ffdev::DevBackend::HipNv
+               ? ff_enum_hip_sm_120(buf, maxDevices, outCount)
+               : ff_enum_hip_gfx1201(buf, maxDevices, outCount);
+}
+
 struct DevMapEntry {
     ffdev::DevBackend backend = ffdev::DevBackend::Unknown;
     int vendorIndex = -1;   // index within the vendor runtime (runtimeIndex)
+    bool remapped = false;  // vendorIndex reconciled against its backend —
+                            // persistent: once true, resolveLogical serves
+                            // this entry with ZERO further enumeration
 };
 
 std::vector<ff::DeviceInfo> g_devices;
@@ -51,9 +68,7 @@ static int findVendorIndexFor(const std::string& busId, ffdev::DevBackend backen
 {
     ff::DeviceInfo buf[kMaxDevices] = {};
     int count = 0;
-    int rc = backend == ffdev::DevBackend::HipNv
-                 ? ff_enum_hip_sm_120(buf, kMaxDevices, &count)
-                 : ff_enum_hip_gfx1201(buf, kMaxDevices, &count);
+    int rc = enumBackend(backend, buf, kMaxDevices, &count);
     if (rc != 0) return -1;
     for (int i = 0; i < count; ++i)
         if (std::string(buf[i].busId) == busId) return i;
@@ -77,15 +92,15 @@ int resolveLogical(int deviceIndex, DevMapEntry* e)
     const std::string key = mapKey(g_devices[deviceIndex]);
     auto it = g_busMap.find(key);
     if (it != g_busMap.end()) {
-        // Remap: the stored vendorIndex is from the enumeration that FIRST
-        // reported this bus. Re-enumerate THAT backend to get the correct
-        // index within it.
-        int remapped = findVendorIndexFor(key, it->second.backend);
-        if (remapped >= 0) {
-            DevMapEntry fixed = it->second;
-            fixed.vendorIndex = remapped;
-            *e = fixed;
-            return 0;
+        // One-time remap: the stored vendorIndex is from the enumeration that
+        // FIRST reported this bus; reconcile it against THAT backend once,
+        // then persist the fixed entry — every later op on this bus is served
+        // from the cache with zero ff_enum_hip_* calls (plan todo 7).
+        // Single-threaded contract, same as the rest of this TU.
+        if (!it->second.remapped) {
+            int remapped = findVendorIndexFor(key, it->second.backend);
+            if (remapped >= 0) it->second.vendorIndex = remapped;
+            it->second.remapped = true;
         }
         *e = it->second;
         return 0;
@@ -118,11 +133,11 @@ int DevInit(void)
     ff::DeviceInfo amdBuf[kMaxDevices] = {};
     ff::DeviceInfo nvBuf[kMaxDevices] = {};
     int amdCount = 0, nvCount = 0;
-    if (ff_enum_hip_gfx1201(amdBuf, kMaxDevices, &amdCount) != 0)
+    if (enumBackend(DevBackend::HipAmd, amdBuf, kMaxDevices, &amdCount) != 0)
         std::fprintf(stderr,
                      "[ffdev] warning: HIP (AMD) enumeration failed; no AMD "
                      "devices will participate\n");
-    if (ff_enum_hip_sm_120(nvBuf, kMaxDevices, &nvCount) != 0)
+    if (enumBackend(DevBackend::HipNv, nvBuf, kMaxDevices, &nvCount) != 0)
         std::fprintf(stderr,
                      "[ffdev] warning: HIP-NV enumeration failed; no NVIDIA "
                      "devices will participate\n");
@@ -143,6 +158,43 @@ int DevInit(void)
                  "[ffdev] DevInit: %zu logical device(s), "
                  "%d duplicate(s) skipped\n",
                  g_devices.size(), skipped);
+    g_initialized = 1;
+    return 0;
+}
+
+int DevInitFromDevices(const std::vector<ff::DeviceInfo>& devices)
+{
+    if (g_initialized) return 0;   // idempotent, same contract as DevInit()
+
+    if (devices.empty()) {
+        std::fprintf(stderr,
+                     "[ffdev] DevInitFromDevices: empty device list — "
+                     "refusing (nothing initialized, no enumeration "
+                     "performed)\n");
+        return -1;
+    }
+
+    // Seed verbatim: the caller owns enumeration results AND ordering; this
+    // TU performs ZERO ff_enum_hip_* calls. Each DeviceInfo already carries
+    // the authoritative vendor + runtimeIndex from the enumeration that
+    // produced it, so entries are born remapped — resolveLogical is served
+    // entirely from this persistent cache.
+    g_devices = devices;
+    g_busMap.clear();
+    for (size_t i = 0; i < g_devices.size(); ++i) {
+        DevMapEntry e;
+        e.backend = std::strcmp(g_devices[i].vendor, "nvidia") == 0
+                        ? DevBackend::HipNv
+                        : DevBackend::HipAmd;
+        e.vendorIndex = g_devices[i].runtimeIndex;
+        e.remapped = true;
+        g_busMap[mapKey(g_devices[i])] = e;
+    }
+
+    std::fprintf(stderr,
+                 "[ffdev] DevInitFromDevices: %zu logical device(s) seeded "
+                 "from caller enumeration (no re-enumeration)\n",
+                 g_devices.size());
     g_initialized = 1;
     return 0;
 }
@@ -480,9 +532,7 @@ int DevForceBackendForBus(const char* busId, DevBackend backend)
     // Re-enumerate the forced backend and locate the bus INSIDE it.
     ff::DeviceInfo buf[kMaxDevices] = {};
     int count = 0;
-    int rc = backend == DevBackend::HipNv
-                 ? ff_enum_hip_sm_120(buf, kMaxDevices, &count)
-                 : ff_enum_hip_gfx1201(buf, kMaxDevices, &count);
+    int rc = enumBackend(backend, buf, kMaxDevices, &count);
     if (rc != 0) {
         std::fprintf(stderr,
                      "[ffdev] DevForceBackendForBus: re-enumerating forced "
@@ -507,12 +557,18 @@ int DevForceBackendForBus(const char* busId, DevBackend backend)
     DevMapEntry e;
     e.backend = backend;
     e.vendorIndex = vendorIndex;
+    e.remapped = true;   // computed from a fresh enumeration right above
     g_busMap[bus] = e;
     std::fprintf(stderr,
                  "[ffdev] DevForceBackendForBus: remapped PCI bus %s to "
                  "'%s' backend (vendor index %d)\n",
                  bus.c_str(), backendName(backend), vendorIndex);
     return 0;
+}
+
+long long DevTestEnumCallCount(void)
+{
+    return g_enumCalls;
 }
 
 }  // namespace ffdev

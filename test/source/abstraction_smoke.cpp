@@ -14,17 +14,31 @@
 // vendor's card, so the forced backend cannot be located in its own
 // enumeration -> DevForceBackendForBus refuses with an explicit message and
 // this binary exits rc=1 (NO silent fallback).
+//
+// Task 7 adds the seed-from-enumeration phase: DevInitFromDevices must seed
+// WITHOUT any ff_enum_hip_* call, resolveLogical post-seed must serve from
+// the persistent cache (100x resolves -> zero enumerations), and an EMPTY
+// seed list must be refused leaving runtimes uninitialized. Init state is
+// process-global, so these phases run in a CHILD PROCESS (the binary re-execs
+// itself with FF_SMOKE_SEED_CHILD=1) while this parent keeps validating the
+// legacy DevInit() path unchanged.
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include "devabstraction.h"
+#include "device_registry.h"
+
+extern "C" int ff_enum_hip_gfx1201(ff::DeviceInfo* out, int maxDevices, int* outCount);
+extern "C" int ff_enum_hip_sm_120(ff::DeviceInfo* out, int maxDevices, int* outCount);
 
 namespace {
 
 constexpr int kElems = 1 << 20;   // 4 MiB of unsigned ints
+constexpr int kMaxDevices = 64;
 
 int runDeviceOps(int idx, const ff::DeviceInfo& info)
 {
@@ -105,10 +119,188 @@ int runDeviceOps(int idx, const ff::DeviceInfo& info)
     return 0;
 }
 
+// Task 7 phases: empty-seed refusal, seed-from-enumeration with zero
+// re-enumeration proof, cached resolveLogical, alloc/free per seeded device.
+int seedPhaseMain()
+{
+    std::fprintf(stderr,
+                 "\n== ffdev seed-from-enumeration phase (child process) ==\n");
+
+    // ---- EMPTY-seed failure QA: refuse WITHOUT initializing runtimes ----
+    long long enumCalls = ffdev::DevTestEnumCallCount();
+    if (ffdev::DevInitFromDevices(std::vector<ff::DeviceInfo>()) == 0) {
+        std::fprintf(stderr,
+                     "[abs-smoke] EMPTY-SEED QA FAIL: empty list accepted\n");
+        return 1;
+    }
+    if (ffdev::DevTestEnumCallCount() != enumCalls) {
+        std::fprintf(stderr,
+                     "[abs-smoke] EMPTY-SEED QA FAIL: %lld ff_enum_hip_* "
+                     "call(s) during refused seed\n",
+                     ffdev::DevTestEnumCallCount() - enumCalls);
+        return 1;
+    }
+    if (ffdev::DevGetDeviceCount() != -1 ||
+        ffdev::DevBackendOf(0) != ffdev::DevBackend::Unknown) {
+        std::fprintf(stderr,
+                     "[abs-smoke] EMPTY-SEED QA FAIL: abstraction state was "
+                     "mutated by the refused seed\n");
+        return 1;
+    }
+    std::fprintf(stderr,
+                 "[abs-smoke] EMPTY-SEED QA OK: DevInitFromDevices({}) "
+                 "refused rc!=0, ZERO ff_enum_hip_* calls (%lld total), "
+                 "runtimes uninitialized (DevGetDeviceCount=-1, "
+                 "DevBackendOf=unknown)\n",
+                 ffdev::DevTestEnumCallCount());
+
+    // ---- Build an already-enumerated list exactly like DevInit would ----
+    ff::DeviceInfo amdBuf[kMaxDevices] = {};
+    ff::DeviceInfo nvBuf[kMaxDevices] = {};
+    int amdCount = 0, nvCount = 0, skipped = 0;
+    if (ff_enum_hip_gfx1201(amdBuf, kMaxDevices, &amdCount) != 0)
+        std::fprintf(stderr,
+                     "[abs-smoke] warning: AMD enumeration failed\n");
+    if (ff_enum_hip_sm_120(nvBuf, kMaxDevices, &nvCount) != 0)
+        std::fprintf(stderr,
+                     "[abs-smoke] warning: NVIDIA enumeration failed\n");
+    std::vector<ff::DeviceInfo> seeded =
+        ff::mergeAndDedupe(amdBuf, amdCount, nvBuf, nvCount, &skipped);
+    // The two direct extern calls above deliberately BYPASS the abstraction
+    // (that is the point: enumeration happened OUTSIDE ffdev), so the
+    // abstraction-side counter must still be zero here.
+    if (seeded.empty()) {
+        std::fprintf(stderr,
+                     "[abs-smoke] SEED FAIL: test-side enumeration produced "
+                     "no devices\n");
+        return 1;
+    }
+    if (ffdev::DevTestEnumCallCount() != 0) {
+        std::fprintf(stderr,
+                     "[abs-smoke] SEED FAIL: abstraction performed %lld "
+                     "enumeration call(s) before any init\n",
+                     ffdev::DevTestEnumCallCount());
+        return 1;
+    }
+
+    // ---- Seed: must perform ZERO ff_enum_hip_* calls ----
+    const long long preSeed = ffdev::DevTestEnumCallCount();
+    if (ffdev::DevInitFromDevices(seeded) != 0) {
+        std::fprintf(stderr, "[abs-smoke] SEED FAIL: DevInitFromDevices "
+                             "refused a valid list\n");
+        return 1;
+    }
+    if (ffdev::DevTestEnumCallCount() != preSeed) {
+        std::fprintf(stderr,
+                     "[abs-smoke] SEED FAIL: %lld ff_enum_hip_* call(s) "
+                     "inside DevInitFromDevices\n",
+                     ffdev::DevTestEnumCallCount() - preSeed);
+        return 1;
+    }
+    std::fprintf(stderr,
+                 "[abs-smoke] SEED OK: %zu logical device(s) seeded, "
+                 "ff_enum_hip_* calls during seed = 0\n",
+                 seeded.size());
+
+    // ---- Zero-reenum proof: 100x resolveLogical post-seed ----
+    const int count = ffdev::DevGetDeviceCount();
+    if (count != static_cast<int>(seeded.size())) {
+        std::fprintf(stderr,
+                     "[abs-smoke] SEED FAIL: count %d != seeded %zu\n",
+                     count, seeded.size());
+        return 1;
+    }
+    const long long preResolve = ffdev::DevTestEnumCallCount();
+    for (int rep = 0; rep < 100; ++rep) {
+        for (int i = 0; i < count; ++i) {
+            if (ffdev::DevBackendOf(i) == ffdev::DevBackend::Unknown) {
+                std::fprintf(stderr,
+                             "[abs-smoke] RESOLVE FAIL: device[%d] unknown "
+                             "backend at rep %d\n", i, rep);
+                return 1;
+            }
+        }
+    }
+    if (ffdev::DevTestEnumCallCount() != preResolve) {
+        std::fprintf(stderr,
+                     "[abs-smoke] ZERO-REENUM PROOF FAIL: %d resolves over "
+                     "%d device(s) triggered %lld ff_enum_hip_* call(s)\n",
+                     100 * count, count,
+                     ffdev::DevTestEnumCallCount() - preResolve);
+        return 1;
+    }
+    std::fprintf(stderr,
+                 "[abs-smoke] ZERO-REENUM PROOF OK: %d resolveLogical ops "
+                 "(100x over %d device(s)) performed %lld ff_enum_hip_* "
+                 "calls\n",
+                 100 * count, count,
+                 ffdev::DevTestEnumCallCount() - preResolve);
+
+    // ---- Alloc trivial buffer on each seeded device -> free ----
+    for (int i = 0; i < count; ++i) {
+        const ff::DeviceInfo& want = seeded[static_cast<size_t>(i)];
+        ff::DeviceInfo live {};
+        if (ffdev::DevGetDeviceProperties(i, &live) != 0 ||
+            std::strcmp(want.name, live.name) != 0 ||
+            std::strcmp(want.busId, live.busId) != 0 ||
+            std::strcmp(want.vendor, live.vendor) != 0) {
+            std::fprintf(stderr,
+                         "[abs-smoke] SEED FAIL: device[%d] live query does "
+                         "not match seeded info (wrong runtime serving this "
+                         "logical index?)\n", i);
+            return 1;
+        }
+        ffdev::DevHandle h;
+        if (ffdev::DevAlloc(i, 4096, &h) != 0) {
+            std::fprintf(stderr,
+                         "[abs-smoke] SEED FAIL: device[%d] trivial "
+                         "DevAlloc FAILED\n", i);
+            return 1;
+        }
+        const ffdev::DevBackend wantBackend =
+            std::strcmp(want.vendor, "nvidia") == 0
+                ? ffdev::DevBackend::HipNv
+                : ffdev::DevBackend::HipAmd;
+        if (h.backend != wantBackend || h.vendorIndex != want.runtimeIndex) {
+            std::fprintf(stderr,
+                         "[abs-smoke] SEED FAIL: device[%d] handle routes to "
+                         "%s vendorIndex %d (want %s/%d)\n",
+                         i, ffdev::backendName(h.backend), h.vendorIndex,
+                         ffdev::backendName(wantBackend), want.runtimeIndex);
+            ffdev::DevFree(&h);
+            return 1;
+        }
+        if (ffdev::DevFree(&h) != 0) {
+            std::fprintf(stderr,
+                         "[abs-smoke] SEED FAIL: device[%d] DevFree FAILED\n",
+                         i);
+            return 1;
+        }
+        std::fprintf(stderr,
+                     "[abs-smoke] SEEDED device[%d] %s (bus=%s backend=%s "
+                     "vendorIndex=%d): live props match, trivial alloc+free "
+                     "OK\n",
+                     i, want.name, want.busId,
+                     ffdev::backendName(wantBackend), want.runtimeIndex);
+    }
+
+    std::fprintf(stderr,
+                 "[abs-smoke] SEED-PHASE OK: %d device(s) seeded without "
+                 "re-enumeration, cache-persistent resolve proven, "
+                 "alloc/free exercised on every seeded device\n",
+                 count);
+    return 0;
+}
+
 }  // namespace
 
-int main()
+int main(int argc, char** argv)
 {
+    // Child dispatch: the seed-from-enumeration phases need virgin init
+    // state, so the parent re-execs this binary with FF_SMOKE_SEED_CHILD=1.
+    const char* seedChild = std::getenv("FF_SMOKE_SEED_CHILD");
+    if (seedChild && seedChild[0] == '1') return seedPhaseMain();
+
     std::fprintf(stderr,
                  "== ffdev abstraction smoke (one process, two GPUs) ==\n");
 
@@ -227,5 +419,28 @@ int main()
                  "(backend hip-amd=%d hip-nv=%d) exercised alloc/copy/event/"
                  "launch in one process\n",
                  count, nAmd, nNv);
+
+    // ---- Task 7: exercise DevInitFromDevices in a fresh child process ----
+    // Init state is process-global; this parent keeps validating legacy
+    // DevInit() while the child proves the seed path + cached resolve.
+    if (argc > 0 && argv[0] && argv[0][0] != '\0') {
+        if (setenv("FF_SMOKE_SEED_CHILD", "1", 1) != 0) {
+            std::fprintf(stderr,
+                         "[abs-smoke] SEED-PHASE FAIL: setenv failed\n");
+            return 1;
+        }
+        const std::string cmd =
+            std::string("'") + argv[0] + "' 2>&1";
+        const int childRc = std::system(cmd.c_str());
+        if (childRc != 0) {
+            std::fprintf(stderr,
+                         "[abs-smoke] SEED-PHASE FAIL: child exited with "
+                         "status %d\n", childRc);
+            return 1;
+        }
+        std::fprintf(stderr,
+                     "[abs-smoke] SEED-PHASE (child) OK: DevInitFromDevices "
+                     "seeded without re-enumeration\n");
+    }
     return 0;
 }

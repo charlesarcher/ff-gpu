@@ -18,6 +18,7 @@
 #define FF_DEVABSTRACTION_H
 
 #include <cstddef>
+#include <vector>
 
 #include "device_info.h"
 
@@ -66,6 +67,19 @@ const char* backendName(DevBackend b);
 // before anything else; idempotent. Returns 0 on success, -1 on error
 // (stderr detail).
 int DevInit(void);
+
+// Seeds the abstraction from an ALREADY-ENUMERATED device list (plan todo 7)
+// WITHOUT calling any ff_enum_hip_* entry point again: the list is taken
+// verbatim — enumeration results AND ordering are the caller's, this TU
+// performs zero re-enumeration — and the busId -> {backend, vendor
+// runtimeIndex} map is built from each DeviceInfo's own vendor/runtimeIndex
+// fields. Entries are born with the remap already resolved, so the cache is
+// persistent from the first op on: resolveLogical never re-enumerates.
+// Same contract as DevInit(): call once before anything else; idempotent (a
+// later DevInit()/DevInitFromDevices() is a no-op). Returns 0 on success;
+// refuses an EMPTY list with -1 while leaving the abstraction uninitialized
+// (no runtime touched, no enumeration performed).
+int DevInitFromDevices(const std::vector<ff::DeviceInfo>& devices);
 
 int DevGetDeviceCount(void);
 
@@ -122,6 +136,11 @@ int DevLaunchM0(int deviceIndex, int kernel_id, void* devBuf, int n, DevStream* 
 // explicit stderr message if the forced backend cannot see the bus — there
 // is NO silent fallback: refusing loudly beats running on the wrong device.
 int DevForceBackendForBus(const char* busId, DevBackend backend);
+
+// ---- TEST-ONLY hook (never used by production callers) ----
+// Number of ff_enum_hip_* invocations this TU has performed since process
+// start. Lets tests PROVE zero re-enumeration (seed path / cached resolve).
+long long DevTestEnumCallCount(void);
 
 }  // namespace ffdev
 
