@@ -179,7 +179,7 @@ ff_sieve [options] <sumStart> <sumLimit>
 
 # Restrict to one GPU vendor
 ./build/ff_sieve --devices=nvidia 5 2097152
-./build/ff_sieve --devices=amd 5 1048576     # AMD cannot handle 2M (VRAM)
+./build/ff_sieve --devices=amd 5 1048576     # AMD-only run (the 2M leg also completes, via auto host-tier spill)
 
 # List detected GPUs and exit
 ./build/ff_sieve --list-devices
@@ -212,6 +212,16 @@ Sizes accept suffixes like `KiB`/`MiB`/`GiB` or raw byte counts.
 | Variable | Effect |
 |----------|--------|
 | `FF_THREADS=<n>` | CPU search thread count, clamped to [1, `hardware_concurrency`] (default 31; ignored when `--threads=N` is given) |
+| `FF_GPU_RESIDENCY=0` | Forces the legacy copy path (full-map H2D staging); absent or any other value keeps the residency handoff enabled |
+
+### Stderr timing lines
+
+Every `ff_sieve` run prints `ff_sieve timing:` phase lines to stderr — device
+enumeration, budget computation, sieve phase, search phase, and total. On the
+GPU-search path these additionally include separable search sub-timers
+(`search H2D copies`, `search kernel`, `search D2H copies`, `search emit`).
+When GPU search falls back to CPU (announced by a documented capacity notice),
+the GPU sub-timers are absent but the search phase itself is still timed.
 
 ## Verification
 
@@ -260,28 +270,30 @@ Only run this when the *reference* behavior legitimately changes — regenerated
 
 ## Performance
 
-### Benchmark Results (from `scripts/bench_full.sh`)
+### Benchmark Results (authoritative sweep: `scripts/bench_per_device.sh`, median of 3 timed reps after 1 untimed warmup; final sweep 2026-08-24)
+
+Wall-clock time (seconds), full process end-to-end:
 
 | Config | 65K | 131K | 262K | 524K | 1M | 2M |
 |--------|-----|------|------|------|----|-----|
-| **Original (ff_seg)** | 0.034s | 0.111s | 0.474s | 2.423s | 10.070s | 47.309s |
-| GPU+CPU RTX 5090 | 0.730s | 0.736s | 1.002s | 2.800s | 11.977s | 63.966s |
-| GPU+CPU RX 9070 XT | 0.633s | 0.634s | 1.059s | 4.408s | 22.731s | - |
-| GPU All RTX 5090 | 0.735s | 0.822s | 1.097s | 2.106s | 7.346s | 62.836s |
+| **Original (ff_seg)** | 0.019s | 0.084s | 0.427s | 2.198s | 9.227s | 40.559s |
+| nvidia_gpu (`--devices=nvidia --gpu-search`) | 0.253s | 0.271s | 0.419s | 0.894s | 2.506s | 11.822s |
+| amd_gpu (`--devices=amd --gpu-search`) | 0.104s | 0.218s | 0.618s | 1.878s | 6.296s | 50.596s |
 
-**Speedup vs Reference** (>1.0 = faster):
+**Speedup vs Reference** (>1.0 = faster; ✗ = misses the plan's bar for that cell):
 
 | Config | 65K | 131K | 262K | 524K | 1M | 2M |
 |--------|-----|------|------|------|----|-----|
-| GPU+CPU RTX 5090 | 0.05x | 0.15x | 0.47x | 0.87x | 0.84x | 0.74x |
-| GPU All RTX 5090 | 0.05x | 0.14x | 0.43x | **1.15x** | **1.37x** | 0.75x |
+| nvidia_gpu | 0.08x | 0.31x ✗(≥1.0) | **1.02x ✓** | **2.46x ✓(≥2.0)** | **3.68x ✓(≥2.0)** | **3.43x ✓(≥2.0)** |
+| amd_gpu | 0.18x | 0.39x ✗(≥1.0) | 0.69x ✗(≥1.0) | **1.17x ✗(≥2.0 required)** | **1.47x ✗(≥2.0 required)** | 0.80x (completion cell¹) |
 
 ### Notes
 
-- **GPU+CPU**: GPU sieve + CPU search (production path)
-- **GPU All**: GPU sieve + GPU search (fully functional; correctness verified)
-- **AMD limitation**: Cannot handle the 2M leg (VRAM insufficient)
-- AMD GPU requires ROCm 7.2+ for gfx1201 support
+- **nvidia_gpu / amd_gpu**: full GPU enablement — both the sieve kernel and the Freudenthal search kernel run on that card. Correctness is byte-identical to the reference in every cell (18/18 cells outcome=OK).
+- **Honest misses**: the AMD ≥2.0x targets at 524K/1M are missed structurally — even a zero-overhead run caps at **1.23x** (524K) and **1.51x** (1M), because sieve + search-kernel work alone exceeds the bar. The ≥1.0x cells at 131K/262K are dominated by ~113–125 ms device enumeration/init inside full-process walls.
+- **65K floors**: NVIDIA 253 ms (−80% vs its 1.281 s baseline), AMD 104 ms (−92% vs its 1.354 s baseline).
+- ¹ **amd_gpu @ 2M** is scored as a completion cell only: it finishes rc=0 byte-exact by default via the auto host-tier spill (GPU search falls back to CPU there); its 0.80x ratio is recorded for transparency, not competitiveness.
+- AMD GPU requires ROCm 7.2+ for gfx1201 support.
 
 ## Project Structure
 
@@ -325,6 +337,16 @@ Build outputs land in `build/` (fully gitignored); reference binaries stay in `r
 ### 1. `slab_cmp` — all cases pass
 
 The `slab_cmp` test previously failed 5/10 cases due to a test-side indexing mismatch (the GPU kernel correctly used segLo-relative indexing matching the production slab engine, but the test compared as global-indexed). The test has been corrected and **all 10 cases pass** with byte-identical output.
+
+### 2. amd@2M leg — completes by default via auto-spill
+
+The 2M leg's prime map (~16 GiB) exceeds the RX 9070 XT's backing (~13.2 GiB
+at the default budget). Since task 14 the aggregate capacity gate
+auto-enables the host overflow tier, so `amd_gpu @ 2097152` completes by
+default (rc=0, byte-identical); GPU search falls back to CPU on that leg via
+the documented capacity notice ("no device fits"). Bringing the map inside
+AMD's backing via wheel-30 compression is a follow-up decision point, not
+done work.
 
 ### 3. Thread Count
 

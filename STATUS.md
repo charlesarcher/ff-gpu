@@ -29,26 +29,30 @@ CUDA calls anywhere in the tree.
 └─────────────────────────────────────────────────────────────┘
 ```
 
-## Current Performance (from `scripts/bench_full.sh`)
+## Current Performance (authoritative sweep: `scripts/bench_per_device.sh`, median of 3 timed reps after 1 untimed warmup; final sweep 2026-08-24 — see `.omo/evidence/gpu-speedup/final-verdict.md`)
 
 ### Wall-Clock Time (seconds)
 
 | Config | 65K | 131K | 262K | 524K | 1M | 2M |
 |--------|-----|------|------|------|----|-----|
-| Original (ff_seg) | 0.034s | 0.111s | 0.474s | 2.423s | 10.070s | 47.309s |
-| GPU+CPU RTX 5090 | 0.730s | 0.736s | 1.002s | 2.800s | 11.977s | 63.966s |
-| GPU+CPU RX 9070 XT | 0.633s | 0.634s | 1.059s | 4.408s | 22.731s | - |
-| GPU All RTX 5090 | 0.735s | 0.822s | 1.097s | 2.106s | 7.346s | 62.836s |
-| GPU All RX 9070 XT | 0.682s | 0.699s | 0.990s | 3.461s | 18.064s | - |
+| Original (ff_seg) | 0.019s | 0.084s | 0.427s | 2.198s | 9.227s | 40.559s |
+| nvidia_gpu (`--devices=nvidia --gpu-search`) | 0.253s | 0.271s | 0.419s | 0.894s | 2.506s | 11.822s |
+| amd_gpu (`--devices=amd --gpu-search`) | 0.104s | 0.218s | 0.618s | 1.878s | 6.296s | 50.596s |
 
-### Speedup vs Reference (ratio >1 = faster)
+### Speedup vs Reference (ratio >1 = faster; ✗ = misses the plan's bar for that cell)
 
 | Config | 65K | 131K | 262K | 524K | 1M | 2M |
 |--------|-----|------|------|------|----|-----|
-| GPU+CPU RTX 5090 | 0.05x | 0.15x | 0.47x | 0.87x | 0.84x | 0.74x |
-| GPU+CPU RX 9070 XT | 0.05x | 0.18x | 0.45x | 0.55x | 0.44x | - |
-| GPU All RTX 5090 | 0.05x | 0.14x | 0.43x | **1.15x** | **1.37x** | 0.75x |
-| GPU All RX 9070 XT | 0.05x | 0.16x | 0.48x | 0.70x | 0.56x | - |
+| nvidia_gpu | 0.08x | 0.31x ✗(≥1.0) | **1.02x ✓** | **2.46x ✓(≥2.0)** | **3.68x ✓(≥2.0)** | **3.43x ✓(≥2.0)** |
+| amd_gpu | 0.18x | 0.39x ✗(≥1.0) | 0.69x ✗(≥1.0) | **1.17x ✗(≥2.0 required)** | **1.47x ✗(≥2.0 required)** | 0.80x (completion cell¹) |
+
+Task-17 verdict: the correctness contract is fully green (byte-identical
+everywhere, ctest 8/8) and NVIDIA beats its entire speed bar, but the AMD
+≥2.0x cells at 524K/1M miss structurally — zero-overhead ceilings are only
+**1.23x** / **1.51x**. The ≥1.0x cells at 131K/262K are init-floor-dominated.
+¹ amd_gpu@2M is scored as completion only: it completes rc=0 byte-exact by
+default via the auto host-tier spill (GPU search falls back to CPU there);
+its 0.80x ratio is recorded for transparency, not competitiveness.
 
 ### Correctness
 
@@ -64,23 +68,21 @@ asserted, plus solution blocks vs `out_pen_*` / `out_pen2_*`):
 | GPU sieve + GPU search, AMD device[0] | YES | YES | YES | YES | YES | GATE¹ |
 | GPU sieve + GPU search, NVIDIA device[1] | YES | YES | YES | YES | YES | YES |
 
-¹ Expected capacity-gate refusal: AMD backing (~13.2 GiB at default budget)
-< 16 GiB map. Passes with `--host-tier-cap=auto` (spill path), byte-identical.
-Prime-map sha256 is identical across AMD sieve, NVIDIA sieve, and both
-search paths (`--dump-map`, leg 1M).
+¹ At the time of the 2026-08-23 run this cell was an expected capacity-gate
+refusal (AMD backing ~13.2 GiB at default budget < 16 GiB map). Post-task-14
+the aggregate gate auto-enables the host overflow tier: the 2026-08-24
+task-17 sweep ran this cell by default and it completed rc=0 byte-identical
+(18/18 cells outcome=OK), with GPU search falling back to CPU per the
+documented capacity notice. Prime-map sha256 is identical across AMD sieve,
+NVIDIA sieve, and both search paths (`--dump-map`, leg 1M).
 
-### 2. GPU vs CPU Performance (LOW PRIORITY)
+### 2. GPU Search Performance (UPDATED 2026-08-24)
 
-**Status**: GPU split model (sieve only) is slower than CPU reference.
-
-**Reasons**:
-1. GPU sieve overhead: device init, map staging to pinned memory
-2. CPU search dominates runtime (10-47s at 2M)
-3. GPU sieve is fast (~0.5-3s) but doesn't overcome CPU bottleneck
-
-**Opportunity**:
-- If GPU search is fixed, GPU All mode at 524K-1M shows **1.15-1.37x speedup**
-- This is the main reason to fix the GPU search kernel
+**Status**: Measured by the authoritative sweep — see Current Performance
+above. NVIDIA passes its entire speed bar (up to **3.68x** at 1M); the AMD
+≥2.0x cells at 524K/1M miss structurally (zero-overhead ceilings
+1.23x / 1.51x). The named follow-up lever is wheel-30 map compression
+(user decision point — see Next Steps).
 
 ### 3. Thread Count Mismatch (INFORMATIONAL)
 
@@ -108,9 +110,9 @@ search paths (`--dump-map`, leg 1M).
 | `source/m4/gpu_search_kernel.h` | GPU Freudenthal search kernel |
 | `source/m4/gpu_search_launcher.cpp` | Host-side wrapper for GPU search |
 | `source/sieve_slab_engine.cpp` | GPU sieve engine |
-| `scripts/bench_full.sh` | Comprehensive benchmark script |
-| `scripts/bench_full_results.csv` | Benchmark data (CSV format) |
-| `scripts/bench_full_report.md` | Benchmark report (markdown) |
+| `scripts/bench_per_device.sh` | Authoritative per-device benchmark script |
+| `scripts/bench_per_device_results.csv` | Benchmark data (CSV format) |
+| `scripts/bench_per_device_report.md` | Benchmark report (markdown) |
 | `goldens/` | Golden files for byte-exact verification |
 
 ## Next Steps
@@ -122,17 +124,32 @@ search paths (`--dump-map`, leg 1M).
 2. ~~Test on both architectures~~ DONE — pure-HIP dual build (gfx1201 +
    sm_120), both kernels verified per device.
 3. ~~Validate at all 6 legs~~ DONE — see correctness table above.
-4. Re-benchmark with the fixed GPU search (open).
-5. Benchmark GPU search to validate performance improvement (open).
+4. ~~Re-benchmark with the fixed GPU search~~ DONE — authoritative
+   `scripts/bench_per_device.sh` sweep run 2026-08-24 (see Current
+   Performance above).
+5. ~~Benchmark GPU search to validate performance improvement~~ DONE —
+   task-17 final verdict: correctness fully green; NVIDIA beats its entire
+   speed bar; AMD ≥2x misses are structural (zero-overhead ceilings
+   1.23x / 1.51x).
+6. DECISION POINT (user): **wheel-30 map compression** — a denser packing
+   keeping 8 of 30 residues (~3.75× denser map: 16 GiB → ~4.3 GiB at 2M).
+   It shrinks sieve marking work, D2H traffic, and the search table
+   proportionally (attacking exactly the phases dominating the AMD misses)
+   AND brings the 2M map inside AMD's backing, converting the amd@2M
+   CPU-search fallback into true GPU search. Cost: changes the canonical
+   prime-map bit layout, so the `--dump-map` sha256 contract and slab
+   geometry assumptions need a deliberate re-spec.
 
 ## Benchmark Recurrence
 
 To reproduce results:
 ```bash
 cd /home/archerc/Downloads/ff-gpu
-bash scripts/bench_full.sh
+cmake --build --preset dev
+bash scripts/bench_per_device.sh
 ```
 
 Results will be in:
-- `scripts/bench_full_results.csv`
-- `scripts/bench_full_report.md`
+- `scripts/bench_per_device_results.csv`
+- `scripts/bench_per_device_raw.csv`
+- `scripts/bench_per_device_report.md`

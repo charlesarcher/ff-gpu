@@ -24,9 +24,12 @@
 #     from ff_sieve --list-devices) captured once into run/bench_env.txt
 #
 # Expected outcomes recorded honestly:
-#   - amd_gpu @ 2097152: capacity-gate refusal (backing < 16 GiB map), rc=1.
-#     Marked EXPECTED_GATE_REFUSAL, not a defect. (--host-tier-cap=auto spills
-#     and passes byte-identical; the default-path refusal is what is benched.)
+#   - amd_gpu @ 2097152: COMPLETES by default since task 14 — the aggregate
+#     capacity gate auto-enables the host overflow tier (rc=0, correct
+#     solution count, byte-identical); GPU search falls back to CPU on this
+#     leg via the documented "no device fits" capacity notice.
+#     (Pre-task-14 sweeps refused here; EXPECTED_GATE_REFUSAL survives only
+#     as a generic outcome label.)
 #
 # Usage: ./scripts/bench_per_device.sh
 # Env overrides: BENCH_REPS (default 3), BENCH_LEGS (default all six),
@@ -415,9 +418,9 @@ L.append("Sub-second legs may finish between sampler ticks (`n/a`); the stderr-n
 L.append("remain authoritative for those.\n")
 
 L.append("## Notes\n")
-L.append("- `amd_gpu` @ 2M: capacity-gate refusal by design (AMD backing ≈13.2 GiB < 16 GiB map), rc=1;")
-L.append("  recorded as `EXPECTED_GATE_REFUSAL`. The spill path (`--host-tier-cap=auto`) completes this")
-L.append("  leg byte-identically but is not part of this default-path sweep.")
+L.append("- `amd_gpu` @ 2M: completes by default since task 14 — the aggregate capacity gate")
+L.append("  auto-enables the host overflow tier (rc=0, byte-identical, outcome OK); GPU search")
+L.append("  falls back to CPU on this leg via the documented \"no device fits\" capacity notice.")
 L.append("- Correctness per rep: solution-count assert against the golden contract (2357/4776/9163/")
 L.append("  18408/35556/71424) in addition to rc==0; any DEFECT marks a real regression.")
 

@@ -54,9 +54,17 @@ stderr:
    are authoritative.
 
 A config×leg where all reps fail rc!=0 with `GATE FAIL` in stderr is marked
-`EXPECTED_GATE_REFUSAL` (e.g. `amd_gpu @ 2097152`: backing ≈13.2 GiB < the
-16 GiB map — documented capacity limit, not a defect). Anything else that is
-not OK is a regression.
+`EXPECTED_GATE_REFUSAL` (a documented capacity limit, not a defect). Anything
+else that is not OK is a regression.
+
+> **Erratum (2026-08-24, post-task-14):** the former example here —
+> `amd_gpu @ 2097152` refusing because backing ≈13.2 GiB < the 16 GiB map —
+> is obsolete. Since task 14 the aggregate capacity gate auto-enables the
+> host overflow tier, so this cell completes by default (rc=0,
+> byte-identical, recorded OK); GPU search falls back to CPU on that leg via
+> the documented capacity notice. `EXPECTED_GATE_REFUSAL` remains in the
+> harness as a generic outcome label only; no current sweep cell is expected
+> to hit it.
 
 ## Known limitations
 
