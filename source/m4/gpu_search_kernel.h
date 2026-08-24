@@ -62,6 +62,49 @@
 #define FF_SEARCH_LD_RO_U8(p)  (*(p))
 #endif
 
+// ---- Occupancy clamp (kernel-gap-closure task 2) ----------------------------
+//
+// SEARCH_KERNEL carries __launch_bounds__(256, minBlocksPerSM). MACRO FORM IS
+// MANDATORY: the raw __attribute__((launch_bounds(...))) spelling silently
+// no-ops on ROCm 7.2 (live-verified in a prior session) while the macro form
+// engages the backend's blocks-per-SM constraint.
+//
+// EFFECTIVE RUNG REALITY on gfx1201 (granule-24 VGPR allocation): the ladder
+// collapses to TWO reachable points near the top — 16 waves/SIMD (VGPR <= 96)
+// or 12 waves/SIMD (VGPR 97–120); requested rungs 13–15 are degenerate because
+// the allocation granularity jumps straight from the 16-wave budget to the
+// 12-wave budget. The baked value passed a ZERO-SPILL gate (one step across
+// the boundary multiplied spills ~30x in live measurement); full ladder +
+// forced-spill discrimination proof:
+//   .omo/evidence/gpu-speedup/gap-closure/task-2-kernel-gap-closure/ladder.md
+//
+// NVIDIA side is intentionally UNCLAMPED: ptxas holds its natural 78 regs /
+// 0 spills and clamping showed no benefit (parity check in ladder.md).
+//
+// BAKED RUNG = 12: N=16 compiles spill-free (VGPRs squeezed 100→88) but
+// measured +2.2% slower @1M — this kernel is local-memory bound, so the
+// occupancy win does not pay for the register squeeze; N=12 keeps native
+// resources AND pins the floor (future VGPR growth must spill loudly here
+// instead of silently dropping below 12 waves).
+//
+// Compile-time override for experiments, mirroring the FF_SIEVE_* geometry
+// macro idiom: -DFF_SEARCH_MIN_BLOCKS_PER_SM=<n>. Values above the zero-spill
+// boundary FORCE register spills (proven in forced-spill-rung.log).
+#ifndef FF_SEARCH_MIN_BLOCKS_PER_SM
+#if defined(__HIP_PLATFORM_AMD__)
+#define FF_SEARCH_MIN_BLOCKS_PER_SM 12
+#else
+#define FF_SEARCH_MIN_BLOCKS_PER_SM 0
+#endif
+#endif
+
+#if defined(__HIP_PLATFORM_AMD__) && FF_SEARCH_MIN_BLOCKS_PER_SM > 0
+#define FF_SEARCH_LAUNCH_BOUNDS \
+    __launch_bounds__(256, FF_SEARCH_MIN_BLOCKS_PER_SM)
+#else
+#define FF_SEARCH_LAUNCH_BOUNDS
+#endif
+
 // ---- GpuRecord: one solution per record slot (host-visible) ----
 typedef struct {
     uint32_t sum;     // 4 bytes
@@ -342,7 +385,7 @@ __device__ static bool dev_DoesPeterKnow(
 static __device__ uint32_t FF_KERN_CAT(ffSearchWork_, SIEVE_KERNEL_ARCH);
 #endif
 
-__global__ void SEARCH_KERNEL(
+__global__ void FF_SEARCH_LAUNCH_BOUNDS SEARCH_KERNEL(
     const uint8_t* __restrict__  primeMap,
     uint64_t                     maxPrimeMapValue,
     uint64_t                     sumStart,
