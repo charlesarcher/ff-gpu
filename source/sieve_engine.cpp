@@ -21,6 +21,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
 #include <cstring>
 #include <vector>
 
@@ -46,6 +47,17 @@ void hostSievePrimes(uint64_t limit, std::vector<uint32_t>& out)
     }
 }
 
+}  // namespace
+
+// Same correction loop as main.cpp's static isqrt64 (sqrt() rounding guard).
+namespace {
+uint64_t isqrt64(uint64_t x) {
+    if (x == 0) return 0;
+    uint64_t r = static_cast<uint64_t>(std::sqrt(static_cast<double>(x)));
+    while ((r + 1) * (r + 1) <= x) ++r;
+    while (r * r > x) --r;
+    return r;
+}
 }  // namespace
 
 SieveEngine::SieveEngine(int deviceIndex, const char* vendor)
@@ -109,6 +121,20 @@ uint64_t SieveEngine::prepare(uint64_t sumLimit)
     uint64_t primeLimit = geom.maxGeneratedPrime;
     if (primeLimit < 2) primeLimit = 2;
     hostSievePrimes(primeLimit, smallPrimes_);
+
+    // The sieve kernel early-breaks at p*p >= bHi, so it never reads primes
+    // beyond sqrt of the map's top value; trim the KERNEL list to
+    // isqrt((mapBytes<<4)-1) — same geometry chain as everywhere else.  At 2M
+    // this halves the H2D upload (~328 KB → ~172 KB).  The search phase keeps
+    // reading the FULL list through getSmallPrimes().
+    const uint64_t kernelPrimeMax = isqrt64((geom.mapBytes << 4) - 1);
+    uint32_t kCount = 0;
+    for (uint32_t v : smallPrimes_) {
+        if (static_cast<uint64_t>(v) > kernelPrimeMax) break;
+        ++kCount;
+    }
+    if (kCount > 0 && smallPrimes_[0] == 2) --kCount;  // kernel skips leading 2
+    kernelPrimeCount_ = kCount;
     return geom.maxPrimeMapValue;
 }
 
@@ -120,6 +146,7 @@ const uint32_t* SieveEngine::kernelPrimes(uint32_t* count) const
         ++p;
         --n;
     }
+    if (n > kernelPrimeCount_) n = kernelPrimeCount_;
     if (count) *count = n;
     return p;
 }

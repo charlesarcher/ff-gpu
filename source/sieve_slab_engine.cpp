@@ -422,6 +422,9 @@ int poolSlabComputeAsync(int vendorIndex, const uint32_t* h_primes, uint32_t num
     if (waitEvent) {
         POOL_HIP_CHECK(hipStreamWaitEvent(cs, reinterpret_cast<hipEvent_t>(waitEvent), 0));
     }
+    // Cache identity = (device, count): the caller bounds numPrimes at
+    // sqrt(map span) (SieveEngine::prepare), so the count fully determines
+    // the uploaded content for a given leg.
     if (g_dPrimes == nullptr || g_primeVendor != vendorIndex || g_dPrimeCount != numPrimes) {
         if (g_dPrimes) { (void)hipFree(g_dPrimes); g_dPrimes = nullptr; }
         const size_t primeBytes = static_cast<size_t>(numPrimes) * sizeof(uint32_t);

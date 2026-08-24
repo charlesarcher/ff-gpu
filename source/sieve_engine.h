@@ -43,7 +43,8 @@ public:
 
     // Small-prime list for the GPU kernel: the leading 2 is skipped (the
     // kernel's odd-only marking makes p=2 a destructive no-op — see
-    // sieve_engine.cpp run()).  Valid after prepare()/run().
+    // sieve_engine.cpp run()) and the tail is trimmed to primes <=
+    // sqrt(maxPrimeMapValue) (see prepare()).  Valid after prepare()/run().
     const uint32_t* kernelPrimes(uint32_t* count = nullptr) const;
 
     // Returns the small-prime list used by the last run and (optionally) its
@@ -54,6 +55,9 @@ private:
     int deviceIndex_;
     const char* vendor_;
     std::vector<uint32_t> smallPrimes_;
+    // kernelPrimes() count after the sqrt(map-span) trim and the leading-2
+    // skip; computed by prepare() from the leg geometry.
+    uint32_t kernelPrimeCount_ = 0;
 };
 
 #endif  // FF_SIEVE_ENGINE_H
