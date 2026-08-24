@@ -10,6 +10,10 @@
 #   - untimed warmup rep per config (GPU clock ramp + page cache)
 #   - REPS timed reps per config x leg; per-rep walls land in *_raw.csv;
 #     summary CSV carries min/median/max/stdev
+#   - per-rep ADDITIVE stderr phase capture: "ff_sieve timing:" lines
+#     (device enumeration / budget computation / sieve phase / search phase /
+#     total + search H2D/kernel/D2H/emit sub-stages) parsed into extra raw-CSV
+#     columns; missing lines -> empty cells
 #   - per-rep DEVICE ATTRIBUTION gates (hard, fail the rep):
 #       1. "--devices=<v> kept 1 of 2" filter line present
 #       2. "GPU search:" stderr line names the EXPECTED card
@@ -121,8 +125,28 @@ median() {
     awk "BEGIN { printf \"%.3f\", ${a[$((n/2))]} }"
 }
 
+# phase_ms <stderr-file> <exact-phase-name>
+# Extracts the millisecond value from a binary's own stderr line of the form
+#   ff_sieve timing: <name> = <ms> ms
+# Prints the raw ms number, or NOTHING when the line is absent (older
+# binaries / the CPU reference emit none) -> caller writes an empty CSV cell.
+# Uses index() matching on an exact "name = " prefix so e.g. the
+# "--list-devices" variant ("device enumeration (--list-devices) = ...")
+# can never satisfy the plain "device enumeration" lookup.
+phase_ms() {
+    local f="$1" name="$2"
+    [[ -f "$f" ]] || return 0
+    awk -v p="ff_sieve timing: ${name} = " '
+        index($0, p) == 1 {
+            v = substr($0, length(p)+1); sub(/ ms$/, "", v); print v; exit
+        }' "$f"
+}
+
 # run_one cfg leg scratch_dir expect forbid cmd...
-# -> prints "wall_s|rc|solutions|search_card_ok|filter_ok|other_card_seen|refused"
+# -> prints "wall_s|rc|solutions|search_card_ok|filter_ok|other_card_seen|refused\
+# |phase_enum_ms|phase_budget_ms|phase_sieve_ms|phase_search_ms|phase_total_ms\
+# |search_h2d_ms|search_kernel_ms|search_d2h_ms|search_emit_ms"
+# (the trailing per-phase fields are ADDITIVE captures from stderr; empty when absent)
 run_one() {
     local cfg="$1" leg="$2" scratch_dir="$3" expect="$4" forbid="$5"; shift 5
     local t_start t_end wall_ms wall_s rc
@@ -153,8 +177,21 @@ run_one() {
         ;;
     esac
     refused=$([[ "$rc" != 0 ]] && grep -q 'GATE FAIL' "$err" 2>/dev/null && echo yes || echo no)
-    printf '%s|%s|%s|%s|%s|%s|%s\n' "$wall_s" "$rc" "$lines" \
-        "$search_card_ok" "$filter_ok" "$other_seen" "$refused"
+    local p_enum p_budget p_sieve p_search p_total s_h2d s_kernel s_d2h s_emit
+    p_enum=$(phase_ms "$err" "device enumeration")
+    p_budget=$(phase_ms "$err" "budget computation")
+    p_sieve=$(phase_ms "$err" "sieve phase")
+    p_search=$(phase_ms "$err" "search phase")
+    p_total=$(phase_ms "$err" "total")
+    s_h2d=$(phase_ms "$err" "search H2D copies")
+    s_kernel=$(phase_ms "$err" "search kernel")
+    s_d2h=$(phase_ms "$err" "search D2H copies")
+    s_emit=$(phase_ms "$err" "search emit")
+    printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+        "$wall_s" "$rc" "$lines" \
+        "$search_card_ok" "$filter_ok" "$other_seen" "$refused" \
+        "$p_enum" "$p_budget" "$p_sieve" "$p_search" "$p_total" \
+        "$s_h2d" "$s_kernel" "$s_d2h" "$s_emit"
 }
 
 echo "=== WARMUP (${WARMUP} untimed rep per config @ ${LEGS[0]}) ==="
@@ -178,7 +215,7 @@ cat > "$CSV" << EOF
 config,leg,wall_median_s,wall_min_s,wall_max_s,wall_stdev_s,reps,solutions,expected,outcome,exit_code
 EOF
 cat > "$RAW_CSV" << EOF
-config,leg,rep,wall_s,solutions,exit_code,search_card_ok,filter_ok,other_card_seen,util_amd_max_pct,util_nv_max_pct
+config,leg,rep,wall_s,solutions,exit_code,search_card_ok,filter_ok,other_card_seen,util_amd_max_pct,util_nv_max_pct,phase_enum_ms,phase_budget_ms,phase_sieve_ms,phase_search_ms,phase_total_ms,search_h2d_ms,search_kernel_ms,search_d2h_ms,search_emit_ms
 EOF
 
 for entry in "${CONFIGS[@]}"; do
@@ -199,7 +236,9 @@ for entry in "${CONFIGS[@]}"; do
                 SAMPLER_PID=$!
             fi
             out=$(run_one "$cfg" "$leg" "$scratch_dir" "$expect" "$forbid" $cmd $leg)
-            IFS='|' read -r wall rc lines s_ok f_ok o_seen refused <<< "$out"
+            IFS='|' read -r wall rc lines s_ok f_ok o_seen refused \
+                p_enum p_budget p_sieve p_search p_total \
+                s_h2d s_kernel s_d2h s_emit <<< "$out"
             if [[ -n "${SAMPLER_PID:-}" ]]; then
                 kill "$SAMPLER_PID" 2>/dev/null; wait "$SAMPLER_PID" 2>/dev/null
                 SAMPLER_PID=""
@@ -209,7 +248,7 @@ for entry in "${CONFIGS[@]}"; do
                 ua=$(max_field "$slog" "amd="); un=$(max_field "$slog" "nv=")
             fi
             rm -rf "$scratch_dir"
-            echo "${cfg},${leg},${r},${wall},${lines},${rc},${s_ok},${f_ok},${o_seen},${ua},${un}" >> "$RAW_CSV"
+            echo "${cfg},${leg},${r},${wall},${lines},${rc},${s_ok},${f_ok},${o_seen},${ua},${un},${p_enum},${p_budget},${p_sieve},${p_search},${p_total},${s_h2d},${s_kernel},${s_d2h},${s_emit}" >> "$RAW_CSV"
             walls+=("$wall"); rcs+=("$rc"); sols+=("$lines")
             [[ "$s_ok" == yes ]] || g_ok_all=no
             [[ "$f_ok" == yes || "$f_ok" == na ]] || f_ok_all=no
