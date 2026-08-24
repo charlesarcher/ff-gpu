@@ -47,6 +47,21 @@
 #define MAX_FACTORS                32
 #define MAX_COMP_MAX_POWER2        64
 
+// ---- Read-only load hints (task 15) -----------------------------------------
+// FF_SEARCH_LD_RO_*: explicit read-only data load for values that are
+// provably never written during kernel lifetime — primeMap is produced by the
+// sieve phase (a different, earlier launch) and only read here; no concurrent
+// writer exists in any launch in this tree. NVIDIA backend: __ldg lowers to
+// ld.global.nc (non-coherent read-only path). AMD backend: plain dereference
+// — RDNA L1/L2 are read-allocate anyway and the HIP porting guide documents
+// __ldg as a no-op there (draft findings); guarded so we never depend on AMD
+// intrinsic availability. Hints never change loaded VALUES.
+#if defined(__HIP_PLATFORM_NVIDIA__)
+#define FF_SEARCH_LD_RO_U8(p)  __ldg(p)
+#else
+#define FF_SEARCH_LD_RO_U8(p)  (*(p))
+#endif
+
 // ---- GpuRecord: one solution per record slot (host-visible) ----
 typedef struct {
     uint32_t sum;     // 4 bytes
@@ -188,7 +203,9 @@ __device__ static bool dev_IsPrime(uint64_t n,
         }
         return true;
     }
-    return (primeMap[n >> 4] & (0x80 >> (n >> 1 & 7))) != 0;
+    // In-map bit-test: read-only hinted load (task 15). The Montgomery branch
+    // above performs NO map reads, so this is the only map touch in dev_IsPrime.
+    return (FF_SEARCH_LD_RO_U8(primeMap + (n >> 4)) & (0x80 >> (n >> 1 & 7))) != 0;
 }
 
 // Product-of-term-pairs-has-single-factor-pair:

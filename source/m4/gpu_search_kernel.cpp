@@ -50,6 +50,117 @@ extern "C" {
 #define FF_SEARCH_BLOCKS_PER_SM FF_SEARCH_DEFAULT_BLOCKS_PER_SM
 #endif
 
+// ---- Optional L2 set-aside persistence (NVIDIA-only, task 15) ---------------
+//
+// Pins the smallPrimes table (re-read by every CTA of the work-stealing grid)
+// — or, if it cannot fit, the low map window (draft findings: most bit-test
+// lookups concentrate in the lowest map bytes) — into the persisting-L2
+// window for ONE search launch, then restores normal behavior. Doubly guarded,
+// never assumed:
+//   * compile-time: __HIP_PLATFORM_NVIDIA__ only. AMD ROCm exposes neither a
+//     hipLimitPersistingL2CacheSize spelling nor hipCtxResetPersistingL2Cache;
+//     the window enums exist but are unsupported at runtime.
+//   * run-time: persisting-L2 max queried FIRST; 0 / query failure / set-limit
+//     failure / stream-attribute rejection each skip with ONE stderr note and
+//     continue normally (graceful degradation, no crash, output unaffected).
+// Cache policy can never change loaded values — byte-exactness is proven
+// independently by slab_cmp + m4_order + verify.sh goldens.
+#if defined(__HIP_PLATFORM_NVIDIA__)
+
+// HIP headers expose no persisting-cache limit constant (verified ROCm 7.2.4
+// nvidia_detail: hipLimit_t aliases only Stack/PrintfFifo/MallocHeap). This is
+// cudaLimitPersistingL2CacheSize's value (driver_types.h: 0x05 is
+// MaxL2FetchGranularity — NOT this limit); the set-aside must be > 0 before an
+// accessPolicyWindow's Persisting hitProp has any effect.
+#ifndef FF_LIMIT_PERSISTING_L2_CACHE_SIZE
+#define FF_LIMIT_PERSISTING_L2_CACHE_SIZE 0x06
+#endif
+
+// Low-map fallback window size when smallPrimes alone exceeds the budget.
+#ifndef FF_SEARCH_PERSIST_MAP_BYTES
+#define FF_SEARCH_PERSIST_MAP_BYTES (256ull << 10)
+#endif
+
+// Compile-time kill switch for honest A/B (-DFF_SEARCH_L2_PERSIST=0).
+#ifndef FF_SEARCH_L2_PERSIST
+#define FF_SEARCH_L2_PERSIST 1
+#endif
+
+#if FF_SEARCH_L2_PERSIST
+static void SearchApplyL2Persistence_(int deviceIndex,
+                                      const uint8_t* d_primeMap,
+                                      const uint32_t* d_smallPrimes,
+                                      uint32_t d_smallPrimeCount) {
+    int persistMax = 0;
+    if (hipDeviceGetAttribute(&persistMax,
+                              hipDeviceAttributePersistingL2CacheMaxSize,
+                              deviceIndex) != hipSuccess ||
+        persistMax <= 0) {
+        std::fprintf(stderr,
+                     "  [ffdev] kernel: persisting-L2 unsupported (max=%d) - "
+                     "continuing without\n", persistMax);
+        return;
+    }
+
+    // One window per stream: prefer smallPrimes (uniformly hot across CTAs);
+    // fall back to the low map window when it does not fit the budget.
+    void* winBase = nullptr;
+    size_t winBytes = 0;
+    const uint64_t primesBytes = (uint64_t)d_smallPrimeCount * sizeof(uint32_t);
+    if (primesBytes > 0 && primesBytes <= (uint64_t)persistMax) {
+        winBase = const_cast<uint32_t*>(d_smallPrimes);
+        winBytes = (size_t)primesBytes;
+    } else {
+        uint64_t mapWin = FF_SEARCH_PERSIST_MAP_BYTES;
+        if (mapWin > (uint64_t)persistMax) mapWin = (uint64_t)persistMax;
+        winBase = const_cast<uint8_t*>(d_primeMap);
+        winBytes = (size_t)mapWin;
+    }
+    if (winBytes == 0 || winBase == nullptr) return;
+
+    if (hipDeviceSetLimit((hipLimit_t)FF_LIMIT_PERSISTING_L2_CACHE_SIZE,
+                          winBytes) != hipSuccess) {
+        std::fprintf(stderr,
+                     "  [ffdev] kernel: persisting-L2 set-limit failed - "
+                     "continuing without\n");
+        // Optional hint: swallow the sticky error so the production launch's
+        // hipGetLastError() below only ever sees REAL launch failures.
+        (void)hipGetLastError();
+        return;
+    }
+
+    hipStreamAttrValue attr = {};  // union incl. 64 B pad -> fully zeroed
+    attr.accessPolicyWindow.base_ptr = winBase;
+    attr.accessPolicyWindow.num_bytes = winBytes;
+    attr.accessPolicyWindow.hitRatio = 1.0f;
+    attr.accessPolicyWindow.hitProp = hipAccessPropertyPersisting;
+    attr.accessPolicyWindow.missProp = hipAccessPropertyStreaming;
+    if (hipStreamSetAttribute(/* default stream */ nullptr,
+                              hipStreamAttributeAccessPolicyWindow,
+                              &attr) != hipSuccess) {
+        std::fprintf(stderr,
+                     "  [ffdev] kernel: stream access-policy rejected - "
+                     "continuing without\n");
+        (void)hipDeviceSetLimit((hipLimit_t)FF_LIMIT_PERSISTING_L2_CACHE_SIZE, 0);
+        (void)hipGetLastError();
+    }
+}
+
+static void SearchRestoreL2Persistence_() {
+    hipStreamAttrValue attr = {};
+    attr.accessPolicyWindow.base_ptr = nullptr;
+    attr.accessPolicyWindow.num_bytes = 0;
+    attr.accessPolicyWindow.hitRatio = 0.0f;
+    attr.accessPolicyWindow.hitProp = hipAccessPropertyNormal;
+    attr.accessPolicyWindow.missProp = hipAccessPropertyNormal;
+    (void)hipStreamSetAttribute(nullptr, hipStreamAttributeAccessPolicyWindow,
+                                &attr);
+    (void)hipDeviceSetLimit((hipLimit_t)FF_LIMIT_PERSISTING_L2_CACHE_SIZE, 0);
+    (void)hipGetLastError();  // hint path must stay error-silent
+}
+#endif  // FF_SEARCH_L2_PERSIST
+#endif  // __HIP_PLATFORM_NVIDIA__
+
 int SEARCH_KERNEL_RUN_NAME(
     int deviceIndex,
     const uint8_t* d_primeMap, uint64_t d_maxPrimeMapValue,
@@ -86,6 +197,11 @@ int SEARCH_KERNEL_RUN_NAME(
     const uint32_t blockSize = 256;
     const uint32_t numBlocks = (uint32_t)smCount * FF_SEARCH_BLOCKS_PER_SM;
 
+#if defined(__HIP_PLATFORM_NVIDIA__) && FF_SEARCH_L2_PERSIST
+    SearchApplyL2Persistence_(deviceIndex, d_primeMap, d_smallPrimes,
+                              d_smallPrimeCount);
+#endif
+
     hipLaunchKernelGGL(SEARCH_KERNEL,
                        dim3(numBlocks), dim3(blockSize), 0, 0,
                        d_primeMap, d_maxPrimeMapValue,
@@ -96,11 +212,17 @@ int SEARCH_KERNEL_RUN_NAME(
     hipError_t err = hipGetLastError();
     if (err != hipSuccess) {
         std::fprintf(stderr, "  [ffdev] kernel launch failed: %s\n", hipGetErrorString(err));
+#if defined(__HIP_PLATFORM_NVIDIA__) && FF_SEARCH_L2_PERSIST
+        SearchRestoreL2Persistence_();
+#endif
         hipSetDevice(prevDevice);
         return -1;
     }
 
     hipError_t syncErr = hipDeviceSynchronize();
+#if defined(__HIP_PLATFORM_NVIDIA__) && FF_SEARCH_L2_PERSIST
+    SearchRestoreL2Persistence_();
+#endif
     if (syncErr != hipSuccess) {
         std::fprintf(stderr, "  [ffdev] kernel sync failed: %s\n", hipGetErrorString(syncErr));
         hipSetDevice(prevDevice);

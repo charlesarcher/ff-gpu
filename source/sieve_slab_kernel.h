@@ -131,6 +131,19 @@ static_assert(kSieveValuesPerThread * kSieveThreadsPerBlock *
                   kSieveSubBlockSize,
               "geometry must exactly cover the sub-block span");
 
+// ---- Read-only load hint (task 15) ------------------------------------------
+// primeList is uploaded once per device (pool static cache) and never written
+// by any kernel in this tree, so an explicit read-only load is legal. NVIDIA
+// backend: __ldg -> ld.global.nc. AMD backend: plain dereference (HIP porting
+// guide documents __ldg as a no-op there; RDNA L1/L2 are read-allocate).
+// Guarded so we never depend on AMD intrinsic availability. The hint never
+// changes loaded VALUES.
+#if defined(__HIP_PLATFORM_NVIDIA__)
+#define FF_SIEVE_LD_RO_U32(p) __ldg(p)
+#else
+#define FF_SIEVE_LD_RO_U32(p) (*(p))
+#endif
+
 // ---- Word flush helper ------------------------------------------------------
 //
 // Flushes one accumulated 64-value word mask at word index `w` (bytes
@@ -233,7 +246,7 @@ __global__ void SIEVE_SLAB_KERNEL(
     // Sieve: identical logic to Prime::SegmentFill, with optimizations.
     for (uint32_t k = 0; k < numList; ++k)
     {
-        uint64_t p = (uint64_t)primeList[k];
+        uint64_t p = (uint64_t)FF_SIEVE_LD_RO_U32(primeList + k);
         if (p * p >= bHi) break;                  // early break (block-uniform)
 
         if (threadIdx.x == 0)
