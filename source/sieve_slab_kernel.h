@@ -9,15 +9,26 @@
 //
 // Primes live in DEVICE GLOBAL read-only memory (const __restrict__).
 //
-// Optimizations vs. baseline:
-//   1. Division elimination: bLo_mod_p = bLo % p, then first = bLo + (p - bLo_mod_p) % p
-//   2. Inner loop: running offset accumulator avoids recomputing (i - segLo)
-//   3. Larger sub-blocks: 4x (2M values) reduces kernel launches from 17 → ~5
+// Optimizations vs. baseline (task 9 redesign):
+//   1. Block-shared first-multiple math: bLo % p is identical for all threads
+//      of a block, so lane 0 computes it ONCE per prime into __shared__
+//      (first shared-memory use in this tree) together with a hoisted
+//      round-up reciprocal of step = 2p; every other thread replaces its two
+//      emulated 64-bit divisions with ONE multiply-high + shift (exact for
+//      the guarded operand ranges, see proof below), falling back to plain
+//      division outside those ranges.
+//   2. Word-granular marking: marks accumulate into a uint32 mask and flush
+//      as one aligned word load/mask/store per touched 64-value word instead
+//      of one byte RMW per mark. Word ownership stays exclusive because
+//      thread chunks start at multiples of 8192 values (= 128 words) from
+//      segLo, so no 64-value word ever straddles two threads.
+//   3. Inner loop: running offset avoids recomputing (i - segLo).
+//   4. Larger sub-blocks: 4x (2M values) reduces kernel launches from 17 → ~5
 //
 // Geometry (optimized):
-//   subBlockSize = 1<<21 = 2097152 values (4x baseline)
+//   subBlockSize = 1<<22 = 4194304 values (4x baseline)
 //   block size   = 256 threads
-//   values/thread = 4096 (256 map bytes = 4 cache lines)
+//   values/thread = 8192 (512 map bytes = 8 cache lines)
 //   blocks/sub-block = 2   (512 threads ÷ 256)
 //   grid = numSubBlocks per slab, one kernel launch per slab
 //
@@ -35,6 +46,49 @@
 
 #define SIEVE_SLAB_KERNEL FF_KERN_CAT(SieveSlab_, SIEVE_KERNEL_ARCH)
 
+// ---- Word flush helper ------------------------------------------------------
+//
+// Flushes one accumulated 64-value word mask at word index `w` (bytes
+// [4w, 4w+4) of the segLo-relative map).
+//
+// OUT-OF-BOUNDS TAIL POLICY (mandatory): the kernel receives no buffer-size
+// parameter, but every launch site allocates AT LEAST bufMinBytes =
+// ceil((segHi-segLo)/16) bytes for the slab under launch:
+//   - test harness (sieve_slab_kernel.cpp): hipMalloc((segHi+15)>>4) >= bufMin;
+//   - engine / pool slabs: hipMalloc(slabBytes) >= bufMin since
+//     segHi - segLo <= slabBytes*16;
+//   - right-sized final slab allocations equal copyBytes which equals bufMin
+//     exactly (segHi is clamped to totalMapBytes*16 there).
+// Only FULL words strictly below bufMinBytes are written as words; any mark
+// landing in the partial trailing word (only possible in the last chunk of
+// the last block) decomposes into byte RMWs clamped to bufMinBytes. Marks at
+// bytes >= bufMinBytes cannot exist (values < segHi), the clamp is defense.
+__device__ __forceinline__ void SieveSlabFlushWord_(
+    uint8_t* __restrict__ primeMap, uint64_t w, uint32_t mask,
+    uint64_t fullWords, uint64_t bufMinBytes)
+{
+    if (w < fullWords)
+    {
+        // Full word strictly below the buffer end: single uint32 RMW.
+        *reinterpret_cast<uint32_t*>(primeMap + (w << 2)) &= ~mask;
+    }
+    else
+    {
+        // Partial trailing word: byte-path fallback, clamped to bufMinBytes.
+        #pragma unroll
+        for (uint32_t j = 0; j < 4; ++j)
+        {
+            const uint32_t byteMask = (mask >> (j << 3)) & 0xffu;
+            if (byteMask)
+            {
+                const uint64_t b = (w << 2) | (uint64_t)j;
+                if (b < bufMinBytes)
+                    primeMap[b] &= (uint8_t)(~byteMask);
+            }
+        }
+    }
+}
+
 // ---- Kernel body (optimized, byte-exact mirror of reference SegmentFill) ----
 
 __global__ void SIEVE_SLAB_KERNEL(
@@ -42,7 +96,7 @@ __global__ void SIEVE_SLAB_KERNEL(
     uint32_t numList,
     uint64_t segLo,
     uint64_t segHi,
-    uint8_t* __restrict__ primeMap)            // slab map, byte-owned per thread
+    uint8_t* __restrict__ primeMap)            // slab map, word-owned per thread
 {
     // Optimized: 8x larger sub-blocks to reduce kernel launch overhead.
     // 4M values per sub-block = 256 KB map bytes.
@@ -60,49 +114,135 @@ __global__ void SIEVE_SLAB_KERNEL(
     if (bHi > segHi) bHi = segHi;
     if (bLo >= segHi) return;
 
-    // Each threadIdx.x covers one 4096-value (256-byte) chunk.
+    // Each threadIdx.x covers one 8192-value (512-byte) chunk; chunk starts
+    // are multiples of 8192 values from segLo, i.e. multiples of 128 uint32
+    // words → word-exclusive ownership across the whole grid.
     uint64_t myStart = bLo + (uint64_t)threadIdx.x * valuesPerThread;
     if (myStart >= bHi) return;
     uint64_t myEnd = myStart + valuesPerThread;
     if (myEnd > bHi) myEnd = bHi;
 
+    // Tightest allocation lower bound derivable from the launch parameters
+    // (see tail-policy note above SieveSlabFlushWord_).
+    const uint64_t span        = segHi - segLo;
+    const uint64_t bufMinBytes = (span + 15u) >> 4;
+    const uint64_t fullWords   = bufMinBytes >> 2;   // words fully below end
+
+    // Word stores need a 4-byte aligned base. Every allocation site uses
+    // hipMalloc (>=256B alignment); this check is pure defense — if it ever
+    // fails, the whole launch falls back to the original byte path.
+    const bool wordOk = ((((uint64_t)(uintptr_t)primeMap) & 3ull) == 0ull);
+
+    // Per-thread loop-invariant offset form of the chunk end.
+    const uint64_t myEndOff = myEnd - segLo;
+
+    // Block-shared per-prime segment-entry info (written by lane 0 only):
+    //   shFirst — first candidate multiple of p within [bLo, ...) after the
+    //             p² floor and odd-only adjustment (identical semantics to
+    //             the baseline scalar computation);
+    //   shMul   — round-up reciprocal magic for step = 2p, valid when
+    //             step < 2^30 and step not a power of two (0 otherwise);
+    //   shShift — floor(log2(step)).
+    // ~24 bytes of static shared memory, reused by every prime iteration.
+    __shared__ uint64_t shFirst;
+    __shared__ uint32_t shMul;
+    __shared__ uint32_t shShift;
+
     // Sieve: identical logic to Prime::SegmentFill, with optimizations.
     for (uint32_t k = 0; k < numList; ++k)
     {
         uint64_t p = (uint64_t)primeList[k];
-        if (p * p >= bHi) break;                  // early break
+        if (p * p >= bHi) break;                  // early break (block-uniform)
 
-        // Optimization 1: Division elimination.
-        // Original: first = ((bLo + p - 1) / p) * p;
-        // Equivalent: first = bLo + (p - bLo % p) % p;
-        // This avoids the multiplication after division.
-        uint64_t bLo_mod_p = bLo % p;
-        uint64_t first = bLo + ((p - bLo_mod_p) % p);
+        if (threadIdx.x == 0)
+        {
+            // First multiple of p >= bLo. (p - r) % p is r==0 ? 0 : p-r,
+            // i.e. branchless-free conditional add — no second division.
+            uint64_t r = bLo % p;
+            uint64_t first = bLo + (r ? p - r : 0);
+            const uint64_t pp = p * p;
+            if (first < pp) first = pp;           // no smaller than p²
+            if (!(first & 1)) first += p;         // odd multiples only
+            shFirst = first;
 
-        if (first < p * p) first = p * p;          // no smaller than p²
-        if (!(first & 1)) first += p;              // odd multiples only
+            const uint64_t step = p << 1;
+            shShift = 63u - (uint32_t)__clzll((unsigned long long)step);
+            shMul = 0u;
+            if (step < (1ull << 30) && (step & (step - 1)) != 0)
+            {
+                // Round-up reciprocal (Granlund–Montgomery): M = ⌈2^(32+s)/d⌉.
+                // Exactness condition n·e < 2^(32+s) with e = M·d − 2^(32+s)
+                // ≤ d−1 ≤ 2^(s+1)−1 holds for all n < 2^31 (n·e <
+                // 2^31·2^(s+1) = 2^(32+s), strict). Guarded use below keeps
+                // n = diff+step−1 < 2^31.
+                shMul = (uint32_t)((((uint64_t)1 << (32 + shShift)) + step - 1) / step);
+            }
+        }
+        __syncthreads();   // publish shFirst/shMul/shShift
 
-        // Advance to myStart if first falls before our chunk.
-        uint64_t step = p << 1;
+        // Advance to myStart if first falls before our chunk: at most ONE
+        // division-shaped op per prime (multiply-high on the fast path).
+        uint64_t first = shFirst;
         if (first < myStart)
         {
-            // Compute offset from myStart to next valid position.
-            uint64_t diff = myStart - first;
-            uint64_t k = (diff + step - 1) / step;  // still need this division
-            first += k * step;
+            const uint64_t step = p << 1;
+            const uint64_t diff = myStart - first;      // < chunk span (< 2^22 here)
+            const uint64_t n    = diff + step - 1;      // ceil(diff/step) numerator
+            uint64_t kk;
+            if (step < (1ull << 30) && diff < (1ull << 31))
+            {
+                // Fast path: n < 2^31 fits the reciprocal's validity domain.
+                // q = floor(n/step) = (n·M) >> (32+s). Power-of-two steps
+                // (only p==2 → step==4) take the plain shift.
+                kk = shMul ? (((uint64_t)(uint32_t)n * shMul) >> (32 + shShift))
+                           : (n >> shShift);
+            }
+            else
+            {
+                kk = n / step;   // original division, exact for any geometry
+            }
+            first += kk * step;
         }
 
-        // Optimization 2: Inner loop with running offset.
-        // Avoid recomputing (i - segLo) for each iteration.
-        uint64_t offset = first - segLo;
-        for (uint64_t i = first; i < myEnd; i += step)
+        if (first < myEnd)
         {
-            // Compute map index and bit offset from running offset.
-            uint64_t mapIdx = offset >> 4;
-            uint32_t bitOff = (uint32_t)((offset >> 1) & 7u);
-            primeMap[mapIdx] &= ~(uint8_t)(0x80u >> bitOff);
-            offset += step;
+            const uint64_t step = p << 1;
+            uint64_t off = first - segLo;   // running segLo-relative offset
+            if (wordOk)
+            {
+                // Word-granular marking: accumulate cleared bits per 64-value
+                // word, one uint32 load/mask/store per touched word. Marks
+                // are strictly increasing → word indices never decrease.
+                uint64_t w = off >> 6;
+                uint32_t mask = 0;
+                do
+                {
+                    const uint64_t cw = off >> 6;
+                    if (cw != w)
+                    {
+                        SieveSlabFlushWord_(primeMap, w, mask, fullWords, bufMinBytes);
+                        w = cw;
+                        mask = 0;
+                    }
+                    // bit-in-byte 0x80>>((off>>1)&7) at byte (off>>4)&3 of the
+                    // word → byte shift ((off & 48) >> 1) ∈ {0,8,16,24}.
+                    mask |= (0x80u >> ((uint32_t)(off >> 1) & 7u))
+                            << (uint32_t)((off & 48u) >> 1);
+                    off += step;
+                } while (off < myEndOff);
+                SieveSlabFlushWord_(primeMap, w, mask, fullWords, bufMinBytes);
+            }
+            else
+            {
+                // Original byte-granular RMW path (misalignment fallback).
+                for (; off < myEndOff; off += step)
+                {
+                    primeMap[off >> 4] &= ~(uint8_t)(0x80u >> ((off >> 1) & 7));
+                }
+            }
         }
+
+        __syncthreads();   // all readers done before lane 0 overwrites next prime
     }
 }
 
