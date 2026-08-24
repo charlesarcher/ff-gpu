@@ -30,6 +30,26 @@ extern "C" {
 // Launch SEARCH_KERNEL on the given device.
 // All memory (primeMap, atomicCount, records, smallPrimes) is pre-allocated on device
 // by the caller; this function just launches the kernel.
+
+// Persistent-grid multiplier: blocks per SM (multiProcessorCount), chosen by
+// measurement (task 11, median-of-3 `search kernel` ms over leg 1048576,
+// sweep k e{1,2,4,8,16,32} on both cards; evidence
+// .omo/evidence/gpu-speedup/task-11-gpu-kernel-speedup/happy-deltas.txt).
+// k<=2 starves both cards; k>=8 plateaus. Baked winner k=16 on BOTH arches
+// (amd 2348.0 ms median, -7% vs k=4; nvidia 851.2 ms, flat vs k=8/32).
+// A compile may override via -DFF_SEARCH_BLOCKS_PER_SM.
+#if defined(__HIP_PLATFORM_NVIDIA__)
+#define FF_SEARCH_DEFAULT_BLOCKS_PER_SM 16
+#elif defined(__HIP_PLATFORM_AMD__)
+#define FF_SEARCH_DEFAULT_BLOCKS_PER_SM 16
+#else
+#define FF_SEARCH_DEFAULT_BLOCKS_PER_SM 1
+#endif
+
+#ifndef FF_SEARCH_BLOCKS_PER_SM
+#define FF_SEARCH_BLOCKS_PER_SM FF_SEARCH_DEFAULT_BLOCKS_PER_SM
+#endif
+
 int SEARCH_KERNEL_RUN_NAME(
     int deviceIndex,
     const uint8_t* d_primeMap, uint64_t d_maxPrimeMapValue,
@@ -45,9 +65,26 @@ int SEARCH_KERNEL_RUN_NAME(
         return -1;
     }
 
-    uint64_t numOddSums = (d_sumLimit - d_sumStart) / 2 + 1;
-    uint32_t blockSize = 256;
-    uint32_t numBlocks = (uint32_t)((numOddSums + blockSize - 1) / blockSize);
+    int smCount = 0;
+    if (hipDeviceGetAttribute(&smCount, hipDeviceAttributeMultiprocessorCount,
+                              deviceIndex) != hipSuccess || smCount <= 0) {
+        std::fprintf(stderr, "  [ffdev] kernel: multiProcessorCount query failed\n");
+        hipSetDevice(prevDevice);
+        return -1;
+    }
+
+    // Zero the device-side work-stealing counter for this launch. Default
+    // stream: ordered before the kernel below.
+    uint32_t zero = 0;
+    if (hipMemcpyToSymbol(HIP_SYMBOL(FF_KERN_CAT(ffSearchWork_, SIEVE_KERNEL_ARCH)),
+                          &zero, sizeof(zero)) != hipSuccess) {
+        std::fprintf(stderr, "  [ffdev] kernel: work-counter reset failed\n");
+        hipSetDevice(prevDevice);
+        return -1;
+    }
+
+    const uint32_t blockSize = 256;
+    const uint32_t numBlocks = (uint32_t)smCount * FF_SEARCH_BLOCKS_PER_SM;
 
     hipLaunchKernelGGL(SEARCH_KERNEL,
                        dim3(numBlocks), dim3(blockSize), 0, 0,
@@ -63,7 +100,12 @@ int SEARCH_KERNEL_RUN_NAME(
         return -1;
     }
 
-    hipDeviceSynchronize();
+    hipError_t syncErr = hipDeviceSynchronize();
+    if (syncErr != hipSuccess) {
+        std::fprintf(stderr, "  [ffdev] kernel sync failed: %s\n", hipGetErrorString(syncErr));
+        hipSetDevice(prevDevice);
+        return -1;
+    }
 
     hipSetDevice(prevDevice);
     return 0;

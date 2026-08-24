@@ -21,6 +21,7 @@
 #ifndef FF_GPU_SEARCH_KERNEL_H
 #define FF_GPU_SEARCH_KERNEL_H
 
+#include <cassert>
 #include <cstdint>
 
 // ---- Per-arch symbol rename (mirrors sieve_slab_kernel.h pattern) ----
@@ -36,7 +37,14 @@
 
 // ---- Constants ----
 
-#define MAX_FACTORS                256
+// Task-11 audit (instrumented atomicMax over every factors[] write site):
+// max observed depth = 18 across ALL odd sums of the full production leg
+// [5, 2097152] (14 on the m4_kernel_unit 65535 leg). 32 = pow2 headroom.
+// The previous value, 256, cost ~2 KB/thread of local memory (the kernel's
+// dominant resource) for depth that is never approached. Debug asserts below
+// trap any future algebra change that would outgrow the table (dev preset
+// never defines NDEBUG, so these stay live in production builds).
+#define MAX_FACTORS                32
 #define MAX_COMP_MAX_POWER2        64
 
 // ---- GpuRecord: one solution per record slot (host-visible) ----
@@ -267,6 +275,15 @@ __device__ static bool dev_AllButOneProductOfTermPairsOfSumOfFactorPairsHasSingl
             testFactor = primeFactor;
         }
     }
+    // Depth (numFactors + numPendingFactors) is monotonically non-decreasing
+    // within a call, so this single exit assert detects any MAX_FACTORS
+    // overshoot at ANY write site above — one branch per call instead of one
+    // per write. Gated behind FF_SEARCH_DEBUG_FACTORS because even this
+    // trap-path stub costs ~1.3% on sm_120 (measured task 11); enable it when
+    // touching the factor-enumeration algebra.
+#if defined(FF_SEARCH_DEBUG_FACTORS)
+    assert(numFactors + numPendingFactors <= MAX_FACTORS);
+#endif
     return numMultipleFactorPairs == 1;
 }
 
@@ -290,7 +307,23 @@ __device__ static bool dev_DoesPeterKnow(
         power2, oddProduct, sum, primeMap, maxPrimeMapValue, smallPrimes, smallPrimeCount, primeIndex);
 }
 
-// ---- SEARCH_KERNEL: one thread per odd sum ----
+// ---- SEARCH_KERNEL: persistent work-stealing grid ----
+//
+// Launch geometry (host side, gpu_search_kernel.cpp): k x multiProcessorCount
+// blocks of 256 threads. Every thread loops pulling the next odd-sum index
+// from ONE global device counter via atomicAdd(counter, 1) until the range is
+// exhausted. Per-thread (not block-cooperative) pulling was chosen by
+// measurement: block-chunk pulls force warps that finish early to idle at
+// __syncthreads behind lagging block-mates instead of stealing work — that
+// coupling cost ~15% on sm_120 at leg 2097152 (task-11 matrix evidence).
+// Emission order is untouched because records still land in the sum-indexed
+// slot (sum - sumStart) >> 1 regardless of which thread pulled the sum.
+//
+// The counter is a per-arch-module __device__ global; the host launcher zeroes
+// it via hipMemcpyToSymbol before every launch (default-stream ordered).
+#ifdef SIEVE_KERNEL_ARCH
+static __device__ uint32_t FF_KERN_CAT(ffSearchWork_, SIEVE_KERNEL_ARCH);
+#endif
 
 __global__ void SEARCH_KERNEL(
     const uint8_t* __restrict__  primeMap,
@@ -302,59 +335,108 @@ __global__ void SEARCH_KERNEL(
     const uint32_t* __restrict__ smallPrimes,
     uint32_t                     smallPrimeCount)
 {
-    uint32_t tidx = (uint32_t)(blockIdx.x * blockDim.x + threadIdx.x);
-
-    uint64_t numOddSums = (sumLimit - sumStart) / 2 + 1;
-    if ((uint64_t)tidx >= numOddSums) return;
-
-    uint64_t sum = sumStart + (uint64_t)tidx * 2;
-
-    if (tidx == 0) {
+    // One-shot launch marker (was global thread 0 of the flat grid):
+    // pAtomicCount keeps its test-visible semantics (0x100000 base + one
+    // increment per emitted record).
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
         atomicAdd(pAtomicCount, 0x100000);
         asm volatile("" ::: "memory");
     }
 
-    // Thread-local storage.
-    uint32_t compositePower2[MAX_COMP_MAX_POWER2];
-    uint32_t numComposite = 0;
-    uint32_t numValid = 0;
-    uint64_t termA = 0, termB = 0;
-    bool termsFound = false;
-    uint32_t primeIndex = 0; // smallPrimes has 2 stripped; index 0 = 3, 1 = 5, ...
+    const uint64_t numOddSums = (sumLimit - sumStart) / 2 + 1;
 
-    // ---- Phase 1: Power2Prime ----
-    for (uint64_t evenTerm = 4, power2 = 2; evenTerm < sum - 2; evenTerm <<= 1, ++power2) {
-        uint64_t oddTerm = sum - evenTerm;
-        if (dev_IsPrime(oddTerm, primeMap, maxPrimeMapValue)) {
-            if (++numValid > 1) break;
-            if (!termsFound && numValid == 1) {
-                termA = evenTerm;
-                termB = oddTerm;
-                termsFound = true;
+    for (;;) {
+        const uint64_t tidx =
+            (uint64_t)atomicAdd(&FF_KERN_CAT(ffSearchWork_, SIEVE_KERNEL_ARCH), 1u);
+        if (tidx >= numOddSums) break;
+
+        {
+            uint64_t sum = sumStart + tidx * 2;
+
+            // ---- CPU-order skip short-circuit (BEFORE any phase work) ----
+            // Mirrors the cpu_search.cpp RunIt filter order:
+            //   !ProductOfTermPairsHasSingleFactorPair(sum)
+            //   && (sum != 3*sumDiv3 || IsPrime(sumDiv3))
+            // For odd sums ProductOfTermPairs... reduces to IsPrime(sum-2), so
+            // skipped sums can never reach the emission gate below — moving
+            // the check ahead of phases 1-4 is output-invariant.
+            bool skipSum = false;
+            if (sum & 1) {
+                uint64_t sumDiv3 = sum / 3;
+                // Condition 1: sum-2 must NOT be prime.
+                if (dev_IsPrime(sum - 2, primeMap, maxPrimeMapValue))
+                    skipSum = true;
+                // Condition 2: if sum is divisible by 3, sum/3 must be prime.
+                else if (sum == 3 * sumDiv3 && !dev_IsPrime(sumDiv3, primeMap, maxPrimeMapValue))
+                    skipSum = true;
             }
-        } else {
-            if (numComposite < MAX_COMP_MAX_POWER2)
-                compositePower2[numComposite++] = (uint32_t)power2;
-        }
-    }
 
-    // ---- Phase 2: Power2Odd (k odd, from highest) ----
-    if (numValid <= 1) {
-        uint32_t power2;
-        for (power2 = 2; 5u << power2 < sum - 2; ++power2)
-            ;
-        power2 = (power2 - 2) | 1;
+            if (!skipSum) {
+            // STATE-RESET RULE (work-stealing): every per-sum local is declared
+            // HERE and fully re-initialized for each pulled index — no state
+            // may survive across loop iterations.
+            uint32_t compositePower2[MAX_COMP_MAX_POWER2];
+            uint32_t numComposite = 0;
+            uint32_t numValid = 0;
+            uint64_t termA = 0, termB = 0;
+            bool termsFound = false;
+            uint32_t primeIndex = 0; // smallPrimes has 2 stripped; index 0 = 3, 1 = 5, ...
 
-        for (; power2 >= 2; power2 -= 2) {
-            for (uint64_t oddPartOfEven = 5;
-                 (oddPartOfEven << power2) < sum - 2;
-                 oddPartOfEven += 2) {
-                uint64_t evenTerm = oddPartOfEven << power2;
+            // ---- Phase 1: Power2Prime ----
+            for (uint64_t evenTerm = 4, power2 = 2; evenTerm < sum - 2; evenTerm <<= 1, ++power2) {
                 uint64_t oddTerm = sum - evenTerm;
-                uint64_t oddProd = oddPartOfEven * oddTerm;
-                if (oddProd % 3) {
-                    if ((numValid += dev_DoesPeterKnow(
-                            power2, oddPartOfEven, oddTerm, oddProd, sum,
+                if (dev_IsPrime(oddTerm, primeMap, maxPrimeMapValue)) {
+                    if (++numValid > 1) break;
+                    if (!termsFound && numValid == 1) {
+                        termA = evenTerm;
+                        termB = oddTerm;
+                        termsFound = true;
+                    }
+                } else {
+                    if (numComposite < MAX_COMP_MAX_POWER2)
+                        compositePower2[numComposite++] = (uint32_t)power2;
+                }
+            }
+
+            // ---- Phase 2: Power2Odd (k odd, from highest) ----
+            if (numValid <= 1) {
+                uint32_t power2;
+                for (power2 = 2; 5u << power2 < sum - 2; ++power2)
+                    ;
+                power2 = (power2 - 2) | 1;
+
+                for (; power2 >= 2; power2 -= 2) {
+                    for (uint64_t oddPartOfEven = 5;
+                         (oddPartOfEven << power2) < sum - 2;
+                         oddPartOfEven += 2) {
+                        uint64_t evenTerm = oddPartOfEven << power2;
+                        uint64_t oddTerm = sum - evenTerm;
+                        uint64_t oddProd = oddPartOfEven * oddTerm;
+                        if (oddProd % 3) {
+                            if ((numValid += dev_DoesPeterKnow(
+                                    power2, oddPartOfEven, oddTerm, oddProd, sum,
+                                    primeMap, maxPrimeMapValue, smallPrimes, smallPrimeCount, primeIndex)) > 1)
+                                break;
+                            if (!termsFound && numValid == 1) {
+                                termA = evenTerm;
+                                termB = oddTerm;
+                                termsFound = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ---- Phase 3: Power2Composite ----
+            if (numValid <= 1) {
+                int32_t nc = (int32_t)numComposite - 1;
+                while (nc >= 0) {
+                    int32_t idx = nc;
+                    --nc;
+                    uint64_t evenTerm = ((uint64_t)1 << compositePower2[idx]);
+                    uint64_t oddTerm = sum - evenTerm;
+                    if ((numValid += dev_AllButOneProductOfTermPairsOfSumOfFactorPairsHasSingleFactorPair(
+                            compositePower2[idx], oddTerm, sum,
                             primeMap, maxPrimeMapValue, smallPrimes, smallPrimeCount, primeIndex)) > 1)
                         break;
                     if (!termsFound && numValid == 1) {
@@ -364,85 +446,56 @@ __global__ void SEARCH_KERNEL(
                     }
                 }
             }
-        }
-    }
 
-    // ---- Phase 3: Power2Composite ----
-    if (numValid <= 1) {
-        int32_t nc = (int32_t)numComposite - 1;
-        while (nc >= 0) {
-            int32_t idx = nc;
-            --nc;
-            uint64_t evenTerm = ((uint64_t)1 << compositePower2[idx]);
-            uint64_t oddTerm = sum - evenTerm;
-            if ((numValid += dev_AllButOneProductOfTermPairsOfSumOfFactorPairsHasSingleFactorPair(
-                    compositePower2[idx], oddTerm, sum,
-                    primeMap, maxPrimeMapValue, smallPrimes, smallPrimeCount, primeIndex)) > 1)
-                break;
-            if (!termsFound && numValid == 1) {
-                termA = evenTerm;
-                termB = oddTerm;
-                termsFound = true;
-            }
-        }
-    }
+            // ---- Phase 4: Power2Even (k even, from highest) ----
+            if (numValid <= 1) {
+                uint32_t power2;
+                for (power2 = 2; 3u << power2 < sum - 2; ++power2)
+                    ;
+                power2 = (power2 - 1) & ~1u;
 
-    // ---- Phase 4: Power2Even (k even, from highest) ----
-    if (numValid <= 1) {
-        uint32_t power2;
-        for (power2 = 2; 3u << power2 < sum - 2; ++power2)
-            ;
-        power2 = (power2 - 1) & ~1u;
-
-        for (; power2 >= 2; power2 -= 2) {
-            for (uint64_t oddPartOfEven = 3;
-                 (oddPartOfEven << power2) < sum - 2;
-                 oddPartOfEven += 2) {
-                uint64_t evenTerm = oddPartOfEven << power2;
-                uint64_t oddTerm = sum - evenTerm;
-                uint64_t oddProd = oddPartOfEven * oddTerm;
-                if (!(oddProd % 3) || dev_IsPrime(oddTerm, primeMap, maxPrimeMapValue)) {
-                    if ((numValid += dev_DoesPeterKnow(
-                            power2, oddPartOfEven, oddTerm, oddProd, sum,
-                            primeMap, maxPrimeMapValue, smallPrimes, smallPrimeCount, primeIndex)) > 1)
-                        break;
-                    if (!termsFound && numValid == 1) {
-                        termA = evenTerm;
-                        termB = oddTerm;
-                        termsFound = true;
+                for (; power2 >= 2; power2 -= 2) {
+                    for (uint64_t oddPartOfEven = 3;
+                         (oddPartOfEven << power2) < sum - 2;
+                         oddPartOfEven += 2) {
+                        uint64_t evenTerm = oddPartOfEven << power2;
+                        uint64_t oddTerm = sum - evenTerm;
+                        uint64_t oddProd = oddPartOfEven * oddTerm;
+                        if (!(oddProd % 3) || dev_IsPrime(oddTerm, primeMap, maxPrimeMapValue)) {
+                            if ((numValid += dev_DoesPeterKnow(
+                                    power2, oddPartOfEven, oddTerm, oddProd, sum,
+                                    primeMap, maxPrimeMapValue, smallPrimes, smallPrimeCount, primeIndex)) > 1)
+                                break;
+                            if (!termsFound && numValid == 1) {
+                                termA = evenTerm;
+                                termB = oddTerm;
+                                termsFound = true;
+                            }
+                        }
                     }
                 }
             }
+
+            // ---- Write result if exactly one valid decomposition ----
+            // (skipSum == false is guaranteed here by the early gate.)
+            if (numValid == 1 && termsFound) {
+                uint64_t lo = termA, hi = termB;
+                if (lo > hi) { uint64_t tmp = lo; lo = hi; hi = tmp; }
+
+                atomicAdd(pAtomicCount, 1);
+                GpuRecord rec;
+                rec.sum = (uint32_t)sum;
+                rec.low = lo;
+                rec.high = hi;
+                rec.tag = 0;
+                // Sum-indexed slot: each sum owns slot (sum-sumStart)/2, so slots
+                // are in ascending-sum order — deterministic emission without a
+                // sort, independent of pull order. Unsolved slots must read zero
+                // (caller zero-fills the buffer first).
+                pRecords[(sum - sumStart) >> 1] = rec;
+            }
+            }  // !skipSum
         }
-    }
-
-    bool skipSum = false;
-    if (sum & 1) {
-        uint64_t sumDiv3 = sum / 3;
-        // Condition 1: ProductOfTermPairsHasSingleFactorPair must be false.
-        // For odd sums, this means sum-2 must NOT be prime.
-        if (dev_IsPrime(sum - 2, primeMap, maxPrimeMapValue))
-            skipSum = true;
-        // Condition 2: if sum is divisible by 3, sum/3 must be prime.
-        else if (sum == 3 * sumDiv3 && !dev_IsPrime(sumDiv3, primeMap, maxPrimeMapValue))
-            skipSum = true;
-    }
-
-    // ---- Write result if exactly one valid decomposition ----
-    if (numValid == 1 && termsFound && !skipSum) {
-        uint64_t lo = termA, hi = termB;
-        if (lo > hi) { uint64_t tmp = lo; lo = hi; hi = tmp; }
-
-        atomicAdd(pAtomicCount, 1);
-        GpuRecord rec;
-        rec.sum = (uint32_t)sum;
-        rec.low = lo;
-        rec.high = hi;
-        rec.tag = 0;
-        // Sum-indexed slot: each thread owns slot (sum-sumStart)/2, so slots
-        // are in ascending-sum order — deterministic emission without a sort.
-        // Unsolved slots must read zero (caller zero-fills the buffer first).
-        pRecords[(sum - sumStart) >> 1] = rec;
     }
 }
 
