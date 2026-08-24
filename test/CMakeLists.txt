@@ -75,6 +75,22 @@ target_link_libraries(
 
 ff_gpu_setup_binary(m4_order_bin)
 
+# ---- M4 Miller-Rabin differential: device dev_IsPrime vs host GpuPrime ----
+
+add_executable(m4_mr_diff_bin source/m4_mr_diff.cpp)
+
+target_compile_features(m4_mr_diff_bin PRIVATE cxx_std_17)
+
+target_link_libraries(
+    m4_mr_diff_bin PRIVATE
+    ff-gpu_core
+    ff-gpu_lib
+    ff-gpu_amd
+    ff-gpu_nv
+)
+
+ff_gpu_setup_binary(m4_mr_diff_bin)
+
 # ---- CTest registration ----
 
 add_test(NAME abstraction_smoke COMMAND abstraction_smoke)
@@ -82,3 +98,4 @@ add_test(NAME ff_budget_selftest COMMAND ff_budget_selftest)
 add_test(NAME slab_cmp COMMAND slab_cmp)
 add_test(NAME m4_kernel_unit_bin COMMAND m4_kernel_unit_bin)
 add_test(NAME m4_order_bin COMMAND m4_order_bin)
+add_test(NAME m4_mr_diff_bin COMMAND m4_mr_diff_bin)

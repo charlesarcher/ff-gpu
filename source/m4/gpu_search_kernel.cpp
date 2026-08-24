@@ -86,6 +86,62 @@ SearchKernelRunFn SEARCH_KERNEL_GET_LAUNCH_FN(int deviceIndex)
     return &SEARCH_KERNEL_RUN_NAME;
 }
 
+// ---- Test-only launcher for MRVerdictKernel_<arch> (m4_mr_diff) ----
+// Same shape as SEARCH_KERNEL_RUN_NAME: caller pre-allocates all buffers
+// through DevAlloc on the SAME logical device it passes here.
+
+#define MR_DIFF_RUN_NAME      FF_HOST_CAT(MRDiffRun_, SIEVE_KERNEL_ARCH)
+#define MR_DIFF_GET_LAUNCH_FN FF_HOST_CAT(MRDiffGetLaunchFn_, SIEVE_KERNEL_ARCH)
+
+int MR_DIFF_RUN_NAME(
+    int deviceIndex,
+    const uint64_t* d_ns, uint8_t* d_verdicts, uint32_t count,
+    const uint8_t* d_primeMap, uint64_t maxPrimeMapValue)
+{
+    int prevDevice = -1;
+    hipGetDevice(&prevDevice);
+    if (hipSetDevice(deviceIndex) != hipSuccess) {
+        std::fprintf(stderr, "  [ffdev] mrdiff: hipSetDevice(%d) failed\n", deviceIndex);
+        if (prevDevice >= 0) hipSetDevice(prevDevice);
+        return -1;
+    }
+
+    uint32_t blockSize = 256;
+    uint32_t numBlocks = count ? (count + blockSize - 1) / blockSize : 1;
+
+    hipLaunchKernelGGL(FF_HOST_CAT(MRVerdictKernel_, SIEVE_KERNEL_ARCH),
+                       dim3(numBlocks), dim3(blockSize), 0, 0,
+                       d_ns, d_verdicts, d_primeMap, maxPrimeMapValue, count);
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess) {
+        std::fprintf(stderr, "  [ffdev] mrdiff launch failed: %s\n", hipGetErrorString(err));
+        hipSetDevice(prevDevice);
+        return -1;
+    }
+
+    hipError_t syncErr = hipDeviceSynchronize();
+    if (syncErr != hipSuccess) {
+        std::fprintf(stderr, "  [ffdev] mrdiff sync failed: %s\n", hipGetErrorString(syncErr));
+        hipSetDevice(prevDevice);
+        return -1;
+    }
+
+    hipSetDevice(prevDevice);
+    return 0;
+}
+
+typedef int (*MRDiffRunFn)(int, const uint64_t*, uint8_t*, uint32_t,
+                           const uint8_t*, uint64_t);
+
+MRDiffRunFn MR_DIFF_GET_LAUNCH_FN(int deviceIndex)
+{
+    int devCount = 0;
+    if (hipGetDeviceCount(&devCount) != hipSuccess) return nullptr;
+    if (deviceIndex < 0 || deviceIndex >= devCount) return nullptr;
+    return &MR_DIFF_RUN_NAME;
+}
+
 // ---- Arch-tagged HIP memory-management wrappers ----
 // main.cpp is compiled with g++ and cannot include hip/hip_runtime.h, so
 // these wrappers live here (compiled with hipcc per-arch) and are called

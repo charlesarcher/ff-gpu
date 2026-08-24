@@ -74,22 +74,59 @@ __device__ static bool dev_IsPowerOf2(uint64_t x) {
     return x > 0 && ((-x) & x) == x;
 }
 
-// 64-bit modular multiplication using 128-bit intermediate (GPU-supported).
-__device__ static uint64_t dev_ModularMulL(uint64_t a, uint64_t b, uint64_t m) {
-    __uint128_t r = (__uint128_t)a * (__uint128_t)b;
-    return (uint64_t)(r % (__uint128_t)m);
+// ---- Montgomery REDC modular arithmetic (64-bit odd moduli) ----
+//
+// R = 2^64. For odd m < R, dev_MontMul returns a*b*R^{-1} mod m exactly, so
+// every residue computed by the Miller-Rabin loop is identical to a plain
+// (__uint128_t %) computation — only the representation differs. The MR
+// branch of dev_IsPrime only ever sees ODD n (even n returns earlier), so no
+// even-modulus fallback exists; the tiny-n base reduction below keeps n <= 17
+// verdicts exact for non-production thresholds as well.
+
+// -m^{-1} mod 2^64 via Newton iteration (seed correct mod 8, 5 doublings).
+__device__ static uint64_t dev_MontMinv(uint64_t m) {
+    uint64_t inv = m; // m*m == 1 (mod 8) for odd m
+#pragma unroll
+    for (int i = 0; i < 5; ++i) inv *= 2u - m * inv;
+    return ~inv + 1u; // -inv mod 2^64
 }
 
-// 64-bit modular exponentiation via repeated squaring.
-__device__ static uint64_t dev_ModularPowerL(uint64_t base, uint64_t exp, uint64_t m) {
-    uint64_t result = 1;
-    base %= m;
-    while (exp > 0) {
-        if (exp & 1) result = dev_ModularMulL(result, base, m);
-        exp >>= 1;
-        base = dev_ModularMulL(base, base, m);
-    }
-    return result;
+// Overflow-safe (a+b) mod m for a,b < m, valid up to m = 2^64-1: a wrap past
+// 2^64 implies the true sum is in [2^64, 2m) so exactly one subtraction of m
+// lands back in [0, m) after the uint64 wrap.
+__device__ static uint64_t dev_MontAddMod(uint64_t a, uint64_t b, uint64_t m) {
+    uint64_t s = a + b;
+    if (s < a || s >= m) s -= m;
+    return s;
+}
+
+// R^2 mod m for odd m: 128 overflow-safe doublings of 1 (= 2^128 mod m).
+// Computed once per modulus; amortized over the whole witness loop.
+__device__ static uint64_t dev_MontR2(uint64_t m) {
+    uint64_t r = 1;
+#pragma unroll 8
+    for (int i = 0; i < 128; ++i) r = dev_MontAddMod(r, r, m);
+    return r;
+}
+
+// Montgomery multiplication: a*b*R^{-1} mod m, exact for any odd m in [3, 2^64)
+// with a,b < m. The carry term handles m > 2^63 where hi+umHi+c0 can exceed
+// 64 bits: the true quotient t = c1*2^64 + rest is < 2m, so subtracting m from
+// `rest` modulo 2^64 yields t - m exactly whenever c1 is set.
+__device__ static uint64_t dev_MontMul(uint64_t a, uint64_t b, uint64_t m, uint64_t minv) {
+    uint64_t lo   = a * b;
+    uint64_t hi   = __umul64hi(a, b);
+    uint64_t u    = lo * minv;            // (a*b) * (-m^{-1}) mod 2^64
+    uint64_t umLo = u * m;
+    uint64_t umHi = __umul64hi(u, m);
+    uint64_t sumLo = lo + umLo;
+    uint64_t c0 = sumLo < lo ? 1u : 0u;
+    uint64_t t = hi + umHi;
+    uint64_t c1 = t < hi ? 1u : 0u;
+    t += c0;
+    c1 += (t < c0) ? 1u : 0u;
+    if (c1 || t >= m) t -= m;
+    return t;
 }
 
 // Bit-test primality: lookup in primeMap for n <= maxPrimeMapValue.
@@ -110,16 +147,35 @@ __device__ static bool dev_IsPrime(uint64_t n,
             n < 3215031751ull ? 4 :
             n < 2152302898747ull ? 5 :
             n < 3474749660383ull ? 6 : 7;
+        // n is odd here, so REDC applies. Squaring loop stays in the
+        // Montgomery domain; 1 and n-1 compare equal against their Montgomery
+        // images (bijection on residues => identical comparison outcomes).
+        const uint64_t minv = dev_MontMinv(n);
+        const uint64_t r2   = dev_MontR2(n);
+        const uint64_t oneM = dev_MontMul(1, r2, n, minv);
+        const uint64_t nm1M = dev_MontMul(n - 1, r2, n, minv);
         for (uint32_t i = 0; i < maxTests; ++i) {
             uint64_t p = primeTestList[i];
-            uint64_t x = dev_ModularPowerL(p, nDiv2Odd, n);
-            if (x != 1 && x != n - 1) {
-                for (uint32_t r = 1; r < power2; ++r) {
-                    x = dev_ModularMulL(x, x, n);
-                    if (x == 1) return false;
-                    if (x == n - 1) break;
+            if (p >= n) p %= n; // unreachable in production; keeps tiny-n exact
+            uint64_t xM = dev_MontMul(p, r2, n, minv);
+            {
+                uint64_t accM = oneM;
+                uint64_t sqM = xM;
+                uint64_t e = nDiv2Odd;
+                while (e) {
+                    if (e & 1) accM = dev_MontMul(accM, sqM, n, minv);
+                    e >>= 1;
+                    if (e) sqM = dev_MontMul(sqM, sqM, n, minv);
                 }
-                if (x != n - 1) return false;
+                xM = accM;
+            }
+            if (xM != oneM && xM != nm1M) {
+                for (uint32_t r = 1; r < power2; ++r) {
+                    xM = dev_MontMul(xM, xM, n, minv);
+                    if (xM == oneM) return false;
+                    if (xM == nm1M) break;
+                }
+                if (xM != nm1M) return false;
             }
         }
         return true;
@@ -388,6 +444,22 @@ __global__ void SEARCH_KERNEL(
         // Unsolved slots must read zero (caller zero-fills the buffer first).
         pRecords[(sum - sumStart) >> 1] = rec;
     }
+}
+
+// ---- Test-only hook: batch Miller-Rabin verdicts through dev_IsPrime ----
+// Driven exclusively by test/source/m4_mr_diff.cpp to exercise the REAL
+// device MR path with arbitrary n. Never launched by production code.
+// Parameter order mirrors SEARCH_KERNEL (pointers, then scalars, count last).
+__global__ void FF_KERN_CAT(MRVerdictKernel_, SIEVE_KERNEL_ARCH)(
+    const uint64_t* __restrict__ ns,
+    uint8_t* __restrict__ verdicts,
+    const uint8_t* __restrict__ primeMap,
+    uint64_t maxPrimeMapValue,
+    uint32_t count)
+{
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    verdicts[i] = dev_IsPrime(ns[i], primeMap, maxPrimeMapValue) ? 1 : 0;
 }
 
 #endif  // SIEVE_KERNEL_ARCH
