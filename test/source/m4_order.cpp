@@ -30,6 +30,7 @@
 #include <fcntl.h>
 
 #include "devabstraction.h"
+#include "geometry.h"
 #include "m4/gpu_search_kernel.h"
 #include "m4/gpu_search_emission.cpp"   // inline for this standalone test
 
@@ -47,7 +48,8 @@
 
 // ---- Resolve kernel launch function (both arches) ----
 
-// ---- Small-prime sieve (CPU reference for prime map) ----
+// ---- Small-prime sieve — CANONICAL map (host GpuPrime/emission format;
+//      the device copy is compacted to internal wheel-30 in main below) ----
 
 static std::vector<uint8_t> cpu_generatePrimeMap(uint64_t limit) {
     uint64_t mapBytes = (limit >> 4) + 1;
@@ -98,17 +100,29 @@ extern "C" SearchKernelRunFn SearchKernelGetLaunchFn_gfx1201(int deviceIndex);
 int main(int /*argc*/, char** /*argv*/) {
     const uint64_t sumStart  = 5;
     const uint64_t sumLimit  = 65536;   // leg from golden file
-    const uint64_t mapBytes  = (sumLimit >> 4) + 1;
+    // Wheel-30 (task 9): the DEVICE buffer carries the INTERNAL layout
+    // consumed by dev_IsPrime — same value span as canonical, sized by
+    // ff::internalMapBytes (30 values/byte), exactly like production
+    // main.cpp plumbing. The CANONICAL map stays host-side only (GpuPrime
+    // oracle + emission).
+    const uint64_t mapBytes  = ff::internalMapBytes(sumLimit + 1);
 
     std::printf("=== m4_order: GPU search ordered emission test ===\n");
-    std::printf("sumStart=%llu, sumLimit=%llu, mapBytes=%llu\n",
+    std::printf("sumStart=%llu, sumLimit=%llu, internal mapBytes=%llu\n",
                 (unsigned long long)sumStart,
                 (unsigned long long)sumLimit,
                 (unsigned long long)mapBytes);
 
     // --- 1. Generate CPU prime map ---
+    // Canonical sieve first (host oracle format), then compact to the
+    // INTERNAL wheel-30 layout with the task-5 helper — the same chain
+    // canonical-sieve -> compact -> H2D -> wheel-decode that m4_mr_diff
+    // validates differentially.
     std::vector<uint8_t> h_primeMap = cpu_generatePrimeMap(sumLimit);
     uint64_t maxPrimeMapValue = sumLimit;
+    std::vector<uint8_t> h_internalMap(ff::internalMapBytes(maxPrimeMapValue + 1), 0);
+    ff::compactCanonicalToWheel30(h_primeMap.data(), h_internalMap.data(),
+                                  maxPrimeMapValue + 1);
 
     // --- 2. Build GpuPrime (host-side lookup table) ---
     // We build the GpuPrime from the host prime map for emission. The GPU
@@ -143,8 +157,8 @@ int main(int /*argc*/, char** /*argv*/) {
     CHECK(ffdev::DevAlloc(0, sizeof(uint32_t), &dhAtomicCount));
     CHECK(ffdev::DevAlloc(0, recordSize, &dhRecords));
 
-    // --- 6. Copy prime map to device ---
-    CHECK(ffdev::DevCopy(&dhPrimeMap, h_primeMap.data(), (size_t)mapBytes, ffdev::DevCopyDir::H2D));
+    // --- 6. Copy prime map to device (INTERNAL wheel-30 bytes) ---
+    CHECK(ffdev::DevCopy(&dhPrimeMap, h_internalMap.data(), (size_t)mapBytes, ffdev::DevCopyDir::H2D));
 
     // --- 7. Initialize atomic counter to 0 ---
     uint32_t h_atomicCount = 0;

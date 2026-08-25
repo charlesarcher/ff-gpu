@@ -293,6 +293,18 @@ int main()
         2 * (21474836480ull - 1073741824ull - 67108864ull);
     CHECK(agg20 >= g2m.mapBytes);                   // 20 GiB caps -> PASS
 
+    // ---- amd@2M participation flip (tasks 6+7, BY DESIGN) ----
+    // RX 9070 XT-class device: the CANONICAL 16-GiB map cannot fit its
+    // backing, but the wheel-30 INTERNAL map (8.53 GiB) fits, so GPU search
+    // participates at the 2M leg where the canonical era needed the host
+    // overflow tier. Pinned on internal sizing so a future density change
+    // re-visits this flip consciously.
+    makeDev(dev, "amd", "RX 9070 XT", "0000:05:00", 17095983104ull);
+    bcfg = ff::Config();
+    b = ff::computeBudget(dev, bcfg, 0.90);
+    CHECK(b.backing < g2m.mapBytes);                // canonical era: no fit -> host tier
+    CHECK(b.backing >= g2m.internalMapBytes);       // wheel era: fits -> search participates
+
     // ---- §4.3 alloc-failure fallback: one midpoint step toward the 0.50 floor
     // ---- (caller loops on alloc failure; backing strictly shrinks each step) ----
     makeDev(dev, "nvidia", "RTX 5090", "0000:01:00", 21474836480ull);  // 20 GiB free

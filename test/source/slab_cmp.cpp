@@ -274,6 +274,38 @@ int main(int /*argc*/, char** /*argv*/)
 
         // 12. Truncation mid-group at the tail
         {"tail mid-group", 30000, 31625},
+
+        // ---- Task 9 full-matrix additions (30 values/byte geometry) ----
+
+        // 13. Minimum in-contract span: exactly one internal byte
+        {"minimum span (one byte)", 0, 30},
+
+        // 14. Sub-byte span: only value 1 defined, all slots padding-cleared
+        {"sub-byte span", 0, 7},
+
+        // 15. Degenerate single-value span
+        {"degenerate span", 0, 1},
+
+        // 16. Second byte, non-zero byte-aligned start
+        {"second byte", 30, 60},
+
+        // 17. Full last-byte boundary (span == 32 bytes exactly)
+        {"byte-boundary end", 0, 960},
+
+        // 18. Mid-superblock start crossing a superblock edge
+        {"mid-superblock start crossing", 210, 510},
+
+        // 19. Window straddling a sub-block boundary (2^18 internal bytes)
+        {"sub-block straddle window", 7864200, 7864500},
+
+        // 20. Mid-superblock start, truncated non-aligned end
+        {"mid-superblock truncated", 123450, 125000},
+
+        // 21. Stress at 30 values/byte: 20M values (~667 KiB internal)
+        {"stress 20M values", 0, 20000000},
+
+        // 22. Deep offset stress: third sub-block + 2M-value window
+        {"deep offset stress", 15728640, 17728640},
     };
 
     for (const auto& tc : tests) {

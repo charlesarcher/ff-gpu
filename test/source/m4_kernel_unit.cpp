@@ -16,6 +16,7 @@
 #include <algorithm>
 
 #include "devabstraction.h"
+#include "geometry.h"
 #include "m4/gpu_search_kernel.h"
 
 // ---- Error handling ----
@@ -48,6 +49,20 @@ static uint64_t cpu_ModularPowerL(uint64_t base, uint64_t exp, uint64_t m) {
     return result;
 }
 
+// Wheel-30 in-map decode (task 9): HOST CLONE of dev_IsPrime's in-map path
+// (source/m4/gpu_search_kernel.h). The constants below are DELIBERATE
+// LITERALS, independent of the header's FF_WHEEL_COPRIME_MASK and magic
+// multiply: this suite exists to catch host/device divergence, so the clone
+// must be able to disagree with the kernel. Derivations (task-8 evidence):
+//   mask 0x208A2882 = (1u<<1)|(1u<<7)|(1u<<11)|(1u<<13)|(1u<<17)|(1u<<19)|
+//                     (1u<<23)|(1u<<29) — bit r set <=> r coprime to 30;
+//   magic 0x8888888888888889 = (2^68+14)/30, mulhi>>4 == floor(n/30) exactly
+//     for every uint64 n (Granlund-Montgomery error bound n*14 < 2^68);
+//   slot = popcount-rank of r among ascending residues {1,7,11,13,17,19,23,29}
+//     == the internal byte's LSB-first bit index for value n (geometry.h).
+// The {3,5} fast path sits BELOW the maxPrimeMapValue branch: above it the
+// reference Miller-Rabin witness-p==n quirk is verdict-normative and must be
+// mirrored (m4_mr_diff T:E bucket pins this).
 static bool cpu_IsPrime(uint64_t n, const uint8_t* primeMap, uint64_t maxPrimeMapValue) {
     if (n == 2) return true;
     if (!(n & 1)) return false;
@@ -75,7 +90,14 @@ static bool cpu_IsPrime(uint64_t n, const uint8_t* primeMap, uint64_t maxPrimeMa
         }
         return true;
     }
-    return (primeMap[n >> 4] & (0x80 >> (n >> 1 & 7))) != 0;
+    if (n == 3 || n == 5) return true;
+    const uint64_t mulhi = (uint64_t)(((unsigned __int128)n * 0x8888888888888889ull) >> 64);
+    const uint64_t q = mulhi >> 4;
+    const uint32_t r = (uint32_t)(n - q * 30);
+    if (!((0x208A2882u >> r) & 1u)) return false;
+    const uint32_t slot =
+        (uint32_t)__builtin_popcount(0x208A2882u & ((1u << r) - 1u));
+    return (primeMap[q] & (uint8_t)(1u << slot)) != 0;
 }
 
 // ---- CPU small-prime sieve ----
@@ -429,16 +451,22 @@ static int runTest(uint32_t sumStart, uint64_t sumLimit, uint32_t testInterval) 
     CHECK(ffdev::DevGetDeviceProperties(0, &di));
     std::printf("  Device 0: %s (%s)\n", di.name, ffdev::backendName(ffdev::DevBackendOf(0)));
 
-    // 3. Generate CPU prime map.
-    uint64_t mapBytes = (sumLimit >> 4) + 1;
-    std::vector<uint8_t> h_primeMap(mapBytes, 0xff);
-    h_primeMap[0] ^= 0x80; // 1 is not prime
+    // 3. Generate CPU prime map. CANONICAL sieve first, then compact to the
+    //    INTERNAL wheel-30 layout (task 8 decode contract): the device buffer
+    //    AND the cpu_IsPrime reference both consume the internal bytes now,
+    //    mirroring the production chain canonical-sieve -> compact -> H2D
+    //    -> wheel-decode.
+    const uint64_t span = sumLimit + 1;
+    std::vector<uint8_t> h_canonMap((span >> 4) + 1, 0xff);
+    h_canonMap[0] ^= 0x80; // 1 is not prime
     for (uint64_t p = 3; p * p <= sumLimit; p += 2) {
-        if (h_primeMap[p >> 4] & (0x80 >> (p >> 1 & 7))) {
+        if (h_canonMap[p >> 4] & (0x80 >> (p >> 1 & 7))) {
             for (uint64_t i = p * p; i <= sumLimit; i += p << 1)
-                h_primeMap[i >> 4] &= ~(0x80 >> (i >> 1 & 7));
+                h_canonMap[i >> 4] &= ~(0x80 >> (i >> 1 & 7));
         }
     }
+    std::vector<uint8_t> h_primeMap(ff::internalMapBytes(span), 0);
+    ff::compactCanonicalToWheel30(h_canonMap.data(), h_primeMap.data(), span);
 
     uint64_t maxPrimeMapValue = sumLimit;
 
@@ -450,7 +478,7 @@ static int runTest(uint32_t sumStart, uint64_t sumLimit, uint32_t testInterval) 
     // 5. Allocate device memory.
     ffdev::DevHandle dhPrimeMap, dhAtomicCount, dhRecords;
 
-    size_t primeMapSize = (size_t)mapBytes;
+    size_t primeMapSize = h_primeMap.size();
     CHECK(ffdev::DevAlloc(0, primeMapSize, &dhPrimeMap));
     CHECK(ffdev::DevAlloc(0, sizeof(uint32_t), &dhAtomicCount));
     size_t recordSize = (size_t)numOddSums * sizeof(GpuRecord);
@@ -459,6 +487,12 @@ static int runTest(uint32_t sumStart, uint64_t sumLimit, uint32_t testInterval) 
     // 5b. Generate smallPrimes and copy to device (kernel needs them for
     //     prime factor advancement in AllButOneProductOfTermPairs).
     //     Strip leading 2 to match main.cpp behavior: index 0 = 3, 1 = 5, ...
+    //     Wheel-30 note (task 9): {3,5} intentionally STAY in this list. It
+    //     is the FACTOR-ADVANCEMENT list (gpu_search_kernel.h walks
+    //     primeFactor = smallPrimes[++primeIndex] from primeFactor=3), NOT a
+    //     sieve marking list — dropping 5 would skip factor-5 enumeration and
+    //     diverge from the cpu_IsPrime-walking reference. Only the SIEVE
+    //     MARKING list drops {2,3,5} under wheel-30 (task 7).
     // cpu_generateSmallPrimes(limit) generates primes up to sqrt(limit).
     // The kernel needs primes up to factorLimit ~ sqrt(product) ~ sumLimit/2.
     // Pass sumLimit^2 so sqrt(sumLimit^2) = sumLimit covers the full range.

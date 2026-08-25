@@ -29,6 +29,17 @@
 //      Montgomery moduli; also exercises the {2,3,5} fast path and the
 //      3/5-multiple guard on nearly every wheel byte
 //
+// IN-MAP DECODE EMPHASIS (task 9): buckets F/G/P:D feed n <= maxPrimeMapValue
+// so dev_IsPrime takes the wheel-30 bit-test path (q/r decode, coprime guard,
+// popcount-rank slot, map load) instead of Miller-Rabin:
+//   F. EXHAUSTIVE every n in [1..30000] @bound 30000 — all 8 residues at
+//      every byte index 0..1000 incl. byte 0 and the all-padding tail byte,
+//      plus every 3/5-multiple guard rejection
+//   G. boundary-byte clusters @bound 65536: first bytes, superblock edges
+//      (240/960), final partial byte below the bound, bound value itself
+//   P:D in-map edges of the production map: [1..2000], the top 2000 values
+//      below maxPrimeMapValue_65K, and the bound value itself
+//
 // Runs on EVERY logical GPU (both vendors when present).
 
 #include <cstdint>
@@ -243,6 +254,55 @@ static bool runOnDevice(int logicalIndex, int vendorIndex, MRDiffRunFn launchFn,
         ok &= runBatchOnDevice(launchFn, logicalIndex, vendorIndex, prodInternal, prodThr,
                                "P:C adversarial edges", adv, s,
                                prodCanon);
+
+        // P:D in-map decode edges (task 9): values BELOW the bound take the
+        // wheel-30 bit-test path — first bytes, top bytes at the far map
+        // edge, and the bound value itself.
+        std::vector<uint64_t> inMapEdges;
+        appendRange(inMapEdges, 1, 2000);
+        appendRange(inMapEdges, prodThr - 2000, prodThr);
+        ok &= runBatchOnDevice(launchFn, logicalIndex, vendorIndex, prodInternal, prodThr,
+                               "P:D in-map edges @bound thr", inMapEdges, s,
+                               prodCanon);
+        total.tested += s.tested;
+        total.divergences += s.divergences;
+    }
+
+    // -- Config M: IN-MAP DECODE EMPHASIS (task 9) --
+    // Buckets F/G below feed n <= maxPrimeMapValue so dev_IsPrime exercises
+    // the wheel-30 bit-test path on every residue at boundary byte indices.
+    {
+        DiffStats s;
+
+        // M:F exhaustive in-map sweep: every n in [1..30000] hits the in-map
+        // path — all 8 residues at every byte index 0..1000, byte 0, the
+        // all-padding tail byte, every 3/5-multiple guard rejection, and the
+        // {2,3,5} fast paths.
+        {
+            std::vector<uint8_t> mCanon = generatePrimeMap(30000);
+            std::vector<uint8_t> mInternal = generatePrimeMapInternal(30000);
+            std::vector<uint64_t> ns;
+            appendRange(ns, 1, 30000);
+            ok &= runBatchOnDevice(launchFn, logicalIndex, vendorIndex, mInternal, 30000,
+                                   "M:F exhaustive in-map 1..30000 @bound30000", ns, s,
+                                   mCanon);
+        }
+
+        // M:G boundary-byte clusters @bound 65536: byte 0, superblock edges
+        // (240/960 = lcm(30,16) multiples), and the final partial byte just
+        // below the bound.
+        {
+            std::vector<uint8_t> bCanon = generatePrimeMap(65536);
+            std::vector<uint8_t> bInternal = generatePrimeMapInternal(65536);
+            std::vector<uint64_t> ns;
+            appendRange(ns, 1, 96);
+            appendRange(ns, 234, 246);
+            appendRange(ns, 954, 966);
+            appendRange(ns, 65505, 65536);
+            ok &= runBatchOnDevice(launchFn, logicalIndex, vendorIndex, bInternal, 65536,
+                                   "M:G boundary-byte clusters @bound65536", ns, s,
+                                   bCanon);
+        }
         total.tested += s.tested;
         total.divergences += s.divergences;
     }
