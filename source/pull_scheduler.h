@@ -23,21 +23,33 @@ namespace ff {
 // releasePullScheduler() once it no longer reads the device map — that call
 // frees the device buffers/streams/events and ends the scheduler's lifetime.
 //
+// Since the tasks-6+7 wheel pair the DEVICE map is the INTERNAL wheel-30
+// layout: mapBytes reports g.internalMapBytes (30 values per byte) and every
+// slab offset below is an INTERNAL-byte offset (slab s starts at
+// s*slabSizeBytes internal bytes = value 30*s*slabSizeBytes). The consumer
+// (GPU search) must treat devPtr contents accordingly.
+//
 // Until release, for every slab s in [0, ownerOf.size()):
 //   ownerOf[s] == deviceIndex  -> the slab's final bytes ALREADY sit on the
-//                                 device at devPtr + s*slabBytes: the producing
-//                                 kernels finished before the scheduler's
-//                                 post-join copy-stream fence drained;
+//                                 device at devPtr + s*slabSizeBytes: the
+//                                 producing kernels finished before the
+//                                 scheduler's post-join copy-stream fence
+//                                 drained;
 //   ownerOf[s] != deviceIndex  -> foreign-owned or homeless: the consumer must
-//                                 fill that slab's range from hostMap (H2D)
-//                                 before reading the map on the device.
-// hostMap itself is always produced complete, exactly as without residency —
-// its contents and contract are unchanged by the handoff.
+//                                 fill that slab's range from the host-side
+//                                 internal image (H2D) before reading the map
+//                                 on the device.
+// hostMap is produced complete on return of runPullScheduler, but in the
+// WHEEL shape: each slab's internal bytes land LEFT-ALIGNED at that slab's
+// canonical region start (hostMap + 15*(s*slabSizeBytes)/8). Call
+// expandSieveMapToCanonical() to convert the whole buffer back into the
+// canonical --dump-map format before any canonical consumer reads it.
 struct PullMapResidency {
     bool valid = false;          // true iff a handoff was granted (handle set)
     int deviceIndex = -1;        // logical index into the scheduler's devs
     uint8_t* devPtr = nullptr;   // contiguous map base on that device
-    uint64_t mapBytes = 0;       // usable bytes at devPtr (= g.mapBytes)
+    uint64_t mapBytes = 0;       // usable bytes at devPtr (= g.internalMapBytes,
+                                 // wheel-30 internal layout)
     std::vector<int> ownerOf;    // per-slab owning device idx, -1 = homeless
     void* handle = nullptr;      // opaque scheduler state; do not touch
 };
@@ -99,6 +111,21 @@ uint64_t runPullScheduler(const Config& cfg,
 // to call with valid=false / handle=nullptr (no-op) and idempotent (the
 // handle is cleared); *residency is invalidated.
 void releasePullScheduler(PullMapResidency* residency);
+
+// Converts a hostMap produced by runPullScheduler (per-slab left-aligned
+// wheel-30 internal bytes) IN PLACE into the canonical 16-values-per-byte
+// format, so --dump-map / GpuPrime / stdout contracts see exactly the bytes
+// the reference produces. Backward per-superblock widening: with internal
+// bytes landed at each slab's canonical region start, processing superblocks
+// back-to-front never clobbers unread input (write base of group s is
+// 15s ≥ 8s+8 = past every still-unread byte for s ≥ 2; groups 0 and 1 stage
+// their 16 source bytes through a temp first). Table-driven: four 65536-entry
+// uint64-pair tables map each 16-input-bit quarter-superblock onto its
+// pre-shifted 30-bit canonical image (~2 ops per input byte; built once).
+// Multithreaded over slabs; emits one "ff_sieve timing:" line for the pass.
+// slabSizeBytes must match the runPullScheduler call (8-byte aligned).
+void expandSieveMapToCanonical(uint8_t* hostMap, const LegGeometry& g,
+                               uint64_t slabSizeBytes);
 
 }  // namespace ff
 

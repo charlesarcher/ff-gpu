@@ -397,13 +397,16 @@ int runLeg(const ff::Config& cfg, const std::vector<std::string>& positionals)
     }
 
     // AGGREGATE sieve run-gate (Oracle round-3): sum(device backing) +
-    // host-tier-cap >= mapBytes(leg); host-tier-cap defaults to 0. The
-    // per-device predicate mapBytes+searchWorkspace <= budget remains the M4
-    // SEARCH-participation gate. Task 14b: when the gate fails and the user
-    // gave NO explicit host-tier choice (--host-tier-cap / --no-host-tier),
-    // the existing host overflow tier is auto-enabled ("--host-tier-cap
-    // auto") with a stderr notice instead of refusing; an explicit choice is
-    // always honored, including --no-host-tier's refusal.
+    // host-tier-cap >= mapBytes(leg); host-tier-cap defaults to 0. Since the
+    // tasks-6+7 wheel pair the SIEVE stores the INTERNAL wheel-30 map
+    // (30 values/byte), so the gate compares against g.internalMapBytes —
+    // amd@2097152 flips from refuse/auto-spill-completion to GPU-enabled BY
+    // DESIGN (internal ~8.55 GiB < its ~13.2 GiB backing). The per-device
+    // predicate internalMapBytes+searchWorkspace <= budget remains the M4
+    // SEARCH-participation gate. Task 14b auto-tier behavior unchanged in
+    // shape, now keyed on the internal size.
+    const unsigned long long internalBytes =
+        static_cast<unsigned long long>(g.internalMapBytes);
     unsigned long long hostTierBytes = cfg.hostTierCapBytes;
     unsigned long long capacity = aggregateBacking;
     if (hostTierBytes >
@@ -416,21 +419,23 @@ int runLeg(const ff::Config& cfg, const std::vector<std::string>& positionals)
                                   unsigned long long cap) {
         std::fprintf(stderr,
                      "[ff_sieve] aggregate: deviceBacking=%llu B (%s) "
-                     "hostTier=%llu B (%s) capacity=%llu B (%s) mapBytes=%llu B "
-                     "(%s) -> %s\n",
+                     "hostTier=%llu B (%s) capacity=%llu B (%s) "
+                     "internalMapBytes=%llu B (%s, wheel-30; canonical %llu B)"
+                     " -> %s\n",
                      static_cast<unsigned long long>(aggregateBacking),
                      ff::bytesToHuman(aggregateBacking).c_str(),
                      static_cast<unsigned long long>(ht),
                      ff::bytesToHuman(ht).c_str(),
                      static_cast<unsigned long long>(cap),
                      ff::bytesToHuman(cap).c_str(),
+                     internalBytes,
+                     ff::bytesToHuman(internalBytes).c_str(),
                      static_cast<unsigned long long>(g.mapBytes),
-                     ff::bytesToHuman(g.mapBytes).c_str(),
-                     cap >= g.mapBytes ? "GATE PASS" : "GATE FAIL");
+                     cap >= internalBytes ? "GATE PASS" : "GATE FAIL");
     };
     printAggregateLine(hostTierBytes, capacity);
 
-    if (capacity < g.mapBytes) {
+    if (capacity < internalBytes) {
         const bool explicitTierChoice = cfg.hasHostTierCap || cfg.noHostTier;
         const unsigned long long autoCap =
             explicitTierChoice ? 0 : hostTierAutoCapBytes();
@@ -440,7 +445,7 @@ int runLeg(const ff::Config& cfg, const std::vector<std::string>& positionals)
             remedied = std::numeric_limits<unsigned long long>::max();
         else
             remedied += autoCap;
-        if (remedied >= g.mapBytes) {
+        if (remedied >= internalBytes) {
             std::fprintf(stderr,
                          "[ff_sieve] note: aggregate capacity %llu B (%s) < map "
                          "%llu B (%s); auto-enabling the host overflow tier "
@@ -448,8 +453,8 @@ int runLeg(const ff::Config& cfg, const std::vector<std::string>& positionals)
                          "leg — pass --no-host-tier to refuse instead\n",
                          static_cast<unsigned long long>(capacity),
                          ff::bytesToHuman(capacity).c_str(),
-                         static_cast<unsigned long long>(g.mapBytes),
-                         ff::bytesToHuman(g.mapBytes).c_str(),
+                         internalBytes,
+                         ff::bytesToHuman(internalBytes).c_str(),
                          static_cast<unsigned long long>(autoCap),
                          ff::bytesToHuman(autoCap).c_str());
             hostTierBytes = autoCap;
@@ -460,12 +465,12 @@ int runLeg(const ff::Config& cfg, const std::vector<std::string>& positionals)
                          "[ff_sieve] ERROR: no device fits leg %llu (map %llu B = %s): "
                          "aggregate capacity %llu B (%s) < map %llu B (%s)\n",
                          static_cast<unsigned long long>(g.sumLimit),
-                         static_cast<unsigned long long>(g.mapBytes),
-                         ff::bytesToHuman(g.mapBytes).c_str(),
+                         internalBytes,
+                         ff::bytesToHuman(internalBytes).c_str(),
                          static_cast<unsigned long long>(capacity),
                          ff::bytesToHuman(capacity).c_str(),
-                         static_cast<unsigned long long>(g.mapBytes),
-                         ff::bytesToHuman(g.mapBytes).c_str());
+                         internalBytes,
+                         ff::bytesToHuman(internalBytes).c_str());
             std::fprintf(stderr,
                          "[ff_sieve] remediation: raise --vram-budget and/or "
                          "--host-tier-cap\n");
@@ -485,8 +490,10 @@ int runLeg(const ff::Config& cfg, const std::vector<std::string>& positionals)
     int plannedSearchDev = -1;
     if (cfg.gpuSearch && dumpMapFile.empty() && residencyToggleOn()) {
         const uint64_t oddSumsPlan = (g.sumLimit - g.sumStart) / 2 + 1;
+        // Wheel-30 (tasks 6+7): the device map is the INTERNAL layout, so the
+        // search-participation requirement uses g.internalMapBytes.
         const unsigned long long reqBytesPlan =
-            static_cast<unsigned long long>(mapBytes) +
+            internalBytes +
             static_cast<unsigned long long>(oddSumsPlan * sizeof(GpuRecord)) +
             static_cast<unsigned long long>(
                 ff::searchWorkspaceBytes(g.sumLimit));
@@ -536,6 +543,9 @@ maxPrimeMapValue = ff::runPullScheduler(cfg, r.devs, budgets, g,
 
     // --dump-map: write prime map to file and exit before search
     if (!dumpMapFile.empty()) {
+        // Wheel-30 (tasks 6+7): the dump contract stays CANONICAL — convert
+        // the per-slab internal image in place first.
+        ff::expandSieveMapToCanonical(hostMap.data(), g, cfg.slabSizeBytes);
         FILE* f = std::fopen(dumpMapFile.c_str(), "wb");
         if (!f) {
             std::fprintf(stderr,
@@ -597,8 +607,10 @@ maxPrimeMapValue = ff::runPullScheduler(cfg, r.devs, budgets, g,
             // diverge). allDevs is non-empty: runLeg returned earlier
             // otherwise, and DevInitFromDevices refuses empty lists.
             if (ffdev::DevInitFromDevices(allDevs) == 0) {
+                // Wheel-30 (tasks 6+7): participation math uses the INTERNAL
+                // map size — this is what flips amd@2097152 to GPU-enabled.
                 uint64_t requiredBytes =
-                    mapBytes + recordBytes + searchWorkspace;
+                    internalBytes + recordBytes + searchWorkspace;
 
                 // Restore full device list (sieve may have narrowed it).
                 r.devs = allDevs;
@@ -673,13 +685,13 @@ maxPrimeMapValue = ff::runPullScheduler(cfg, r.devs, budgets, g,
                 dPrimeMap.ptr = residency.devPtr;
                 std::fprintf(stderr,
                     "[ff_sieve] GPU search: residency handoff — reading the "
-                    "sieve-resident map in place on device[%d] %s (%llu B, "
-                    "no map H2D)\n",
+                    "sieve-resident wheel-30 map in place on device[%d] %s "
+                    "(%llu B internal, no map H2D)\n",
                     gpuDeviceIndex, r.devs[gpuDeviceIndex].name,
                     static_cast<unsigned long long>(residency.mapBytes));
             } else if (GpuSearchAlloc(r.devs[gpuDeviceIndex].runtimeIndex,
                                       r.devs[gpuDeviceIndex].vendor,
-                                      mapBytes, &dPrimeMap.ptr) != 0) {
+                                      internalBytes, &dPrimeMap.ptr) != 0) {
                 std::fprintf(stderr,
                     "[ff_sieve] GPU search: device allocation failed, using CPU fallback\n");
                 useGpu = false;
@@ -752,16 +764,22 @@ maxPrimeMapValue = ff::runPullScheduler(cfg, r.devs, budgets, g,
                                      recordBytes);
                 }
                 uint64_t fillSlabs = 0, fillBytes = 0;
+                // Wheel-30 (tasks 6+7): the host side holds per-slab
+                // LEFT-ALIGNED internal bytes; slab s lives at canonical
+                // region base 15*(s*slabB)/8 with cBi internal bytes, and the
+                // device slot is iOff = s*slabB internal bytes in.
                 const uint64_t slabB = cfg.slabSizeBytes;
                 for (uint64_t s = 0; s < residency.ownerOf.size(); ++s) {
                     if (residency.ownerOf[s] == residency.deviceIndex) continue;
-                    const uint64_t off = s * slabB;
-                    if (off >= mapBytes) break;
-                    const uint64_t cb = std::min(slabB, mapBytes - off);
-                    GpuSearchCopyH2D(ri, v, residency.devPtr + off,
-                                     hostMap.data() + off, cb);
+                    const uint64_t iOff = s * slabB;
+                    if (iOff >= g.internalMapBytes) break;
+                    const uint64_t cBi =
+                        std::min(slabB, g.internalMapBytes - iOff);
+                    const uint64_t cOff = (iOff / 8ull) * 15ull;
+                    GpuSearchCopyH2D(ri, v, residency.devPtr + iOff,
+                                     hostMap.data() + cOff, cBi);
                     ++fillSlabs;
-                    fillBytes += cb;
+                    fillBytes += cBi;
                 }
                 std::fprintf(stderr,
                     "[ff_sieve] GPU search: residency fill on device[%d] %s: "
@@ -776,7 +794,19 @@ maxPrimeMapValue = ff::runPullScheduler(cfg, r.devs, budgets, g,
                 std::fill(hRecords.begin(), hRecords.end(), GpuRecord{});
                 GpuSearchCopyH2D(ri, v, dRecords.ptr, hRecords.data(), recordBytes);
 
-                GpuSearchCopyH2D(ri, v, dPrimeMap.ptr, hostMap.data(), mapBytes);
+                // Wheel-30 (tasks 6+7): the host map holds per-slab
+                // LEFT-ALIGNED internal bytes, so the full-map upload becomes
+                // per-slab chunks (source = canonical region base, length =
+                // internal bytes; destination = contiguous internal offsets).
+                const uint64_t slabB = cfg.slabSizeBytes;
+                for (uint64_t s = 0; s * slabB < g.internalMapBytes; ++s) {
+                    const uint64_t iOff = s * slabB;
+                    const uint64_t cBi =
+                        std::min(slabB, g.internalMapBytes - iOff);
+                    const uint64_t cOff = (iOff / 8ull) * 15ull;
+                    GpuSearchCopyH2D(ri, v, dPrimeMap.ptr + iOff,
+                                     hostMap.data() + cOff, cBi);
+                }
             }
 
             if (GpuSearchAlloc(ri, v, smallPrimeCountGpu * sizeof(uint32_t), &dSmallPrimes.ptr) != 0) {
@@ -789,6 +819,13 @@ maxPrimeMapValue = ff::runPullScheduler(cfg, r.devs, budgets, g,
             gpuH2dMs = elapsedMs(tH2d);
             dumpPhaseTimer("search H2D copies", gpuH2dMs);
         }
+
+        // Wheel-30 (tasks 6+7): the GPU-search feed above consumed the
+        // per-slab internal bytes; EVERY other consumer (GpuPrime verdicts,
+        // CPU search, emission) needs the canonical layout, so convert in
+        // place now — strictly after the scheduler's post-join fence
+        // (runPullScheduler returned) and after the internal H2D reads.
+        ff::expandSieveMapToCanonical(hostMap.data(), g, cfg.slabSizeBytes);
 
         if (useGpu) {
             // Launch GPU search.  Dispatch by vendor: both runtimes number

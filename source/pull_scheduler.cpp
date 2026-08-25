@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -60,8 +61,9 @@ struct PerDevice {
 
 struct Shared {
     uint64_t numSlabs = 0;
-    uint64_t slabBytes = 0;
-    uint64_t totalMapBytes = 0;
+    uint64_t slabBytes = 0;           // INTERNAL bytes per slab (device-side)
+    uint64_t totalMapBytes = 0;       // INTERNAL map bytes (= g.internalMapBytes)
+    uint64_t spanValues = 0;          // value span covered by the map
     const uint32_t* kernelPrimes = nullptr;
     uint32_t kernelPrimeCount = 0;
     uint8_t* hostMap = nullptr;
@@ -167,56 +169,60 @@ void deviceWorker(Shared& sh, size_t i)
         uint64_t s = sh.nextSlab.fetch_add(1, std::memory_order_relaxed);
         if (s >= sh.numSlabs) break;
         ++d.pulled;
-        const uint64_t off = s * sh.slabBytes;
-        const uint64_t copyBytes = std::min(sh.slabBytes, sh.totalMapBytes - off);
-        const uint64_t segLo = s * sh.slabBytes * 16;
-        const uint64_t segHi = std::min(segLo + sh.slabBytes * 16, sh.totalMapBytes * 16);
+        // Wheel-30 internal currency: slab s covers internal bytes
+        // [s*slabBytes, ...) == values [30*s*slabBytes, ...). Device buffers
+        // hold internal bytes; hostMap receives them LEFT-ALIGNED inside the
+        // slab's canonical region (canonical byte of value segLo is
+        // segLo/16 == 15*off/8; slabSizeBytes % 8 == 0 keeps it integral).
+        const uint64_t off = s * sh.slabBytes;                  // internal B
+        const uint64_t copyBytes = std::min(sh.slabBytes,
+                                            sh.totalMapBytes - off);
+        const uint64_t segLo = off * 30ull;
+        uint64_t segHi = segLo + sh.slabBytes * 30ull;
+        if (segHi > sh.spanValues) segHi = sh.spanValues;
+        uint8_t* dest = sh.hostMap + (off / 8ull) * 15ull;      // canonical base
         const int owner = sh.ownerOf[s];
         int rc = 0;
         if (owner == static_cast<int>(i)) {
             void* buf = d.region[s - d.homeBase];
             // M3: async compute on computeStream, then async D2H into hostMap
             // on copyStream — this copy is the SOLE producer of hostMap for
-            // home slabs (the old assemble() re-copy is gone); runPullScheduler
-            // fences every copyStream after the join before anyone reads.
+            // home slabs; runPullScheduler fences every copyStream after the
+            // join before anyone reads.
             rc = d.ops->slabComputeAsync(ri, sh.kernelPrimes, sh.kernelPrimeCount,
-                                          segLo, segHi, buf, sh.slabBytes,
+                                          segLo, segHi, buf, copyBytes,
                                           d.computeStream, nullptr);
             if (rc == 0) {
                 // Record end of compute, then gate the copy stream on it
                 // BEFORE enqueueing the D2H — a wait enqueued after the copy
                 // on the same stream would gate nothing (stream ops run in
-                // enqueue order; the old assemble() re-copy used to mask
-                // exactly that race with a correct synchronous overwrite).
+                // enqueue order).
                 d.ops->recordEvent(ri, d.evEndA, d.computeStream);
                 rc = d.ops->waitEvent(ri, d.evEndA, d.copyStream);
                 if (rc == 0)
-                    rc = d.ops->copyD2HAsync(ri, sh.hostMap + off, buf,
+                    rc = d.ops->copyD2HAsync(ri, dest, buf,
                                              copyBytes, d.copyStream);
                 if (rc != 0) {
                     // Async path failed: synchronous fallback (error path
                     // only — poolCopyD2H device-syncs, so ordering holds).
-                    rc = d.ops->copyD2H(ri, sh.hostMap + off, buf, copyBytes);
+                    rc = d.ops->copyD2H(ri, dest, buf, copyBytes);
                 }
             }
         } else {
             ++d.staged;
             // Prime only the bytes this slab actually spans (the kernel never
-            // touches beyond ceil((segHi-segLo)/16) = copyBytes).
+            // touches beyond ceil((segHi-segLo)/30) = copyBytes).
             rc = d.ops->slabCompute(ri, sh.kernelPrimes, sh.kernelPrimeCount,
                                     segLo, segHi, d.stagingDev, copyBytes, 1);
             if (rc == 0 && owner < 0) {
                 // Homeless slab: straight into hostMap (sync copy
                 // self-completes before the API returns).
-                rc = d.ops->copyD2H(ri, sh.hostMap + off, d.stagingDev,
-                                    copyBytes);
+                rc = d.ops->copyD2H(ri, dest, d.stagingDev, copyBytes);
             } else if (rc == 0) {
                 // Foreign-owned slab: relay through the pinned host landing
                 // into the owner's resident buffer (kept for the task-12
                 // residency handoff), then enqueue the final D2H into hostMap
                 // on the OWNER's copyStream — the post-join fence drains it.
-                // Enqueueing from this thread is safe: the stream serializes,
-                // and slab destinations are disjoint.
                 const size_t oi = static_cast<size_t>(owner);
                 PerDevice& od = sh.devs[oi];
                 const int ori = od.dev->runtimeIndex;
@@ -226,14 +232,12 @@ void deviceWorker(Shared& sh, size_t i)
                 if (rc == 0)
                     rc = od.ops->copyH2D(ori, obuf, d.stagingHost, copyBytes);
                 if (rc == 0 && od.copyStream) {
-                    rc = od.ops->copyD2HAsync(ori, sh.hostMap + off, obuf,
+                    rc = od.ops->copyD2HAsync(ori, dest, obuf,
                                               copyBytes, od.copyStream);
                     if (rc != 0)   // enqueue failed: synchronous fallback
-                        rc = od.ops->copyD2H(ori, sh.hostMap + off, obuf,
-                                             copyBytes);
+                        rc = od.ops->copyD2H(ori, dest, obuf, copyBytes);
                 } else if (rc == 0) {
-                    rc = od.ops->copyD2H(ori, sh.hostMap + off, obuf,
-                                         copyBytes);
+                    rc = od.ops->copyD2H(ori, dest, obuf, copyBytes);
                 }
             }
         }
@@ -350,8 +354,19 @@ uint64_t runPullScheduler(const Config& cfg,
     // path tears down internally and lets the unique_ptr free the shell.
     std::unique_ptr<Shared> shp = std::make_unique<Shared>();
     Shared& sh = *shp;
-    sh.slabBytes = cfg.slabSizeBytes;
-    sh.totalMapBytes = g.mapBytes;
+    if (cfg.slabSizeBytes % 8ull != 0ull) {
+        // Wheel-30 requirement: slab edges must land on 8-internal-byte
+        // superblock groups so per-slab canonical region starts (15*off/8)
+        // stay integral and the backward in-place expansion stays safe.
+        std::fprintf(stderr,
+                     "[ff_sieve] error: --slab-size %llu B is not a multiple "
+                     "of 8 B (wheel-30 superblock group)\n",
+                     static_cast<unsigned long long>(cfg.slabSizeBytes));
+        return 0;
+    }
+    sh.slabBytes = cfg.slabSizeBytes;      // INTERNAL bytes per slab
+    sh.totalMapBytes = g.internalMapBytes;
+    sh.spanValues = g.mapBytes << 4;
     sh.numSlabs = (sh.totalMapBytes + sh.slabBytes - 1) / sh.slabBytes;
     if (sh.numSlabs == 0) sh.numSlabs = 1;
     sh.kernelPrimes = kernelPrimes;
@@ -459,7 +474,7 @@ uint64_t runPullScheduler(const Config& cfg,
         }
         for (uint64_t k = 0; k < d.homeCount; ++k) {
             const uint64_t s = d.homeBase + k;
-            const uint64_t off = s * sh.slabBytes;
+            const uint64_t off = s * sh.slabBytes;                 // internal B
             const uint64_t slabCap = std::min(sh.slabBytes,
                                               sh.totalMapBytes - off);
             if (d.ops->memset(ri, d.region[k], 0xff, slabCap) != 0) {
@@ -467,8 +482,27 @@ uint64_t runPullScheduler(const Config& cfg,
                 return 0;
             }
             if (s == 0) {
-                const uint8_t notOne = 0x7f;
+                // Value 1 is not prime: clear residue-slot 0 of byte 0
+                // (internal init 0xfe; was 0x7f in the canonical layout).
+                const uint8_t notOne = 0xfe;
                 if (d.ops->copyH2D(ri, d.region[k], &notOne, 1) != 0) {
+                    teardown(sh);
+                    return 0;
+                }
+            }
+            if (s + 1 == sh.numSlabs && slabCap > 0) {
+                // Zero the padding slots past the value span (task-5 internal
+                // contract: expansion and decode read them as "no residue").
+                uint8_t lastByte = 0xff;
+                const uint64_t base = (sh.totalMapBytes - 1) * 30ull;
+                for (unsigned r = 0; r < kWheelResidueCount; ++r)
+                    if (base + kWheelResidues[r] >= sh.spanValues)
+                        lastByte &= static_cast<uint8_t>(~(1u << r));
+                if (lastByte != 0xff &&
+                    d.ops->copyH2D(ri,
+                                   static_cast<uint8_t*>(d.region[k]) +
+                                       (slabCap - 1),
+                                   &lastByte, 1) != 0) {
                     teardown(sh);
                     return 0;
                 }
@@ -615,6 +649,167 @@ void releasePullScheduler(PullMapResidency* residency)
     residency->valid = false;
     residency->devPtr = nullptr;
     residency->ownerOf.clear();
+}
+
+// ---- Wheel-30 -> canonical boundary conversion (tasks 6+7 pair) ------------
+
+namespace {
+
+// One superblock = 8 internal bytes <-> 15 canonical bytes (lcm(30,16)=240
+// values). Split into four 16-bit quarters: quarter h holds internal bytes
+// 2h,2h+1, whose bits map onto canonical bit positions 30h..30h+29 (odd
+// value lv sits at MSB-first canonical bit (lv-1)/2; packed little-endian
+// position = (m & ~7) | (7-(m&7))). Each table entry is PRE-SHIFTED into its
+// final window position, so one superblock expands as 4 lookups + 4 ORs.
+struct ExpandTables {
+    uint64_t lo[4][65536];
+    uint64_t hi[4][65536];
+};
+
+ExpandTables* g_expandTables = nullptr;
+std::once_flag g_expandTablesOnce;
+
+void buildExpandTables()
+{
+    g_expandTables = new ExpandTables();
+    for (unsigned h = 0; h < 4; ++h) {
+        for (unsigned x = 0; x < 65536; ++x) {
+            uint64_t lo = 0, hi = 0;
+            if (x != 0) {
+                for (unsigned j = 0; j < 16; ++j) {
+                    if (!((x >> j) & 1u)) continue;
+                    const unsigned d = j >> 3, i = j & 7;
+                    const uint64_t lv =
+                        60ull * h + 30ull * d + kWheelResidues[i];
+                    const uint64_t m = (lv - 1) / 2;
+                    const uint64_t pos = (m & ~7ull) | (7ull - (m & 7ull));
+                    if (pos < 64) lo |= 1ull << pos;
+                    else          hi |= 1ull << (pos - 64);
+                }
+            }
+            g_expandTables->lo[h][x] = lo;
+            g_expandTables->hi[h][x] = hi;
+        }
+    }
+}
+
+// Backward IN-PLACE widening of one slab region: internal bytes occupy
+// [0, cBi) of `region`, canonical bytes [0, cBc) are produced over them.
+// Superblocks run back-to-front; group s writes [15s,15s+15) while every
+// still-unread source lies below 8s+8 <= 15s for s >= 2, so nothing is
+// clobbered; groups 0 and 1 stage their 16 source bytes first (their write
+// ranges reach down to 15 < 8+8). The trailing partial group (last slab of
+// the map only) is scalar-expanded FIRST, before any full-group write can
+// reach its source.
+void expandSlabInPlace(uint8_t* region, uint64_t cBc, uint64_t cBi,
+                       uint64_t spanSlab)
+{
+    std::call_once(g_expandTablesOnce, buildExpandTables);
+    const ExpandTables& t = *g_expandTables;
+
+    const uint64_t nG = cBi / 8;
+    const uint64_t tail = cBi % 8;
+    if (tail != 0) {
+        // Partial superblock nG: values [240*nG, spanSlab) -> canonical bytes
+        // [15*nG, cBc). Runs before the backward loop (its source would be
+        // overwritten otherwise: full-group writes reach 15*nG > 8*nG).
+        uint8_t win[15] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+        for (uint64_t q = 0; q < tail; ++q) {
+            const uint8_t b = region[8 * nG + q];
+            if (!b) continue;
+            for (unsigned i = 0; i < kWheelResidueCount; ++i) {
+                if (!((b >> i) & 1u)) continue;
+                const uint64_t lv = 240ull * nG + 30ull * q + kWheelResidues[i];
+                if (lv >= spanSlab) break;   // ascending residues: padding
+                const uint64_t m = (lv - 1) / 2;
+                win[(m >> 3) - 15 * nG] |=   // window-relative byte index
+                    static_cast<uint8_t>(0x80u >> (m & 7u));
+            }
+        }
+        const uint64_t outBytes = cBc - 15 * nG;
+        for (uint64_t j = 0; j < outBytes && j < 15; ++j)
+            region[15 * nG + j] = win[j];
+    }
+
+    if (nG == 0) return;
+    // Groups 0 and 1 read below their own write bases — stage them first.
+    uint8_t head[16];
+    const uint64_t headBytes = nG >= 2 ? 16 : (nG == 1 ? 8 : 0);
+    for (uint64_t j = 0; j < headBytes; ++j) head[j] = region[j];
+
+    for (uint64_t s = nG; s-- > 0;) {
+        const uint8_t* src;
+        uint8_t single[8];
+        if (s >= 2) {
+            src = region + 8 * s;
+        } else {
+            for (uint64_t j = 0; j < 8; ++j) single[j] = head[8 * s + j];
+            src = single;
+        }
+        uint64_t Q;
+        std::memcpy(&Q, src, 8);
+        const uint64_t lo = t.lo[0][Q & 0xffffu] |
+                            t.lo[1][(Q >> 16) & 0xffffu] |
+                            t.lo[2][(Q >> 32) & 0xffffu] |
+                            t.lo[3][(Q >> 48) & 0xffffu];
+        const uint64_t hi = t.hi[0][Q & 0xffffu] |
+                            t.hi[1][(Q >> 16) & 0xffffu] |
+                            t.hi[2][(Q >> 32) & 0xffffu] |
+                            t.hi[3][(Q >> 48) & 0xffffu];
+        std::memcpy(region + 15 * s, &lo, 8);
+        std::memcpy(region + 15 * s + 8, &hi, 7);
+    }
+}
+
+void expandSlabRange(uint8_t* hostMap, const LegGeometry& g,
+                     uint64_t slabSizeBytes, uint64_t sBegin, uint64_t sEnd)
+{
+    const uint64_t internalTotal = g.internalMapBytes;
+    const uint64_t span = g.mapBytes << 4;
+    const uint64_t numSlabs =
+        (internalTotal + slabSizeBytes - 1) / slabSizeBytes;
+    for (uint64_t s = sBegin; s < sEnd && s < numSlabs; ++s) {
+        const uint64_t iOff = s * slabSizeBytes;
+        const uint64_t cBi = std::min(slabSizeBytes, internalTotal - iOff);
+        const uint64_t segLo = iOff * 30ull;
+        uint64_t segHi = segLo + slabSizeBytes * 30ull;
+        if (segHi > span) segHi = span;
+        const uint64_t cBc = (segHi - segLo + 15ull) / 16ull;
+        expandSlabInPlace(hostMap + (iOff / 8ull) * 15ull, cBc, cBi,
+                          segHi - segLo);
+    }
+}
+
+}  // namespace
+
+void expandSieveMapToCanonical(uint8_t* hostMap, const LegGeometry& g,
+                               uint64_t slabSizeBytes)
+{
+    if (hostMap == nullptr || g.internalMapBytes == 0) return;
+    const auto t0 = std::chrono::steady_clock::now();
+    const uint64_t numSlabs =
+        (g.internalMapBytes + slabSizeBytes - 1) / slabSizeBytes;
+    unsigned hw = std::thread::hardware_concurrency();
+    if (hw == 0) hw = 4;
+    const unsigned nThreads =
+        static_cast<unsigned>(std::min<uint64_t>(hw, numSlabs));
+    std::vector<std::thread> pool;
+    pool.reserve(nThreads);
+    for (unsigned t = 0; t < nThreads; ++t) {
+        const uint64_t sBegin = numSlabs * t / nThreads;
+        const uint64_t sEnd = numSlabs * (t + 1) / nThreads;
+        if (sEnd > sBegin)
+            pool.emplace_back(expandSlabRange, hostMap, std::cref(g),
+                              slabSizeBytes, sBegin, sEnd);
+    }
+    for (auto& th : pool) th.join();
+    // Structural primes 3 and 5 survive wheel-30 unrepresented; the expansion
+    // rebuilds every byte from scratch, so re-insert them (byte 0, bits
+    // 0x40|0x20). Value 1 arrives cleared through the internal 0xfe init.
+    hostMap[0] |= static_cast<uint8_t>(0x60u);
+    const double ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - t0).count();
+    std::fprintf(stderr, "ff_sieve timing: wheel expansion = %.3f ms\n", ms);
 }
 
 }  // namespace ff
