@@ -480,7 +480,9 @@ int runLeg(const ff::Config& cfg, const std::vector<std::string>& positionals)
 
     // Allocate host map
     uint64_t mapBytes = (g.maxPrimeMapValue + 1 + 15) >> 4;
+    auto tHostMapFill = std::chrono::steady_clock::now();
     std::vector<uint8_t> hostMap(mapBytes, 0);
+    dumpPhaseTimer("hostmap zero-fill", elapsedMs(tHostMapFill));
 
     // Residency planning, BEFORE the sieve: pick the GPU-search device now
     // (pure budget math via selectSearchDevice) and ask the scheduler to
@@ -740,6 +742,10 @@ maxPrimeMapValue = ff::runPullScheduler(cfg, r.devs, budgets, g,
         // the GPU path's early return 0 below.
         double gpuH2dMs = 0.0;
 
+        // A2(c): search device setup — device init / selectSearchDevice /
+        // GpuSearchAlloc segment, t_search(:588) up to the tH2d marker below.
+        dumpPhaseTimer("search device setup", elapsedMs(t_search));
+
         if (useGpu) {
             auto tH2d = std::chrono::steady_clock::now();
             int ri = r.devs[gpuDeviceIndex].runtimeIndex;
@@ -858,7 +864,10 @@ maxPrimeMapValue = ff::runPullScheduler(cfg, r.devs, budgets, g,
 
                 // The launch synchronized internally, so the resident map has
                 // been fully consumed — end the deferred scheduler lifetime.
+                auto tSchedTeardown = std::chrono::steady_clock::now();
                 if (residency.valid) ff::releasePullScheduler(&residency);
+                dumpPhaseTimer("scheduler teardown",
+                               elapsedMs(tSchedTeardown));
 
                 std::cout.flush();
                 auto t1 = std::chrono::high_resolution_clock::now();
@@ -869,11 +878,14 @@ maxPrimeMapValue = ff::runPullScheduler(cfg, r.devs, budgets, g,
                     std::chrono::duration<double, std::milli>(t2 - t1).count();
                 dumpPhaseTimer("search emit", emitMs);
 
+                auto tDevTeardown = std::chrono::steady_clock::now();
                 GpuSearchFree(gpuDeviceIndex, r.devs[gpuDeviceIndex].vendor, dSmallPrimes.ptr);
                 GpuSearchFree(gpuDeviceIndex, r.devs[gpuDeviceIndex].vendor, dRecords.ptr);
                 GpuSearchFree(gpuDeviceIndex, r.devs[gpuDeviceIndex].vendor, dAtomic.ptr);
                 if (primeMapOwned)
                     GpuSearchFree(gpuDeviceIndex, r.devs[gpuDeviceIndex].vendor, dPrimeMap.ptr);
+                dumpPhaseTimer("search device teardown",
+                               elapsedMs(tDevTeardown));
 
                 // Print timing (stdout, byte-exact)
                 uint64_t searchUs = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
