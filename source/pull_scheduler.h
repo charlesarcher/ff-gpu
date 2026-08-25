@@ -130,6 +130,10 @@ void releasePullScheduler(PullMapResidency* residency);
 // iff i <= G'-1), windows partition each region exactly and regions partition
 // the map, so every canonical byte is written exactly once. Pool size =
 // min(hardware_concurrency [FF_EXPANSION_THREADS env cap], work items).
+// If the arena allocation fails under memory pressure, the expansion falls
+// back to the zero-extra-memory region-grain in-place schedule instead of
+// leaving the map unconverted — the canonical contract always holds on
+// return.
 // Table-driven: four 65536-entry uint64-pair tables map each 16-input-bit
 // quarter-superblock onto its pre-shifted 30-bit canonical image (~2 ops per
 // input byte; built once). Multithreaded over tiles; the caller owns the pass

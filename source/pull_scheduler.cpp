@@ -951,10 +951,30 @@ void expandSieveMapToCanonical(uint8_t* hostMap, const LegGeometry& g,
     try {
         arena.reset(new uint8_t[g.internalMapBytes]);
     } catch (const std::bad_alloc&) {
+        // Memory-pressure fallback: widen every region IN PLACE (the
+        // zero-extra-memory region-grain schedule). The map MUST end
+        // canonical — bailing out here would hand internal-layout bytes to
+        // canonical consumers (dump-map, CPU search) with rc=0.
         std::fprintf(stderr,
-                     "[ff_sieve] error: expansion scratch alloc failed "
-                     "(%llu B)\n",
+                     "[ff_sieve] expansion: scratch alloc failed (%llu B) — "
+                     "falling back to in-place region-grain widening\n",
                      static_cast<unsigned long long>(g.internalMapBytes));
+        std::atomic<uint64_t> nextRegion{0};
+        std::vector<std::thread> fallback;
+        const unsigned nFallback =
+            static_cast<unsigned>(std::min<uint64_t>(hw, numSlabs));
+        auto widenNext = [&] {
+            uint64_t s;
+            while ((s = nextRegion.fetch_add(1, std::memory_order_relaxed)) <
+                   numSlabs)
+                expandSlabInPlace(regions[s].base, regions[s].cBc,
+                                  regions[s].cBi, regions[s].spanSlab);
+        };
+        for (unsigned t = 1; t < nFallback; ++t)
+            fallback.emplace_back(widenNext);
+        widenNext();   // main thread joins the dispenser pool
+        for (auto& th : fallback) th.join();
+        hostMap[0] |= static_cast<uint8_t>(0x60u);
         return;
     }
     std::atomic<uint64_t> nextItem{0};
