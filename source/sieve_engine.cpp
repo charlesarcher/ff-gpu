@@ -59,8 +59,8 @@ uint64_t isqrt64(uint64_t x) {
     return r;
 }
 
-// Wheel-30 structural strip sanity (task 5, INERT): compile-time checks only
-// — nothing here touches the live list build; see sieve_engine.h.
+// Wheel-30 structural strip sanity (tasks 6+7 pair: strip is LIVE for the
+// kernel marking list — see kernelPrimes()).
 static_assert(kWheelStructuralPrimeCount == 3,
               "wheel-30 structural strip is exactly {2,3,5}");
 static_assert(kWheelStructuralPrimes[0] == 2 && kWheelStructuralPrimes[1] == 3 &&
@@ -101,17 +101,13 @@ uint64_t SieveEngine::run(uint64_t sumLimit, uint8_t* hostMap)
     }
 
     // ---- 4. Dispatch to per-arch full-map engine run ----
-    // Reference Prime::SegmentFill's smallPrimes list excludes 2; the CPU
-    // search's list keeps it (primes[0]=2, search indexes primes[2]=5).  Skip
-    // the leading 2 for the kernel: with p=2 its odd-only adjustment is a
-    // no-op, so it clears every value == 2 (mod 4), wiping all ==3 (mod 4)
-    // primes from the map.
-    // Wheel-30 note (task 5): under the FUTURE wheel kernel (task 7) this
-    // marking list additionally drops kWheelStructuralPrimes {3,5}; today the
-    // strip is INERT and the list content below is unchanged.
+    // Wheel marking list (tasks 6+7 pair): skip the whole {2,3,5} structural
+    // strip — the wheel-30 kernel's modulus covers them (sieve_slab_kernel.h).
+    // The search list (getSmallPrimes) keeps all primes.
     const uint32_t* kernelPrimes = smallPrimes_.data();
     uint32_t kernelPrimeCount = static_cast<uint32_t>(smallPrimes_.size());
-    if (kernelPrimeCount > 1 && kernelPrimes[0] == 2) {
+    while (kernelPrimeCount > 0 &&
+           isWheelStructuralPrime(kernelPrimes[0])) {
         ++kernelPrimes;
         --kernelPrimeCount;
     }
@@ -141,15 +137,15 @@ uint64_t SieveEngine::prepare(uint64_t sumLimit)
     // isqrt((mapBytes<<4)-1) — same geometry chain as everywhere else.  At 2M
     // this halves the H2D upload (~328 KB → ~172 KB).  The search phase keeps
     // reading the FULL list through getSmallPrimes().
-    // (Task 5: the {2,3,5} wheel strip is NOT applied here — inert until the
-    // task-7 wheel kernel; getSmallPrimes()/kernelPrimes() content unchanged.)
+    // (Tasks 6+7 pair: the {2,3,5} wheel strip IS applied to the kernel
+    // marking list — see kernelPrimes(); getSmallPrimes() content unchanged.)
     const uint64_t kernelPrimeMax = isqrt64((geom.mapBytes << 4) - 1);
     uint32_t kCount = 0;
     for (uint32_t v : smallPrimes_) {
         if (static_cast<uint64_t>(v) > kernelPrimeMax) break;
+        if (isWheelStructuralPrime(v)) continue;   // structural: never uploaded
         ++kCount;
     }
-    if (kCount > 0 && smallPrimes_[0] == 2) --kCount;  // kernel skips leading 2
     kernelPrimeCount_ = kCount;
     return geom.maxPrimeMapValue;
 }
@@ -158,7 +154,7 @@ const uint32_t* SieveEngine::kernelPrimes(uint32_t* count) const
 {
     const uint32_t* p = smallPrimes_.data();
     uint32_t n = static_cast<uint32_t>(smallPrimes_.size());
-    if (n > 1 && p[0] == 2) {
+    while (n > 0 && isWheelStructuralPrime(p[0])) {
         ++p;
         --n;
     }

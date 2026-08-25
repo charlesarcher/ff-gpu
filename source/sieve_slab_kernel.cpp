@@ -66,13 +66,23 @@ extern "C" int SIEVE_SLAB_RUN_NAME(int deviceIndex,
                                    uint64_t segLo, uint64_t segHi,
                                    uint8_t* h_out)
 {
-    // Map size in bytes from global value 0 up to segHi.
-    const uint64_t mapBytes = (segHi + 15u) >> 4;
+    // Wheel-30 INTERNAL layout: the slab result occupies
+    // bufMin = ceil((segHi-segLo)/30) bytes, segLo-relative. The scratch
+    // buffer is sized over [0, segHi) like the canonical harness was.
+    const uint64_t mapBytes = (segHi + 29u) / 30u;
 
-    // ---- 1. Host-side slab init: memset 0xff, clear bit-0 if range starts at 0 ----
+    // ---- 1. Host-side slab init: memset 0xff; byte0 0xfe iff range starts
+    //         at 0 (value 1 not prime); last byte's padding slots zeroed ----
     std::vector<uint8_t> h_init(mapBytes, 0xff);
     if (segLo == 0) {
-        h_init[0] ^= 0x80u;   // 1 is not prime
+        h_init[0] = 0xfeu;
+    }
+    {
+        const uint64_t bufMin = ((segHi - segLo) + 29u) / 30u;
+        const uint64_t base = segLo + (bufMin - 1) * 30ull;
+        for (unsigned r = 0; r < ff::kWheelResidueCount; ++r)
+            if (base + ff::kWheelResidues[r] >= segHi)
+                h_init[bufMin - 1] &= static_cast<uint8_t>(~(1u << r));
     }
 
     // ---- 2. Allocate device slab buffer ----
@@ -92,9 +102,11 @@ extern "C" int SIEVE_SLAB_RUN_NAME(int deviceIndex,
 
     // ---- 5. Launch kernel ----
     // Flat block grid: each sub-block uses kSieveBlocksPerSubBlock blocks.
+    // Grid covers the slab's internal-byte extent: ceil(span/30) bytes.
     const uint64_t numValues = segHi - segLo;
+    const uint64_t bufMinBytes = (numValues + 29u) / 30u;
     const uint32_t numSubBlocks = static_cast<uint32_t>(
-        (numValues + kSieveSubBlockSize - 1) / kSieveSubBlockSize);
+        (bufMinBytes + kSieveSubBlockSize - 1) / kSieveSubBlockSize);
     const uint32_t totalBlocks = numSubBlocks * kSieveBlocksPerSubBlock;
 
     hipLaunchKernelGGL(SIEVE_SLAB_KERNEL,
@@ -103,9 +115,13 @@ extern "C" int SIEVE_SLAB_RUN_NAME(int deviceIndex,
     SLAB_HIP_CHECK(hipGetLastError());
     SLAB_HIP_CHECK(hipDeviceSynchronize());
 
-    // ---- 6. Copy full map back to host ----
-    SLAB_HIP_CHECK(hipMemcpy(h_out, d_map, mapBytes,
-                             hipMemcpyDeviceToHost));
+    // ---- 6. Copy the slab result back (exactly bufMin internal bytes,
+    //         matching the per-slab right-sized production buffers) ----
+    {
+        const uint64_t bufMin = ((segHi - segLo) + 29u) / 30u;
+        SLAB_HIP_CHECK(hipMemcpy(h_out, d_map, bufMin,
+                                 hipMemcpyDeviceToHost));
+    }
 
     // ---- 7. Cleanup ----
     (void)hipFree(d_primes);

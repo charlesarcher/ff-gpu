@@ -5,8 +5,9 @@
 //
 // Slab configuration:
 //   SLAB_SIZE_BYTES  = 1 GiB  (1 << 30)
-//   values per slab  = SLAB_SIZE_BYTES * 16 = 1 << 34
-//   slab k covers    [k * (1<<34), (k+1) * (1<<34))
+//   values per slab  = SLAB_SIZE_BYTES * 30 (wheel-30 internal bytes)
+//   slab k covers    [k * SLAB_SIZE_BYTES internal bytes, ...) in values
+//                     [30*k*(1<<30), 30*(k+1)*(1<<30))
 //
 // At 2M the full map is ~16 GiB → 16 full slabs + 1 truncated slab (16 values)
 // = 17 launches of SieveSlabKernel.
@@ -123,12 +124,20 @@ extern "C" int SIEVE_ENGINE_RUN_NAME(int deviceIndex,
     (void)hipGetDevice(&prevDev);
     ENGINE_HIP_CHECK(hipSetDevice(deviceIndex));
 
-    // ---- 0b. Total map size in bytes ----
-    const uint64_t totalMapBytes = (maxPrimeMapValue + 1 + 15u) >> 4;
+    // ---- 0b. Total map size in bytes (wheel-30 INTERNAL layout) ----
+    const uint64_t totalMapBytes = ff::internalMapBytes(maxPrimeMapValue + 1);
 
-    // ---- 1. Host-side init buffer: all 0xff, clear bit-0 (value 1 not prime) ----
+    // ---- 1. Host-side init buffer: all 0xff, byte0 0xfe (value 1 not prime:
+    //         residue-slot 0 cleared), last byte's padding slots zeroed ----
     std::vector<uint8_t> h_init(totalMapBytes, 0xff);
-    h_init[0] ^= 0x80u;   // bit 0 of value 0 is index bit 0 → clear for value 1
+    h_init[0] = 0xfeu;
+    {
+        const uint64_t base = (totalMapBytes - 1) * 30ull;
+        for (unsigned r = 0; r < ff::kWheelResidueCount; ++r)
+            if (base + ff::kWheelResidues[r] > maxPrimeMapValue)
+                h_init[totalMapBytes - 1] &=
+                    static_cast<uint8_t>(~(1u << r));
+    }
 
     // ---- 1b. Per-slab device allocations ----
     // Each slab covers SLAB_SIZE_BYTES*16 values; bytes per slab = SLAB_SIZE_BYTES.
@@ -156,7 +165,7 @@ extern "C" int SIEVE_ENGINE_RUN_NAME(int deviceIndex,
 
     // ---- 3. Loop over slabs ----
     uint64_t segLo = 0;
-    uint64_t segHi = SLAB_SIZE_BYTES * 16;   // values per slab
+    uint64_t segHi = SLAB_SIZE_BYTES * 30;   // values per slab (internal bytes)
     uint64_t ceiling = maxPrimeMapValue + 1;
     uint64_t slabIdx = 0;
 
@@ -164,9 +173,12 @@ extern "C" int SIEVE_ENGINE_RUN_NAME(int deviceIndex,
         if (segHi > ceiling) segHi = ceiling;
 
         // Launch SieveSlabKernel for this slab, passing this slab's device ptr.
+        // Grid covers the slab's INTERNAL-byte extent: ceil(span/30) bytes,
+        // then ceil to the byte-currency sub-block size.
         const uint64_t numValues = segHi - segLo;
+        const uint64_t bufMinBytes = (numValues + 29) / 30;
         const uint32_t numSubBlocks = static_cast<uint32_t>(
-            (numValues + kSieveSubBlockSize - 1) / kSieveSubBlockSize);
+            (bufMinBytes + kSieveSubBlockSize - 1) / kSieveSubBlockSize);
         const uint32_t totalBlocks = numSubBlocks * kSieveBlocksPerSubBlock;
 
         hipLaunchKernelGGL(SIEVE_SLAB_KERNEL,
@@ -177,8 +189,8 @@ extern "C" int SIEVE_ENGINE_RUN_NAME(int deviceIndex,
 
         // Advance to next slab.
         segLo = segHi;
-        segHi += SLAB_SIZE_BYTES * 16;
-        if (segHi > ceiling + SLAB_SIZE_BYTES * 16)
+        segHi += SLAB_SIZE_BYTES * 30;
+        if (segHi > ceiling + SLAB_SIZE_BYTES * 30)
             segHi = ceiling;   // guard against overflow
         ++slabIdx;
     }
@@ -285,8 +297,22 @@ int poolSlabCompute(int vendorIndex, const uint32_t* h_primes, uint32_t numPrime
     if (primeSlab) {
         POOL_HIP_CHECK(hipMemset(d_slab, 0xff, slabBytes));
         if (segLo == 0) {
-            const uint8_t notOne = 0x7f;   // 0xff with bit-0 clear (value 1)
+            const uint8_t notOne = 0xfe;   // residue-slot 0 clear: value 1
             POOL_HIP_CHECK(hipMemcpy(d_slab, &notOne, 1, hipMemcpyHostToDevice));
+        }
+        // Zero padding slots past segHi in this staging buffer's last byte
+        // (task-5 internal contract; expansion/decode read them).
+        const uint64_t bufMin = ((segHi - segLo) + 29) / 30;
+        if (bufMin > 0 && bufMin <= slabBytes) {
+            uint8_t lastByte = 0xff;
+            const uint64_t base = segLo + (bufMin - 1) * 30;
+            for (unsigned r = 0; r < ff::kWheelResidueCount; ++r)
+                if (base + ff::kWheelResidues[r] >= segHi)
+                    lastByte &= static_cast<uint8_t>(~(1u << r));
+            if (lastByte != 0xff)
+                POOL_HIP_CHECK(hipMemcpy(
+                    static_cast<uint8_t*>(d_slab) + (bufMin - 1), &lastByte,
+                    1, hipMemcpyHostToDevice));
         }
     }
 
@@ -297,8 +323,9 @@ int poolSlabCompute(int vendorIndex, const uint32_t* h_primes, uint32_t numPrime
                              hipMemcpyHostToDevice));
 
     const uint64_t numValues = segHi - segLo;
+    const uint64_t bufMinBytes = (numValues + 29) / 30;
     const uint32_t numSubBlocks = static_cast<uint32_t>(
-        (numValues + kSieveSubBlockSize - 1) / kSieveSubBlockSize);
+        (bufMinBytes + kSieveSubBlockSize - 1) / kSieveSubBlockSize);
     const uint32_t totalBlocks = numSubBlocks * kSieveBlocksPerSubBlock;
 
     hipLaunchKernelGGL(SIEVE_SLAB_KERNEL,
@@ -434,8 +461,9 @@ int poolSlabComputeAsync(int vendorIndex, const uint32_t* h_primes, uint32_t num
         g_primeVendor = vendorIndex;
     }
     const uint64_t numValues = segHi - segLo;
+    const uint64_t bufMinBytes = (numValues + 29) / 30;
     const uint32_t numSubBlocks = static_cast<uint32_t>(
-        (numValues + kSieveSubBlockSize - 1) / kSieveSubBlockSize);
+        (bufMinBytes + kSieveSubBlockSize - 1) / kSieveSubBlockSize);
     const uint32_t totalBlocks = numSubBlocks * kSieveBlocksPerSubBlock;
     hipLaunchKernelGGL(SIEVE_SLAB_KERNEL, dim3(totalBlocks), dim3(kSieveThreadsPerBlock), 0, cs,
                        g_dPrimes, numPrimes, segLo, segHi,

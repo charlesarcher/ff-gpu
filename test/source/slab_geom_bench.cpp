@@ -37,30 +37,44 @@
 #include <vector>
 
 // ---------------------------------------------------------------------------
-// CPU reference — BYTE-EXACT copy of segmentedSieve.C:253-268 (Prime::SegmentFill),
-// same renaming-#define pattern as slab_cmp.cpp.
+// CPU wheel-30 TWIN reference (tasks 6+7 pair): same independent filler as
+// slab_cmp.cpp — brute-force multiples with explicit coprimality filtering,
+// no shared tables with the kernel. Task 9 productionizes this harness.
 // ---------------------------------------------------------------------------
 
-#define SEGMENT_FILL_RENAME REF_CPU_SegmentFill
-
-void SEGMENT_FILL_RENAME(const uint64_t segLo, const uint64_t segHi,
-                         const uint32_t* const primeList,
-                         const uint32_t numList,
-                         unsigned char* const primeMap)
+static bool coprime30(uint64_t x)
 {
-    const uint64_t subBlockSize=1<<19;
-    for (uint64_t bLo=segLo; bLo<segHi; bLo+=subBlockSize)
-    {uint64_t bHi=bLo+subBlockSize;
-     if (bHi>segHi) bHi=segHi;
-     for (uint32_t k=0; k<numList; ++k)
-      {uint64_t p=primeList[k];
-       if (p*p>=bHi) break;
-       uint64_t first=((bLo+p-1)/p)*p;
-       if (first<p*p) first=p*p;
-       if (!(first&1)) first+=p;
-       for (uint64_t i=first; i<bHi; i+=p<<1)
-         primeMap[i>>4]&=~(0x80>>(i>>1&7));
-      }
+    return x % 2 != 0 && x % 3 != 0 && x % 5 != 0;
+}
+
+static unsigned slotOfResidue(uint64_t r)
+{
+    static const uint64_t res[8] = {1, 7, 11, 13, 17, 19, 23, 29};
+    for (unsigned i = 0; i < 8; ++i)
+        if (res[i] == r) return i;
+    return 8;
+}
+
+static void REF_WHEEL_Fill(const uint64_t segLo, const uint64_t segHi,
+                           const uint32_t* const primeList,
+                           const uint32_t numList,
+                           uint8_t* const internalMap)
+{
+    const uint64_t bufMin = ((segHi - segLo) + 29) / 30;
+    for (uint32_t k = 0; k < numList; ++k) {
+        const uint64_t p = primeList[k];
+        if (p < 7) continue;
+        if (p * p >= segHi) break;
+        for (uint64_t t = 1;; ++t) {
+            if (!coprime30(t)) continue;
+            const uint64_t v = p * t;
+            if (v >= segHi) break;
+            if (v < p * p) continue;
+            const uint64_t rel = v / 30 - segLo / 30;
+            if (rel >= bufMin) continue;
+            internalMap[rel] &=
+                static_cast<uint8_t>(~(1u << slotOfResidue(v % 30)));
+        }
     }
 }
 
@@ -95,6 +109,14 @@ static std::vector<uint32_t> generateSmallPrimes(uint64_t limit)
             primes.push_back(static_cast<uint32_t>(p));
 
     return primes;
+}
+
+static std::vector<uint32_t> stripStructural(const std::vector<uint32_t>& in)
+{
+    std::vector<uint32_t> out;
+    for (uint32_t p : in)
+        if (p >= 7) out.push_back(p);
+    return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -175,7 +197,7 @@ static void emitRow(const char* kind, int rep, double ms)
 {
     std::printf("%s,%d,%llu,%u,%u,%s,%d,%.3f\n",
                 kArchName, FF_SIEVE_SUB_BLOCK_LOG2,
-                (unsigned long long)kSieveValuesPerThread,
+                (unsigned long long)kSieveBytesPerThread,
                 kSieveBlocksPerSubBlock, kSieveThreadsPerBlock,
                 kind, rep, ms);
     std::fflush(stdout);
@@ -193,10 +215,10 @@ int main(int argc, char** argv)
     }
     if (reps < 1) reps = 1;
 
-    // Fixed 1-GiB region: [0, 2^34) values -> 2^30 map bytes.
+    // Fixed region: [0, 2^34) values -> wheel-30 internal map bytes.
     const uint64_t segLo = 0;
     const uint64_t segHi = 1ull << 34;
-    const uint64_t mapBytes = (segHi + 15u) >> 4;
+    const uint64_t mapBytes = (segHi + 29u) / 30u;
 
     char devName[256] = {0};
     int dev = -1;
@@ -205,24 +227,43 @@ int main(int argc, char** argv)
         return 0;
     }
 
-    // ---- primes + CPU reference (cached) ----
-    std::vector<uint32_t> primes = generateSmallPrimes(segHi);
+    // ---- primes + CPU reference (cached; wheel layout gets its own cache
+    //      file so stale canonical caches can never be loaded) ----
+    std::vector<uint32_t> primes =
+        stripStructural(generateSmallPrimes(segHi));
     std::vector<uint8_t> h_ref(mapBytes, 0xff);
-    h_ref[0] ^= 0x80;   // value 1 is not prime
+    h_ref[0] = 0xfe;   // value 1 is not prime (residue-slot 0)
+    {
+        const uint64_t bufMin = (segHi + 29u) / 30u;
+        const uint64_t base = segLo + (bufMin - 1) * 30ull;
+        static const uint64_t res[8] = {1, 7, 11, 13, 17, 19, 23, 29};
+        for (unsigned r = 0; r < 8; ++r)
+            if (base + res[r] >= segHi)
+                h_ref[bufMin - 1] &= static_cast<uint8_t>(~(1u << r));
+    }
 
     if (cachePath.empty()) {
-        cachePath = "/tmp/ff_slab_geom_refcache_" + std::to_string(segHi) + ".bin";
+        cachePath = "/tmp/ff_slab_geom_refcache_w30_" +
+                    std::to_string(segHi) + ".bin";
     }
     if (!loadRefCache(cachePath, h_ref)) {
-        REF_CPU_SegmentFill(segLo, segHi, primes.data(),
-                            static_cast<uint32_t>(primes.size()), h_ref.data());
+        REF_WHEEL_Fill(segLo, segHi, primes.data(),
+                       static_cast<uint32_t>(primes.size()), h_ref.data());
         storeRefCache(cachePath, h_ref);
     }
 
     // ---- device buffers ----
     BENCH_HIP_CHECK(hipSetDevice(dev));
     std::vector<uint8_t> h_init(mapBytes, 0xff);
-    h_init[0] ^= 0x80;
+    h_init[0] = 0xfe;
+    {
+        const uint64_t bufMin = (segHi + 29u) / 30u;
+        const uint64_t base = segLo + (bufMin - 1) * 30ull;
+        static const uint64_t res[8] = {1, 7, 11, 13, 17, 19, 23, 29};
+        for (unsigned r = 0; r < 8; ++r)
+            if (base + res[r] >= segHi)
+                h_init[bufMin - 1] &= static_cast<uint8_t>(~(1u << r));
+    }
 
     uint8_t* d_map = nullptr;
     BENCH_HIP_CHECK(hipMalloc(&d_map, mapBytes));
@@ -233,10 +274,12 @@ int main(int argc, char** argv)
     BENCH_HIP_CHECK(hipMalloc(&d_primes, primeBytes));
     BENCH_HIP_CHECK(hipMemcpy(d_primes, primes.data(), primeBytes, hipMemcpyHostToDevice));
 
-    // Grid math identical to the engine's launch loop, from the same table.
+    // Grid math identical to the engine's launch loop, from the same table
+    // (internal-byte currency: ceil(span/30) bytes covered).
     const uint64_t numValues = segHi - segLo;
+    const uint64_t bufMinBytes = (numValues + 29u) / 30u;
     const uint32_t numSubBlocks = static_cast<uint32_t>(
-        (numValues + kSieveSubBlockSize - 1) / kSieveSubBlockSize);
+        (bufMinBytes + kSieveSubBlockSize - 1) / kSieveSubBlockSize);
     const uint32_t totalBlocks = numSubBlocks * kSieveBlocksPerSubBlock;
 
     hipEvent_t ev0, ev1;
@@ -245,11 +288,11 @@ int main(int argc, char** argv)
 
     std::vector<uint8_t> h_gpu(mapBytes);
     std::printf("# arch=%s dev=%d (%s) segHi=%llu mapBytes=%llu primes=%zu "
-                "subLog2=%d vpt=%llu bps=%u tpb=%u blocks=%u\n",
+                "subLog2=%d bpt=%llu bps=%u tpb=%u blocks=%u\n",
                 kArchName, dev, devName,
                 (unsigned long long)segHi, (unsigned long long)mapBytes,
                 primes.size(), FF_SIEVE_SUB_BLOCK_LOG2,
-                (unsigned long long)kSieveValuesPerThread,
+                (unsigned long long)kSieveBytesPerThread,
                 kSieveBlocksPerSubBlock, kSieveThreadsPerBlock, totalBlocks);
 
     auto runAndCompare = [&](const char* kind, int rep) -> bool {
@@ -269,7 +312,7 @@ int main(int argc, char** argv)
     if (!runAndCompare("CORRECT", 0)) {
         std::fprintf(stderr, "BYTE MISMATCH: geometry %d/%llu/%u/%u is not byte-exact\n",
                      FF_SIEVE_SUB_BLOCK_LOG2,
-                     (unsigned long long)kSieveValuesPerThread,
+                     (unsigned long long)kSieveBytesPerThread,
                      kSieveBlocksPerSubBlock, kSieveThreadsPerBlock);
         return 1;
     }
@@ -278,6 +321,10 @@ int main(int argc, char** argv)
     for (int r = 1; r <= reps; ++r) {
         BENCH_HIP_CHECK(hipMemset(d_map, 0xff, mapBytes));
         BENCH_HIP_CHECK(hipMemcpy(d_map, h_init.data(), 1, hipMemcpyHostToDevice));
+        // restore the padded trailing byte too (production init contract)
+        BENCH_HIP_CHECK(hipMemcpy(d_map + (mapBytes - 1),
+                                  h_init.data() + (mapBytes - 1), 1,
+                                  hipMemcpyHostToDevice));
         BENCH_HIP_CHECK(hipDeviceSynchronize());
 
         BENCH_HIP_CHECK(hipEventRecord(ev0, 0));
