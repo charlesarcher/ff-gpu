@@ -16,6 +16,22 @@ The implementing script is `scripts/bench_per_device.sh`; its outputs are
 Legs: the six golden legs `65536 … 2097152` (same work as the correctness
 contract in GPU_PLAN §9).
 
+## Map format: internal vs canonical
+
+Since the wheel-30 landing, two byte layouts exist and both are load-bearing:
+
+- **Internal (wheel-30)** — `internalMapBytes = ceil(span/30)` bytes; the
+  layout the GPU sieve produces and the search kernel consumes **on-device**.
+  It is what makes amd@2M fit its card: at 2097152 the internal map is
+  9162596899 B = 8.53 GiB.
+- **Canonical** — `ceil(span/16)` bytes; the hostMap / `--dump-map` format
+  that defines the sha256 golden-map contract. It is re-materialized from the
+  internal map at every non-GPU boundary (dump, host consumption), which is
+  why dump-map hashes are unchanged vs the pre-wheel era.
+
+Density consequence: internal is **1.875×** denser than canonical
+(17179869185 B → 9162596899 B at 2M).
+
 ## Measurement protocol
 
 1. **Environment snapshot** — one per sweep, written to `run/bench_env.txt`:
@@ -57,14 +73,20 @@ A config×leg where all reps fail rc!=0 with `GATE FAIL` in stderr is marked
 `EXPECTED_GATE_REFUSAL` (a documented capacity limit, not a defect). Anything
 else that is not OK is a regression.
 
-> **Erratum (2026-08-24, post-task-14):** the former example here —
-> `amd_gpu @ 2097152` refusing because backing ≈13.2 GiB < the 16 GiB map —
-> is obsolete. Since task 14 the aggregate capacity gate auto-enables the
-> host overflow tier, so this cell completes by default (rc=0,
-> byte-identical, recorded OK); GPU search falls back to CPU on that leg via
-> the documented capacity notice. `EXPECTED_GATE_REFUSAL` remains in the
-> harness as a generic outcome label only; no current sweep cell is expected
-> to hit it.
+> **Erratum history for `amd_gpu @ 2097152`** (three eras; only the last is
+> current):
+> 1. *Pre-task-14*: this cell refused with a capacity GATE FAIL (canonical
+>    map exceeded the card's default-budget backing).
+> 2. *Task 14 → pre-wheel*: the aggregate capacity gate auto-enabled the host
+>    overflow tier, so the cell completed by default (rc=0, byte-identical)
+>    but with GPU search falling back to CPU via the documented capacity
+>    notice — a completion-only cell.
+> 3. *Wheel-30 landing (current truth)*: the compressed internal map
+>    (9162596899 B = 8.53 GiB at 2M) fits the card's participation budget,
+>    so this cell runs **true GPU search**: card named in stderr, zero
+>    fallback notices, residency handoff 0 B H2D, median wall **12.483 s**
+>    (bar ≤38 s). `EXPECTED_GATE_REFUSAL` remains in the harness as a generic
+>    outcome label only; no current sweep cell is expected to hit it.
 
 ## Known limitations
 

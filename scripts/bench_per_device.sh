@@ -24,12 +24,14 @@
 #     from ff_sieve --list-devices) captured once into run/bench_env.txt
 #
 # Expected outcomes recorded honestly:
-#   - amd_gpu @ 2097152: COMPLETES by default since task 14 — the aggregate
-#     capacity gate auto-enables the host overflow tier (rc=0, correct
-#     solution count, byte-identical); GPU search falls back to CPU on this
-#     leg via the documented "no device fits" capacity notice.
-#     (Pre-task-14 sweeps refused here; EXPECTED_GATE_REFUSAL survives only
-#     as a generic outcome label.)
+#   - amd_gpu @ 2097152: runs TRUE GPU search since the wheel-30 landing —
+#     the compressed internal map (8.53 GiB at 2M) fits the card's
+#     participation budget, so the aggregate gate passes on internal bytes,
+#     the residency handoff reads the sieve-resident map in place (0 B H2D),
+#     and every rep carries search-kernel sub-timers. (Historical eras: this
+#     cell once refused with a capacity GATE FAIL, then completed via the
+#     task-14 auto host-tier spill with CPU-search fallback; both are gone.)
+#     EXPECTED_GATE_REFUSAL survives only as a generic outcome label.
 #
 # Usage: ./scripts/bench_per_device.sh
 # Env overrides: BENCH_REPS (default 3), BENCH_LEGS (default all six),
@@ -418,9 +420,11 @@ L.append("Sub-second legs may finish between sampler ticks (`n/a`); the stderr-n
 L.append("remain authoritative for those.\n")
 
 L.append("## Notes\n")
-L.append("- `amd_gpu` @ 2M: completes by default since task 14 — the aggregate capacity gate")
-L.append("  auto-enables the host overflow tier (rc=0, byte-identical, outcome OK); GPU search")
-L.append("  falls back to CPU on this leg via the documented \"no device fits\" capacity notice.")
+L.append("- `amd_gpu` @ 2M: TRUE GPU search since the wheel-30 landing — the compressed")
+L.append("  internal map (8.53 GiB at 2M) fits the card, so every rep runs the search")
+L.append("  kernel on-device (card named in stderr, zero fallback notices, residency")
+L.append("  handoff 0 B H2D). Historical eras — capacity-gate refusal, then task-14")
+L.append("  auto host-tier spill with CPU-search fallback — are both gone.")
 L.append("- Correctness per rep: solution-count assert against the golden contract (2357/4776/9163/")
 L.append("  18408/35556/71424) in addition to rc==0; any DEFECT marks a real regression.")
 

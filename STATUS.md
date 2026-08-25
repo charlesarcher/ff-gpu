@@ -29,30 +29,46 @@ CUDA calls anywhere in the tree.
 └─────────────────────────────────────────────────────────────┘
 ```
 
-## Current Performance (authoritative sweep: `scripts/bench_per_device.sh`, median of 3 timed reps after 1 untimed warmup; final sweep 2026-08-24 — see `.omo/evidence/gpu-speedup/final-verdict.md`)
+## Current Performance (authoritative sweep: `scripts/bench_per_device.sh`, median of 3 timed reps after 1 untimed warmup; wheel-30 gap-closure final sweep 2026-08-24 — every figure verbatim from `.omo/evidence/gpu-speedup/gap-closure/final-verdict.md`)
 
 ### Wall-Clock Time (seconds)
 
 | Config | 65K | 131K | 262K | 524K | 1M | 2M |
 |--------|-----|------|------|------|----|-----|
-| Original (ff_seg) | 0.019s | 0.084s | 0.427s | 2.198s | 9.227s | 40.559s |
-| nvidia_gpu (`--devices=nvidia --gpu-search`) | 0.253s | 0.271s | 0.419s | 0.894s | 2.506s | 11.822s |
-| amd_gpu (`--devices=amd --gpu-search`) | 0.104s | 0.218s | 0.618s | 1.878s | 6.296s | 50.596s |
+| Original (ff_seg) | 0.019s | 0.085s | 0.441s | 2.240s | 9.473s | 41.340s |
+| nvidia_gpu (`--devices=nvidia --gpu-search`) | 0.263s | 0.288s | 0.450s | 1.029s | 1.974s | 5.452s |
+| amd_gpu (`--devices=amd --gpu-search`) | 0.113s | 0.154s | 0.362s | 1.193s | 3.283s | 12.483s |
 
-### Speedup vs Reference (ratio >1 = faster; ✗ = misses the plan's bar for that cell)
+### Speedup vs Reference (>1 = faster; ✗ = honest miss, stated plainly)
 
 | Config | 65K | 131K | 262K | 524K | 1M | 2M |
 |--------|-----|------|------|------|----|-----|
-| nvidia_gpu | 0.08x | 0.31x ✗(≥1.0) | **1.02x ✓** | **2.46x ✓(≥2.0)** | **3.68x ✓(≥2.0)** | **3.43x ✓(≥2.0)** |
-| amd_gpu | 0.18x | 0.39x ✗(≥1.0) | 0.69x ✗(≥1.0) | **1.17x ✗(≥2.0 required)** | **1.47x ✗(≥2.0 required)** | 0.80x (completion cell¹) |
+| nvidia_gpu | 0.07x | 0.30x | 0.98x | **2.18x ✗**(prior verdict 2.46x, −11.5%) | **4.80x** (prior 3.68x, +30%) | **7.58x** (prior 3.43x, +121%) |
+| amd_gpu | 0.17x | 0.55x | **1.22x** | **1.88x** (stretch ≥1.35x ✓) | **2.89x** (bar ≥1.6x ✓, stretch ≥1.8x ✓) | **3.31x** (true GPU-search cell¹) |
 
-Task-17 verdict: the correctness contract is fully green (byte-identical
-everywhere, ctest 8/8) and NVIDIA beats its entire speed bar, but the AMD
-≥2.0x cells at 524K/1M miss structurally — zero-overhead ceilings are only
-**1.23x** / **1.51x**. The ≥1.0x cells at 131K/262K are init-floor-dominated.
-¹ amd_gpu@2M is scored as completion only: it completes rc=0 byte-exact by
-default via the auto host-tier spill (GPU search falls back to CPU there);
-its 0.80x ratio is recorded for transparency, not competitiveness.
+Task-10 final verdict: the correctness contract is fully green (byte-identical
+everywhere, ctest 8/8, dump-map sha256 intact), and the plan's headline goals
+beat their bars — AMD@1M **2.89x** (committed bar ≥1.6x, stretch ≥1.8x both
+met), amd@2M converted from a 50.6 s CPU-fallback completion cell into a true
+GPU-search cell at **12.483 s** (bar ≤38 s), sieve execution deficit **88.7%
+recovered** @1M vs amd-gap-analysis §2.3. Recorded honestly against that:
+
+- The committed ZERO-regression tier is an honest **FAIL**: 14/18 cells clean;
+  4 cells beyond ±3% after the one sanctioned re-run (nv@524288 +10.3%,
+  nv@131072 +8.1%, amd@65536 +7.7%, nv@65536 +3.75%). Mechanism: the wheel
+  canonical-expansion pass costs ~380 ms inside NV mid-leg totals,
+  outweighing sieve savings there (NV sieve itself IMPROVED 337→101 ms
+  @524288); the two @65536 misses are floor-cell noise-scale.
+- NVIDIA band check is a **PARTIAL FAIL**: @524288 2.18x vs prior 2.46x =
+  −11.5% ✗; @1M 4.80x and @2M 7.58x exceed their bands in the improvement
+  direction (recorded as gains).
+- Occupancy split recorded honestly: sieve kernel 16 waves/SIMD ✓; search
+  kernel 12 waves by measured decision (N=16 spill-free but +2.17% slower
+  @1M).
+
+¹ amd_gpu@2M runs GPU search ENGAGED on the RX 9070 XT post-wheel-30: card
+named in stderr, zero fallback notices, residency handoff 0 B H2D, all reps
+carry search-kernel sub-timers (impossible under CPU fallback).
 
 ### Correctness
 
@@ -69,20 +85,25 @@ asserted, plus solution blocks vs `out_pen_*` / `out_pen2_*`):
 | GPU sieve + GPU search, NVIDIA device[1] | YES | YES | YES | YES | YES | YES |
 
 ¹ At the time of the 2026-08-23 run this cell was an expected capacity-gate
-refusal (AMD backing ~13.2 GiB at default budget < 16 GiB map). Post-task-14
-the aggregate gate auto-enables the host overflow tier: the 2026-08-24
-task-17 sweep ran this cell by default and it completed rc=0 byte-identical
-(18/18 cells outcome=OK), with GPU search falling back to CPU per the
-documented capacity notice. Prime-map sha256 is identical across AMD sieve,
+refusal (the canonical 16 GiB map exceeded AMD's default-budget backing).
+Post-task-14 the aggregate gate auto-enabled the host overflow tier and the
+cell completed rc=0 byte-identical via CPU-search fallback. Post-wheel-30
+(task-10 sweep, 2026-08-24) the fallback clause is itself historical: the
+compressed internal map (8.53 GiB at 2M) fits the card, so this cell runs
+TRUE GPU search — card named, zero fallback notices, residency handoff 0 B
+H2D (18/18 cells outcome=OK). Prime-map sha256 is identical across AMD sieve,
 NVIDIA sieve, and both search paths (`--dump-map`, leg 1M).
 
-### 2. GPU Search Performance (UPDATED 2026-08-24)
+### 2. GPU Search Performance (UPDATED 2026-08-24, wheel-30 gap-closure final sweep)
 
 **Status**: Measured by the authoritative sweep — see Current Performance
-above. NVIDIA passes its entire speed bar (up to **3.68x** at 1M); the AMD
-≥2.0x cells at 524K/1M miss structurally (zero-overhead ceilings
-1.23x / 1.51x). The named follow-up lever is wheel-30 map compression
-(user decision point — see Next Steps).
+above. Headlines: NVIDIA up to **7.58x** @2M / **4.80x** @1M; AMD **2.89x**
+@1M (committed + stretch bars met), **1.88x** @524288, and amd@2M now a true
+GPU-search cell at **12.483 s** / 3.31x. The pre-wheel "AMD ≥2x misses are
+structural" conclusion is OBSOLETE — it was invalidated by wheel-30 map
+compression. Honest residual: 4/18 cells regressed beyond ±3% vs the frozen
+pre-plan baseline (NV mid-leg canonical-expansion cost; floor-cell noise),
+and NV@524288 sits at 2.18x vs its prior 2.46x verdict.
 
 ### 3. Thread Count Mismatch (INFORMATIONAL)
 
@@ -128,17 +149,30 @@ above. NVIDIA passes its entire speed bar (up to **3.68x** at 1M); the AMD
    `scripts/bench_per_device.sh` sweep run 2026-08-24 (see Current
    Performance above).
 5. ~~Benchmark GPU search to validate performance improvement~~ DONE —
-   task-17 final verdict: correctness fully green; NVIDIA beats its entire
-   speed bar; AMD ≥2x misses are structural (zero-overhead ceilings
-   1.23x / 1.51x).
-6. DECISION POINT (user): **wheel-30 map compression** — a denser packing
-   keeping 8 of 30 residues (~3.75× denser map: 16 GiB → ~4.3 GiB at 2M).
-   It shrinks sieve marking work, D2H traffic, and the search table
-   proportionally (attacking exactly the phases dominating the AMD misses)
-   AND brings the 2M map inside AMD's backing, converting the amd@2M
-   CPU-search fallback into true GPU search. Cost: changes the canonical
-   prime-map bit layout, so the `--dump-map` sha256 contract and slab
-   geometry assumptions need a deliberate re-spec.
+   task-17 verdict said AMD ≥2x misses were structural (zero-overhead
+   ceilings below bar). SUPERSEDED 2026-08-25: that conclusion was
+   invalidated by wheel-30 map compression (item 6) — AMD@1M reached
+   **2.89x**.
+6. ~~DECISION POINT (user): **wheel-30 map compression**~~ DONE — landed and
+   measured (kernel-gap-closure tasks 1–10; final sweep 2026-08-24, see
+   Current Performance above).
+   - **Density-figure correction**: this bullet previously claimed the
+     packing was "~3.75× denser … ~4.3 GiB at 2M". That was an arithmetic
+     error (wrong baseline). The measured truth: the wheel-30 layout stores
+     `ceil(span/30)` bytes vs canonical `ceil(span/16)` = **1.875× denser**
+     (17179869185 B → 9162596899 B = 8.53 GiB at 2M; D2H traffic ÷1.875
+     inside the sieve timer).
+   - Measured outcome: AMD@1048576 **2.89x** (committed bar 1.6x, stretch
+     1.8x both met); amd@2097152 converted from a 50.6 s CPU-fallback
+     completion cell into a **true GPU-search cell at 12.483 s** (bar ≤38 s);
+     NV@1M 4.80x / @2M 7.58x; sieve execution deficit **88.7% recovered**
+     vs amd-gap-analysis §2.3.
+   - Honest cost: the committed ZERO-regression tier FAILED on 4/18 cells
+     (nv@524288 +10.3%, nv@131072 +8.1%, amd@65536 +7.7%, nv@65536 +3.75%)
+     and NV@524288's speedup fell 2.46x → 2.18x (−11.5%) — the wheel
+     canonical-expansion pass costs ~380 ms inside NV mid-leg totals.
+     Routed to `.omo/notepads/kernel-gap-closure/problems.md`; remediation
+     deliberately deferred (task-10 mandate).
 
 ## Benchmark Recurrence
 

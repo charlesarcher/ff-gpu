@@ -179,7 +179,7 @@ ff_sieve [options] <sumStart> <sumLimit>
 
 # Restrict to one GPU vendor
 ./build/ff_sieve --devices=nvidia 5 2097152
-./build/ff_sieve --devices=amd 5 1048576     # AMD-only run (the 2M leg also completes, via auto host-tier spill)
+./build/ff_sieve --devices=amd 5 1048576     # AMD-only run (the 2M leg also completes: post-wheel-30 the compressed map fits the card — see Known Issues #2)
 
 # List detected GPUs and exit
 ./build/ff_sieve --list-devices
@@ -270,29 +270,31 @@ Only run this when the *reference* behavior legitimately changes — regenerated
 
 ## Performance
 
-### Benchmark Results (authoritative sweep: `scripts/bench_per_device.sh`, median of 3 timed reps after 1 untimed warmup; final sweep 2026-08-24)
+### Benchmark Results (authoritative sweep: `scripts/bench_per_device.sh`, median of 3 timed reps after 1 untimed warmup; wheel-30 gap-closure final sweep 2026-08-24 — every figure verbatim from `.omo/evidence/gpu-speedup/gap-closure/final-verdict.md`)
 
 Wall-clock time (seconds), full process end-to-end:
 
 | Config | 65K | 131K | 262K | 524K | 1M | 2M |
 |--------|-----|------|------|------|----|-----|
-| **Original (ff_seg)** | 0.019s | 0.084s | 0.427s | 2.198s | 9.227s | 40.559s |
-| nvidia_gpu (`--devices=nvidia --gpu-search`) | 0.253s | 0.271s | 0.419s | 0.894s | 2.506s | 11.822s |
-| amd_gpu (`--devices=amd --gpu-search`) | 0.104s | 0.218s | 0.618s | 1.878s | 6.296s | 50.596s |
+| **Original (ff_seg)** | 0.019s | 0.085s | 0.441s | 2.240s | 9.473s | 41.340s |
+| nvidia_gpu (`--devices=nvidia --gpu-search`) | 0.263s | 0.288s | 0.450s | 1.029s | 1.974s | 5.452s |
+| amd_gpu (`--devices=amd --gpu-search`) | 0.113s | 0.154s | 0.362s | 1.193s | 3.283s | 12.483s |
 
-**Speedup vs Reference** (>1.0 = faster; ✗ = misses the plan's bar for that cell):
+**Speedup vs Reference** (>1.0 = faster; ✗ = honest miss, stated plainly — regressions are marked as visibly as wins):
 
 | Config | 65K | 131K | 262K | 524K | 1M | 2M |
 |--------|-----|------|------|------|----|-----|
-| nvidia_gpu | 0.08x | 0.31x ✗(≥1.0) | **1.02x ✓** | **2.46x ✓(≥2.0)** | **3.68x ✓(≥2.0)** | **3.43x ✓(≥2.0)** |
-| amd_gpu | 0.18x | 0.39x ✗(≥1.0) | 0.69x ✗(≥1.0) | **1.17x ✗(≥2.0 required)** | **1.47x ✗(≥2.0 required)** | 0.80x (completion cell¹) |
+| nvidia_gpu | 0.07x | 0.30x | 0.98x | **2.18x ✗**(prior verdict 2.46x, −11.5%) | **4.80x** (prior 3.68x, +30%) | **7.58x** (prior 3.43x, +121%) |
+| amd_gpu | 0.17x | 0.55x | **1.22x** | **1.88x** (stretch ≥1.35x ✓) | **2.89x** (bar ≥1.6x ✓, stretch ≥1.8x ✓) | **3.31x** (true GPU-search cell¹) |
 
 ### Notes
 
 - **nvidia_gpu / amd_gpu**: full GPU enablement — both the sieve kernel and the Freudenthal search kernel run on that card. Correctness is byte-identical to the reference in every cell (18/18 cells outcome=OK).
-- **Honest misses**: the AMD ≥2.0x targets at 524K/1M are missed structurally — even a zero-overhead run caps at **1.23x** (524K) and **1.51x** (1M), because sieve + search-kernel work alone exceeds the bar. The ≥1.0x cells at 131K/262K are dominated by ~113–125 ms device enumeration/init inside full-process walls.
-- **65K floors**: NVIDIA 253 ms (−80% vs its 1.281 s baseline), AMD 104 ms (−92% vs its 1.354 s baseline).
-- ¹ **amd_gpu @ 2M** is scored as a completion cell only: it finishes rc=0 byte-exact by default via the auto host-tier spill (GPU search falls back to CPU there); its 0.80x ratio is recorded for transparency, not competitiveness.
+- **Honest regression (committed ZERO-regression tier: FAIL)**: 14/18 cells stayed within ±3% of the frozen pre-plan baseline (`amd-gap/sweep-full.csv`); 4 cells remain beyond band after the one sanctioned re-run — nv@524288 +10.3%, nv@131072 +8.1%, amd@65536 +7.7%, nv@65536 +3.75%. Mechanism: the wheel design's canonical-expansion pass costs ~380 ms inside NV mid-leg totals, outweighing the sieve savings there (the NV sieve itself IMPROVED 337→101 ms @524288); the two @65536 misses are floor-cell noise-scale (+9/+8 ms on init-floor-dominated walls). None is a kernel-speed regression.
+- **Headlines**: AMD@1048576 **2.89x** (9.473 s / 3.283 s) beats both its committed bar (≥1.6x) and stretch bar (≥1.8x); amd@2097152 converted from a 50.6 s CPU-fallback completion cell into a **true GPU-search cell at 12.483 s** (bar ≤38 s; also beats the ≤26 s marker); NV@1M 4.80x / @2M 7.58x exceed their prior verdict bands in the improvement direction. Sieve execution deficit vs `amd-gap-analysis` §2.3: **88.7% recovered** @1M (2369.8 → 268.5 ms).
+- **Occupancy, recorded honestly**: sieve kernel 16 waves/SIMD with 0 spills ✓; search kernel runs 12 waves/SIMD by measured decision — the N=16 rung compiled spill-free but measured +2.17% slower @1M (kernel is scratch-bound).
+- **65K floors**: NVIDIA 0.263 s / AMD 0.113 s walls are init-floor-dominated (device enumeration alone: 124.2 ms NV vs 7.5 ms AMD per the verdict's phase decomposition).
+- ¹ **amd_gpu @ 2M** now runs GPU search ENGAGED on the RX 9070 XT: card named in stderr, zero fallback notices, residency handoff 0 B H2D, rc=0 byte-identical, all 3 reps carry search-kernel sub-timers (impossible under CPU fallback). See Known Issues #2.
 - AMD GPU requires ROCm 7.2+ for gfx1201 support.
 
 ## Project Structure
@@ -336,17 +338,27 @@ Build outputs land in `build/` (fully gitignored); reference binaries stay in `r
 
 ### 1. `slab_cmp` — all cases pass
 
-The `slab_cmp` test previously failed 5/10 cases due to a test-side indexing mismatch (the GPU kernel correctly used segLo-relative indexing matching the production slab engine, but the test compared as global-indexed). The test has been corrected and **all 10 cases pass** with byte-identical output.
+The `slab_cmp` test previously failed 5/10 cases due to a test-side indexing mismatch (the GPU kernel correctly used segLo-relative indexing matching the production slab engine, but the test compared as global-indexed). The test has been corrected and **all cases pass** with byte-identical output — the matrix has since grown to **22 cases** (task-9 twin coverage: superblock truncation/mid-group tails, degenerate spans, deep offsets), all green in the latest `ctest` run (8/8 suites).
 
-### 2. amd@2M leg — completes by default via auto-spill
+### 2. amd@2M leg — TRUE GPU search since the wheel-30 landing (was: auto-spill completion)
 
-The 2M leg's prime map (~16 GiB) exceeds the RX 9070 XT's backing (~13.2 GiB
-at the default budget). Since task 14 the aggregate capacity gate
-auto-enables the host overflow tier, so `amd_gpu @ 2097152` completes by
-default (rc=0, byte-identical); GPU search falls back to CPU on that leg via
-the documented capacity notice ("no device fits"). Bringing the map inside
-AMD's backing via wheel-30 compression is a follow-up decision point, not
-done work.
+The 2M leg's canonical prime map (~16 GiB) used to exceed the RX 9070 XT's
+backing, so from task 14 the aggregate capacity gate auto-enabled the host
+overflow tier and the cell completed via CPU-search fallback. That era is
+over: the wheel-30 internal layout stores the map at **1.875×** higher density
+than the canonical layout (`internalMapBytes = ceil(span/30)` bytes consumed
+on-device vs canonical `ceil(span/16)` = 17179869185 B; at 2M the internal map
+is 9162596899 B = 8.53 GiB), which fits the card's participation budget. The
+aggregate gate now passes on internal bytes ("GATE PASS"), the residency
+handoff reads the sieve-resident map in place (0 B H2D), and `amd_gpu @
+2097152` runs **true GPU search**: median wall **12.483 s** / **3.31x**,
+rc=0 byte-identical, card named in stderr, zero fallback notices.
+
+> Density-figure erratum (corrected 2026-08-25): an earlier revision of this
+> document and of `STATUS.md` estimated the wheel-30 packing at "~3.75×
+> denser". That figure was wrong — it compared against the wrong baseline.
+> The measured density gain is **1.875×** (17179869185 B → 9162596899 B;
+> D2H traffic ÷1.875 inside the sieve timer per the final verdict).
 
 ### 3. Thread Count
 
