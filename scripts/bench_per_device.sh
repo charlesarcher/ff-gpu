@@ -35,7 +35,8 @@
 #
 # Usage: ./scripts/bench_per_device.sh
 # Env overrides: BENCH_REPS (default 3), BENCH_LEGS (default all six),
-#                BENCH_WARMUP (default 1)
+#                BENCH_WARMUP (default 1), BENCH_MEDIAN_N (default 5),
+#                BENCH_JIT_WARMUP (default 1), BENCH_AUTOEXTEND (default 1)
 #
 # Protocol extensions (plan task 2 — harness upgrade):
 #   ACTIVE by default (adds a gate, changes NO measurement):
@@ -45,11 +46,11 @@
 #       goldens/out_ff_seg_<leg>.txt (hashes precomputed at sweep start;
 #       one golden set suffices — stdout is platform-independent by
 #       contract). Any mismatch => outcome DEFECT.
-#   DORMANT — env-flagged, ALL OFF by default (Gate 0 forbids changing the
-#   default protocol; activation is a later plan task). With every knob
-#   unset the invocation behaves exactly as before (median-of-3, same
-#   single warmup, same columns — new columns are APPEND-ONLY):
-#     BENCH_MEDIAN_N=N    median-of-N (N>=5) timed reps for sub-second legs
+#
+# PROTOCOL DEFAULTS — ACTIVATED as of the plan-task-7 re-baseline (formerly
+#   dormant env-flagged knobs, ALL OFF before task 7; each remains
+#   env-overridable, set to 0 to restore the legacy behavior for that knob):
+#     BENCH_MEDIAN_N=5    median-of-N (N>=5) timed reps for sub-second legs
 #                         (a leg is classified sub-second by its first
 #                         rep's wall clock < 1.000 s)
 #     BENCH_JIT_WARMUP=1  one extra untimed warmup before EVERY config x leg
@@ -79,9 +80,9 @@ ENV_TXT="$ROOT/run/bench_env.txt"
 TIMEOUT_SEC=600
 REPS="${BENCH_REPS:-3}"
 WARMUP="${BENCH_WARMUP:-1}"
-MEDIAN_N="${BENCH_MEDIAN_N:-0}";     [[ "$MEDIAN_N"   =~ ^[0-9]+$ ]] || MEDIAN_N=0
-JIT_WARMUP="${BENCH_JIT_WARMUP:-0}"; [[ "$JIT_WARMUP" =~ ^[0-9]+$ ]] || JIT_WARMUP=0
-AUTOEXTEND="${BENCH_AUTOEXTEND:-0}"; [[ "$AUTOEXTEND" =~ ^[0-9]+$ ]] || AUTOEXTEND=0
+MEDIAN_N="${BENCH_MEDIAN_N:-5}";     [[ "$MEDIAN_N"   =~ ^[0-9]+$ ]] || MEDIAN_N=5
+JIT_WARMUP="${BENCH_JIT_WARMUP:-1}"; [[ "$JIT_WARMUP" =~ ^[0-9]+$ ]] || JIT_WARMUP=1
+AUTOEXTEND="${BENCH_AUTOEXTEND:-1}"; [[ "$AUTOEXTEND" =~ ^[0-9]+$ ]] || AUTOEXTEND=1
 
 LEGS=(${BENCH_LEGS:-65536 131072 262144 524288 1048576 2097152})
 declare -A EXPECTED=(
@@ -402,7 +403,7 @@ for entry in "${CONFIGS[@]}"; do
             _med=$(median "${walls[@]}")
             _min=$(printf '%s\n' "${walls[@]}" | sort -n | head -1)
             _max=$(printf '%s\n' "${walls[@]}" | sort -n | tail -1)
-            _over=$(awk "BEGIN{print ($med <= 0 || ($_max - $_min) / $med > 0.15) ? 1 : 0}")
+            _over=$(awk "BEGIN{print ($_med <= 0 || ($_max - $_min) / $_med > 0.15) ? 1 : 0}")
             (( $_over == 1 )) || break
             r=$((r+1)); extras=$((extras+1))
             echo "  [$cfg $leg] autoextend: spread ($_min..$_max)/$_med > 0.15 — extra rep $extras/2"

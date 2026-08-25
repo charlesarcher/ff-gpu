@@ -41,10 +41,17 @@ Density consequence: internal is **1.875×** denser than canonical
 2. **Preflight** — binaries exist; warning if any process already holds an
    NVIDIA compute context (results would be polluted).
 3. **Warmup** — one *untimed* rep per config at the smallest leg (GPU clock
-   ramp, page cache). Never reported.
-4. **Timed reps** — default 3 per config×leg (`BENCH_REPS`). Each rep runs in
-   a fresh scratch cwd with `timeout 600`. Wall clock = full process time
-   (spawn → exit), captured with `date +%s%N` around the whole invocation.
+   ramp, page cache). Never reported. Additionally — since the task-7
+   re-baseline — one extra *untimed* JIT warmup before EVERY config×leg
+   block (`BENCH_JIT_WARMUP=1`, default ON).
+4. **Timed reps** — default 3 per config×leg (`BENCH_REPS`). Since the
+   task-7 re-baseline, any cell whose FIRST rep's wall clock is < 1.000 s
+   (sub-second heuristic) is automatically extended to median-of-N with
+   N≥5 (`BENCH_MEDIAN_N=5`, default ON). Each rep runs in a fresh scratch
+   cwd with `timeout 600`. Wall clock = full process time (spawn → exit),
+   captured with `date +%s%N` around the whole invocation.
+4b. **Auto-extend on spread** — while `(max−min)/median > 0.15`, up to 2
+   extra reps are run per cell (`BENCH_AUTOEXTEND=1`, default ON).
 5. **Aggregation** — summary CSV carries median/min/max/pstdev of the reps.
    The report tables quote the median; raw CSV preserves every rep so any
    statistic can be recomputed.
@@ -52,6 +59,28 @@ Density consequence: internal is **1.875×** denser than canonical
    the solution count matches the golden contract
    (2357/4776/9163/18408/35556/71424). A config×leg whose reps disagree or
    mismatch is marked `DEFECT`, never silently dropped.
+7. **Per-rep stdout sha256 gate** — ACTIVE: each rep's stdout is normalized
+   with `sed -E 's/(Prime|Freudenthal) time: [0-9]+/\1 time: N/'` BEFORE
+   hashing and compared against the identically-normalized golden stdout;
+   any mismatch marks the cell `DEFECT`. Timing-digit jitter passes;
+   content corruption fires (fault-injection proven,
+   `.omo/start-work/evidence/rebaseline-dual-report.md`).
+
+## Frozen reference (task-7 re-baseline, 2026-08-25)
+
+The sweep of 2026-08-25T16:50:49Z — run under the ACTIVATED protocol above
+(`median_n=5 jit_warmup=1 autoextend=1`, sha256 gate live, 18/18 outcome=OK,
+86/86 reps sha_ok) — is **the frozen ±3 % band reference going forward**.
+All future wall-median comparisons quote bands against
+`scripts/bench_per_device_results.csv` at this freeze; the old-vs-new dual
+report (Gate-1 `d01d9dc` numbers side-by-side, zero >±10 % wall movers) is
+archived at `.omo/start-work/evidence/rebaseline-dual-report.md`.
+
+Environment state at freeze: `nvidia-persistenced` enablement was attempted
+passwordless (`sudo -n`) and **BLOCKED** (password required); persistence
+mode remained `Disabled` before and after. The freeze therefore carries no
+persistenced effect — if persistenced is enabled later, that is a protocol
+change and demands a fresh re-baseline before bands are quoted.
 
 ## Device attribution (making sure we bench the intended GPU)
 
@@ -103,6 +132,9 @@ else that is not OK is a regression.
 
 ```bash
 cmake --build --preset dev            # fresh build first
-./scripts/bench_per_device.sh         # full sweep (~10 min)
+./scripts/bench_per_device.sh         # full sweep (~10–15 min under the activated protocol)
 BENCH_LEGS="65536" BENCH_REPS=2 ./scripts/bench_per_device.sh   # quick check
 ```
+
+Legacy single-warmup / median-of-3 / no-autoextend behavior per knob:
+`BENCH_JIT_WARMUP=0 BENCH_MEDIAN_N=0 BENCH_AUTOEXTEND=0`.
