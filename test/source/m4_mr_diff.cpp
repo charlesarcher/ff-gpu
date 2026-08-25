@@ -6,6 +6,16 @@
 // production search kernel does. Any verdict divergence between device and
 // host is a FAILURE — perfect match is the pass condition.
 //
+// MAP FORMAT (kernel-gap-closure task 8): dev_IsPrime consumes the INTERNAL
+// wheel-30 layout (byte k = values [30k,30k+30), bit i LSB-first = value
+// 30k + kWheelResidues[i], source/geometry.h). The device buffers therefore
+// carry generatePrimeMapInternal() output — the canonical sieve compacted by
+// the landed task-5 helper ff::compactCanonicalToWheel30 — while the HOST
+// oracle always runs on the CANONICAL map (GpuPrime's layout). The differential
+// thus validates the full chain canonical-sieve -> compact -> H2D -> wheel
+// decode against canonical truth; a residue-table or slot-order mismatch
+// anywhere diverges loudly.
+//
 // Coverage (>= 200k sampled n across configurations):
 //   A. contiguous [maxPrimeMapValue_65K+1 .. +100000]   (production 65K-leg
 //      map bound, replicated from source/geometry.cpp:15-20)
@@ -16,7 +26,8 @@
 //   D. Carmichael numbers 561/1105/1729/2465/2821/6601 + small spsp under a
 //      LOW map bound (500) so they take the MR branch
 //   E. every odd n in [5..119] under a TINY map bound (4) — smallest possible
-//      Montgomery moduli
+//      Montgomery moduli; also exercises the {2,3,5} fast path and the
+//      3/5-multiple guard on nearly every wheel byte
 //
 // Runs on EVERY logical GPU (both vendors when present).
 
@@ -30,6 +41,7 @@
 
 #include "devabstraction.h"
 #include "gpu_prime.h"
+#include "geometry.h"
 
 extern "C" {
 typedef int (*MRDiffRunFn)(int deviceIndex,
@@ -65,6 +77,19 @@ static std::vector<uint8_t> generatePrimeMap(uint64_t limit) {
     return map;
 }
 
+// INTERNAL wheel-30 variant of the above (task 8): canonical sieve compacted
+// by the landed task-5 helper. span = limit+1 matches the geometry.h contract
+// (span == maxPrimeMapValue+1); generatePrimeMap(limit) already allocates
+// exactly canonicalMapBytes(limit+1) readable bytes, so compact reads only
+// defined bits. Padding slots come back zeroed per the helper contract.
+static std::vector<uint8_t> generatePrimeMapInternal(uint64_t limit) {
+    std::vector<uint8_t> canon = generatePrimeMap(limit);
+    const uint64_t span = limit + 1;
+    std::vector<uint8_t> internal(ff::internalMapBytes(span), 0);
+    ff::compactCanonicalToWheel30(canon.data(), internal.data(), span);
+    return internal;
+}
+
 // maxPrimeMapValue of the 65536 leg, replicated from source/geometry.cpp:15-20
 // ((sumLimit+1)>>1)^2 >> 2 + 2 -> rounded up to a 16-value map boundary.
 static uint64_t maxPrimeMapValue_65K() {
@@ -86,7 +111,8 @@ struct DiffStats {
 static bool runBatchOnDevice(MRDiffRunFn launchFn, int logicalIndex, int vendorIndex,
                              const std::vector<uint8_t>& h_map, uint64_t maxMapValue,
                              const char* label, const std::vector<uint64_t>& ns,
-                             DiffStats& stats) {
+                             DiffStats& stats,
+                             const std::vector<uint8_t>& oracleMap) {
     if (ns.empty()) {
         std::printf("  [%s] SKIP (empty bucket)\n", label);
         return true;
@@ -140,7 +166,7 @@ static bool runBatchOnDevice(MRDiffRunFn launchFn, int logicalIndex, int vendorI
     }
     if (echoBad) std::printf("  [%s] ECHO BAD=%u\n", label, echoBad);
 
-    GpuPrime host(h_map.data(), maxMapValue);
+    GpuPrime host(oracleMap.data(), maxMapValue);
     uint32_t printed = 0;
     for (size_t i = 0; i < ns.size(); ++i) {
         ++stats.tested;
@@ -173,25 +199,32 @@ static void appendValues(std::vector<uint64_t>& v, std::initializer_list<uint64_
 // ---- Per-device driver: all configurations and buckets ----
 
 static bool runOnDevice(int logicalIndex, int vendorIndex, MRDiffRunFn launchFn,
-                        const std::vector<uint8_t>& prodMap, uint64_t prodThr) {
+                        const std::vector<uint8_t>& prodCanon, uint64_t prodThr) {
     bool ok = true;
     DiffStats total;
+
+    // Device buffers carry the INTERNAL wheel-30 map; the host oracle keeps
+    // the CANONICAL one (GpuPrime's layout). Same value span, both derived
+    // from the same sieve — see the MAP FORMAT note in the header comment.
+    const std::vector<uint8_t> prodInternal = generatePrimeMapInternal(prodThr);
 
     // -- Config P: production 65K-leg map bound --
     {
         DiffStats s;
         std::vector<uint64_t> contiguous;
         appendRange(contiguous, prodThr + 1, prodThr + 100000);
-        ok &= runBatchOnDevice(launchFn, logicalIndex, vendorIndex, prodMap, prodThr,
-                               "P:A contiguous thr+1..thr+100000", contiguous, s);
+        ok &= runBatchOnDevice(launchFn, logicalIndex, vendorIndex, prodInternal, prodThr,
+                               "P:A contiguous thr+1..thr+100000", contiguous, s,
+                               prodCanon);
 
         std::mt19937_64 rng(0x853C49E6748FEA9BULL); // fixed seed: reproducible
         std::vector<uint64_t> random44;
         random44.reserve(100000);
         for (int i = 0; i < 100000; ++i)
             random44.push_back(rng() & ((1ull << 44) - 1));
-        ok &= runBatchOnDevice(launchFn, logicalIndex, vendorIndex, prodMap, prodThr,
-                               "P:B random up to 2^44 (seed 0x853C49E6748FEA9B)", random44, s);
+        ok &= runBatchOnDevice(launchFn, logicalIndex, vendorIndex, prodInternal, prodThr,
+                               "P:B random up to 2^44 (seed 0x853C49E6748FEA9B)", random44, s,
+                               prodCanon);
 
         std::vector<uint64_t> adv;
         appendRange(adv, (1ull << 32) - 3, (1ull << 32) + 3);
@@ -207,8 +240,9 @@ static bool runOnDevice(int logicalIndex, int vendorIndex, MRDiffRunFn launchFn,
             adv.push_back((1ull << k) + 1);              // maximal power2 chains
         for (int64_t k : {-31, -27, -25, -3, -1, 1, 3, 25})
             adv.push_back((1ull << 63) + k);             // m near 2^63
-        ok &= runBatchOnDevice(launchFn, logicalIndex, vendorIndex, prodMap, prodThr,
-                               "P:C adversarial edges", adv, s);
+        ok &= runBatchOnDevice(launchFn, logicalIndex, vendorIndex, prodInternal, prodThr,
+                               "P:C adversarial edges", adv, s,
+                               prodCanon);
         total.tested += s.tested;
         total.divergences += s.divergences;
     }
@@ -216,13 +250,15 @@ static bool runOnDevice(int logicalIndex, int vendorIndex, MRDiffRunFn launchFn,
     // -- Config L: low map bound (500) — Carmichaels + small spsp take MR --
     {
         DiffStats s;
-        std::vector<uint8_t> lowMap = generatePrimeMap(500);
+        std::vector<uint8_t> lowCanon = generatePrimeMap(500);
+        std::vector<uint8_t> lowInternal = generatePrimeMapInternal(500);
         std::vector<uint64_t> ns;
         appendValues(ns, {561ull, 1105ull, 1729ull, 2465ull, 2821ull, 6601ull});
         appendValues(ns, {2047ull, 3277ull, 4033ull});
         appendRange(ns, 501, 700); // contiguous MR sweep just above the bound
-        ok &= runBatchOnDevice(launchFn, logicalIndex, vendorIndex, lowMap, 500,
-                               "L:D Carmichael+spsp+sweep @bound500", ns, s);
+        ok &= runBatchOnDevice(launchFn, logicalIndex, vendorIndex, lowInternal, 500,
+                               "L:D Carmichael+spsp+sweep @bound500", ns, s,
+                               lowCanon);
         total.tested += s.tested;
         total.divergences += s.divergences;
     }
@@ -230,11 +266,13 @@ static bool runOnDevice(int logicalIndex, int vendorIndex, MRDiffRunFn launchFn,
     // -- Config T: tiny map bound (4) — smallest Montgomery moduli (m >= 5) --
     {
         DiffStats s;
-        std::vector<uint8_t> tinyMap = generatePrimeMap(4);
+        std::vector<uint8_t> tinyCanon = generatePrimeMap(4);
+        std::vector<uint8_t> tinyInternal = generatePrimeMapInternal(4);
         std::vector<uint64_t> ns;
         appendRange(ns, 5, 120);
-        ok &= runBatchOnDevice(launchFn, logicalIndex, vendorIndex, tinyMap, 4,
-                               "T:E odd sweep 5..119 @bound4", ns, s);
+        ok &= runBatchOnDevice(launchFn, logicalIndex, vendorIndex, tinyInternal, 4,
+                               "T:E odd sweep 5..119 @bound4", ns, s,
+                               tinyCanon);
         total.tested += s.tested;
         total.divergences += s.divergences;
     }
@@ -261,8 +299,9 @@ int main() {
 
     const uint64_t prodThr = maxPrimeMapValue_65K();
     std::printf("  maxPrimeMapValue_65K = %llu\n", (unsigned long long)prodThr);
-    std::vector<uint8_t> prodMap = generatePrimeMap(prodThr);
-    std::printf("  production map: %zu bytes\n", prodMap.size());
+    std::vector<uint8_t> prodCanon = generatePrimeMap(prodThr);
+    std::printf("  canonical oracle map: %zu bytes; device wheel-30 map: %zu bytes\n",
+                prodCanon.size(), ff::internalMapBytes(prodThr + 1));
 
     int devicesTested = 0;
     bool ok = true;
@@ -301,7 +340,7 @@ int main() {
 
         std::printf("  device[%d] %s (%s, vendorIndex=%d)\n",
                     i, di.name, ffdev::backendName(backend), vendorIndex);
-        bool devOk = runOnDevice(i, vendorIndex, fn, prodMap, prodThr);
+        bool devOk = runOnDevice(i, vendorIndex, fn, prodCanon, prodThr);
         ok &= devOk;
         ++devicesTested;
     }

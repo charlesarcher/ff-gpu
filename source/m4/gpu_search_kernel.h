@@ -195,9 +195,64 @@ __device__ static uint64_t dev_MontMul(uint64_t a, uint64_t b, uint64_t m, uint6
     return t;
 }
 
-// Bit-test primality: lookup in primeMap for n <= maxPrimeMapValue.
-// For n > maxPrimeMapValue, falls back to Miller-Rabin with the same
-// witness set and thresholds as GpuPrime::AskMillerRabin.
+// ---- Wheel-30 in-map decode constants (kernel-gap-closure task 8) ----------
+//
+// primeMap arrives in the INTERNAL wheel-30 layout defined by landed task 5
+// (source/geometry.{h,cpp}): byte k covers values [30k, 30k+30); bit i with
+// mask 1u<<i (LSB-FIRST) is value 30k + kWheelResidues[i],
+// kWheelResidues = {1,7,11,13,17,19,23,29}. Values divisible by 2, 3 or 5
+// have NO slot — they are unrepresentable, so dev_IsPrime rejects them before
+// any map access (multiples of 2 via the even-reject; multiples of 3/5 via
+// the residue-mask guard below; the primes 3/5 themselves via the in-map-path
+// fast path — deliberately BELOW the maxPrimeMapValue branch so the
+// Miller-Rabin branch keeps reference-exact verdicts).
+//
+// Both constants below are DELIBERATE LITERALS, mirroring the task-5 selftest
+// oracle discipline: they must NOT silently track a future kWheelResidues
+// change. If the layout ever moves, update these together with geometry.h and
+// re-run the exhaustive decode proof (gap-closure/task-8 evidence).
+//
+//   FF_WHEEL_COPRIME_MASK = (1u<<1)|(1u<<7)|(1u<<11)|(1u<<13)|(1u<<17)|
+//                           (1u<<19)|(1u<<23)|(1u<<29)
+//     Bit r set  <=> r coprime to 30 AND r odd. For ODD n (the only kind that
+//     reaches this code), "bit r set" <=> n not divisible by 3 or 5, so this
+//     one shift-and doubles as the required {3,5} guard AND a belt-and-braces
+//     even-recheck. Exhaustively checked against coprimality on r in [0,30).
+//
+//   Slot index (perfect-hash rank): idx = popcount(MASK & ((1u<<r)-1)) — the
+//     rank of residue r among the ascending residues, which by construction
+//     equals its index in kWheelResidues:
+//       1->0, 7->1, 11->2, 13->3, 17->4, 19->5, 23->6, 29->7.
+//     Bijective on the coprime set (each slot hit exactly once — proven
+//     exhaustively on host, see task-8 decode-exhaustive.log); non-coprime r
+//     can collide but never reaches here (guard exits first). Chosen over a
+//     multiplier/shift hash because NO monotone multiply-shift can produce
+//     task-5 slot order directly (slot deltas are all +1 while residue gaps
+//     alternate 6,4,2 — slope bounds [0.5,∞) ∩ [1/6,1/3) are empty), and the
+//     plan-draft hash ((r*34)>>5)&7 yields a DIFFERENT permutation
+//     {1->1,7->7,11->3,13->5,17->2,19->4,23->0,29->6} that would need an
+//     extra 3-bit permutation on top; popcount-rank is one v_popc/__popc.
+//
+//   Division by 30: q = mulhi(n, 0x8888888888888889) >> 4. The magic is
+//     M = (2^68 + 14)/30 (14 = (-2^68) mod 30); floor(n*M/2^68) == floor(n/30)
+//     for EVERY uint64 n because the round-up error satisfies
+//     n*14 < 2^68 (Granlund-Montgomery condition). Host-checked exhaustively
+//     on [0, 3e7] plus powers-of-two boundaries up to 2^64-1.
+//
+// Op budget (q/r/idx/mask path, conservative ALU count): mulhi + shr + mad30
+// + sub + guard-shr + guard-and + shl + sub1 + and + popc + shl + and = 12
+// (v_mad_u32/IMAD fuses *30; ~14 if the fuse is denied). The load-address
+// chain is mulhi->shr->add (depth 3); guard and perfect-hash hang OFF that
+// chain and overlap the load latency. Composite-dominant traffic (~47% of
+// odd n is divisible by 3 or 5) exits at the guard with ZERO memory traffic
+// — the fast-exit ordering lesson from the reverted task-3 interleave.
+#define FF_WHEEL_COPRIME_MASK 0x208A2882u
+
+// Bit-test primality: lookup in the INTERNAL wheel-30 primeMap for
+// n <= maxPrimeMapValue (same VALUE span as the canonical format; only the
+// byte layout differs — see geometry.h). For n > maxPrimeMapValue, falls back
+// to Miller-Rabin with the same witness set and thresholds as
+// GpuPrime::AskMillerRabin.
 __device__ static bool dev_IsPrime(uint64_t n,
                                    const uint8_t* __restrict__ primeMap,
                                    uint64_t maxPrimeMapValue) {
@@ -246,9 +301,21 @@ __device__ static bool dev_IsPrime(uint64_t n,
         }
         return true;
     }
-    // In-map bit-test: read-only hinted load (task 15). The Montgomery branch
-    // above performs NO map reads, so this is the only map touch in dev_IsPrime.
-    return (FF_SEARCH_LD_RO_U8(primeMap + (n >> 4)) & (0x80 >> (n >> 1 & 7))) != 0;
+    // In-map bit-test against the INTERNAL wheel-30 layout: q = n/30 (magic
+    // multiply), r = n mod 30. The structural primes 3 and 5 have NO wheel
+    // slot, so they are answered here before any map access — but ONLY below
+    // the map bound: above it the reference's Miller-Rabin quirk (witness p
+    // == n degenerates to 0 -> composite) is verdict-normative and must be
+    // mirrored (m4_mr_diff T:E bucket pins this). Guard rejects 3/5-multiples
+    // BEFORE the load (their slots do not exist); popcount-rank gives the
+    // LSB-first slot index. Read-only hinted load (task 15) — still the only
+    // map touch in dev_IsPrime (the Montgomery branch performs NO map reads).
+    if (n == 3 || n == 5) return true;
+    const uint64_t q = (uint64_t)(__umul64hi(n, 0x8888888888888889ull) >> 4);
+    const uint32_t r = (uint32_t)(n - q * 30);
+    if (!((FF_WHEEL_COPRIME_MASK >> r) & 1u)) return false;
+    const uint32_t slot = __popc(FF_WHEEL_COPRIME_MASK & ((1u << r) - 1u));
+    return (FF_SEARCH_LD_RO_U8(primeMap + q) & (uint8_t)(1u << slot)) != 0;
 }
 
 // Product-of-term-pairs-has-single-factor-pair:
