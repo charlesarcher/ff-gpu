@@ -236,6 +236,7 @@ set(
     FF_GPU_RUNTIME_LIBS
     amdhip64
     cudart
+    cuda   # driver API: hip_enum.cpp targeted queries (hipDeviceGet/GetName)
     Threads::Threads
 )
 

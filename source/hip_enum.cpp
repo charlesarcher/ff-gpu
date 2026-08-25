@@ -10,10 +10,13 @@
 // are never mixed in one TU (ROCm/HIP#2703). Fills vendor-neutral
 // ff::DeviceInfo records.
 //
-// Per-device query set required by the plan: hipGetDeviceCount (count),
-// hipGetDeviceProperties (name, PCI bus ID, compute capability, max threads,
-// shared-mem limits) and hipMemGetInfo (free/total VRAM — queried with the
-// device made current, since memGetInfo is current-device scoped).
+// Per-device query set (plan todo 10 / F8): targeted hipDeviceGetAttribute
+// calls instead of the monolithic hipGetDeviceProperties populate — only the
+// fields with live downstream consumers are queried (name via hipDeviceGetName,
+// PCI domain/bus/device, compute capability, max threads-per-block, shared-mem
+// limits, SM count). Dead fields (maxGridDim*, warpSize) are no longer queried.
+// Plus hipGetDeviceCount (count) and hipMemGetInfo (free/total VRAM — queried
+// with the device made current, since memGetInfo is current-device scoped).
 
 #include <hip/hip_runtime.h>
 
@@ -42,10 +45,17 @@ namespace {
 // Arch-tagged entry point: ff_enum_hip_gfx1201 / ff_enum_hip_sm_120.
 #define FF_ENUM_FN FF_TAG_CAT(ff_enum_hip_, SIEVE_KERNEL_ARCH)
 
-void formatBusId(char* out, size_t n, const hipDeviceProp_t& p)
+void formatBusId(char* out, size_t n, int domain, int bus, int device)
 {
-    std::snprintf(out, n, "%04x:%02x:%02x", p.pciDomainID, p.pciBusID,
-                  p.pciDeviceID);
+    std::snprintf(out, n, "%04x:%02x:%02x", domain, bus, device);
+}
+
+// One targeted attribute query; on failure reports and returns false.
+bool queryAttr(int dev, hipDeviceAttribute_t attr, const char* label, int* out)
+{
+    if (hipDeviceGetAttribute(out, attr, dev) == hipSuccess) return true;
+    std::fprintf(stderr, FF_ENUM_LABEL ": %s(%d) failed\n", label, dev);
+    return false;
 }
 
 }  // namespace
@@ -70,9 +80,34 @@ extern "C" int FF_ENUM_FN(ff::DeviceInfo* out, int maxDevices, int* outCount)
     int prev = -1;
     (void)hipGetDevice(&prev);   // best-effort; the runtime is already up
     for (int i = 0; i < count; ++i) {
-        hipDeviceProp_t p{};
-        if (hipGetDeviceProperties(&p, i) != hipSuccess) {
-            std::fprintf(stderr, FF_ENUM_LABEL ": hipGetDeviceProperties(%d) failed\n", i);
+        // Targeted queries (F8): name + the 9 attributes with live consumers.
+        hipDevice_t hdev = 0;
+        char name[256] = {};
+        if (hipDeviceGet(&hdev, i) != hipSuccess ||
+            hipDeviceGetName(name, static_cast<int>(sizeof name), hdev) !=
+                hipSuccess) {
+            std::fprintf(stderr, FF_ENUM_LABEL ": device name query(%d) failed\n", i);
+            if (prev >= 0) (void)hipSetDevice(prev);
+            return -1;
+        }
+        int pciDomain = 0, pciBus = 0, pciDev = 0;
+        int major = 0, minor = 0, maxThreads = 0;
+        int smemBlock = 0, smemMp = 0, smCount = 0;
+        if (!queryAttr(i, hipDeviceAttributePciDomainID, "PciDomainID", &pciDomain) ||
+            !queryAttr(i, hipDeviceAttributePciBusId, "PciBusId", &pciBus) ||
+            !queryAttr(i, hipDeviceAttributePciDeviceId, "PciDeviceId", &pciDev) ||
+            !queryAttr(i, hipDeviceAttributeComputeCapabilityMajor,
+                       "ComputeCapabilityMajor", &major) ||
+            !queryAttr(i, hipDeviceAttributeComputeCapabilityMinor,
+                       "ComputeCapabilityMinor", &minor) ||
+            !queryAttr(i, hipDeviceAttributeMaxThreadsPerBlock,
+                       "MaxThreadsPerBlock", &maxThreads) ||
+            !queryAttr(i, hipDeviceAttributeMaxSharedMemoryPerBlock,
+                       "SharedMemoryPerBlock", &smemBlock) ||
+            !queryAttr(i, hipDeviceAttributeMaxSharedMemoryPerMultiprocessor,
+                       "MaxSharedMemoryPerMultiprocessor", &smemMp) ||
+            !queryAttr(i, hipDeviceAttributeMultiprocessorCount,
+                       "MultiprocessorCount", &smCount)) {
             if (prev >= 0) (void)hipSetDevice(prev);
             return -1;
         }
@@ -90,23 +125,19 @@ extern "C" int FF_ENUM_FN(ff::DeviceInfo* out, int maxDevices, int* outCount)
         ff::DeviceInfo& d = out[*outCount];
         std::memset(&d, 0, sizeof d);
         std::snprintf(d.vendor, sizeof d.vendor, "%s", FF_ENUM_VENDOR);
-        std::snprintf(d.name, sizeof d.name, "%s", p.name);
-        formatBusId(d.busId, sizeof d.busId, p);
-        d.pciDomain = p.pciDomainID;
-        d.pciBus = p.pciBusID;
-        d.pciDevice = p.pciDeviceID;
+        std::snprintf(d.name, sizeof d.name, "%s", name);
+        formatBusId(d.busId, sizeof d.busId, pciDomain, pciBus, pciDev);
+        d.pciDomain = pciDomain;
+        d.pciBus = pciBus;
+        d.pciDevice = pciDev;
         d.freeBytes = freeBytes;
         d.totalBytes = totalBytes;
-        d.computeMajor = p.major;
-        d.computeMinor = p.minor;
-        d.maxThreadsPerBlock = p.maxThreadsPerBlock;
-        d.sharedMemPerBlock = p.sharedMemPerBlock;
-        d.sharedMemPerMultiprocessor = p.sharedMemPerMultiprocessor;
-        d.multiProcessorCount = p.multiProcessorCount;
-        d.maxGridDimX = p.maxGridSize[0];
-        d.maxGridDimY = p.maxGridSize[1];
-        d.maxGridDimZ = p.maxGridSize[2];
-        d.warpSize = p.warpSize;
+        d.computeMajor = major;
+        d.computeMinor = minor;
+        d.maxThreadsPerBlock = maxThreads;
+        d.sharedMemPerBlock = static_cast<unsigned long long>(smemBlock);
+        d.sharedMemPerMultiprocessor = static_cast<unsigned long long>(smemMp);
+        d.multiProcessorCount = smCount;
         d.runtimeIndex = i;
         ++*outCount;
     }
