@@ -84,6 +84,19 @@ if(FF_GPU_LINEINFO)
     set(FF_GPU_LINEINFO_FLAGS -lineinfo)
 endif()
 
+# ---- Task-9 coverage trap ----
+# FF_POISON_HOSTMAP=ON fills ff_sieve's host prime map with the 0xA5 sentinel
+# instead of zero-filling it (same allocation path, only the fill pattern
+# differs). Default OFF: production builds are byte-identical in behavior.
+# test/source/hostmap_coverage.cpp runs the always-poison twin
+# (ff_sieve_poison, registered in test/CMakeLists.txt) against the leg-65536
+# golden to prove every hostMap byte is producer-written before any consumer
+# reads it.
+option(FF_POISON_HOSTMAP "Fill hostMap with 0xA5 sentinel instead of zero-fill (coverage-trap builds)" OFF)
+if(FF_POISON_HOSTMAP)
+    target_compile_definitions(ff-gpu_exe PRIVATE FF_POISON_HOSTMAP=1)
+endif()
+
 # ---- Per-arch AMD objects (custom hipcc commands, gfx1201) ----
 # Same hand-rolled command the Makefile used. CMake's HIP language driver
 # rejects the hipcc wrapper on this machine (CMake >= 4.0 wants raw Clang),

@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -478,10 +479,22 @@ int runLeg(const ff::Config& cfg, const std::vector<std::string>& positionals)
         }
     }
 
-    // Allocate host map
+    // Allocate host map UNINITIALIZED (task 9, B4): three independent code
+    // audits concluded every byte is producer-written before read —
+    // sole-producer drain contract (pull_scheduler.h:74-79), internal regions
+    // fully written by slab D2H drains, canonical regions fully rewritten by
+    // the backward-widening expansion, failure paths bail before reading.
+    // test/source/hostmap_coverage.cpp enforces this at runtime: the
+    // FF_POISON_HOSTMAP build fills the SAME allocation with the 0xA5
+    // sentinel instead — ONLY the fill pattern differs — and must stay
+    // golden-identical on leg 65536 in both search modes.
     uint64_t mapBytes = (g.maxPrimeMapValue + 1 + 15) >> 4;
     auto tHostMapFill = std::chrono::steady_clock::now();
-    std::vector<uint8_t> hostMap(mapBytes, 0);
+    std::unique_ptr<uint8_t[]> hostMap(new uint8_t[mapBytes]);
+#ifdef FF_POISON_HOSTMAP
+    std::fill(hostMap.get(), hostMap.get() + mapBytes,
+              static_cast<uint8_t>(0xA5u));
+#endif
     dumpPhaseTimer("hostmap zero-fill", elapsedMs(tHostMapFill));
 
     // Residency planning, BEFORE the sieve: pick the GPU-search device now
@@ -534,7 +547,7 @@ int runLeg(const ff::Config& cfg, const std::vector<std::string>& positionals)
     uint64_t sieveUs = 0;
 maxPrimeMapValue = ff::runPullScheduler(cfg, r.devs, budgets, g,
                                              kernelPrimes, kernelPrimeCount,
-                                             hostMap.data(), &sieveUs,
+                                             hostMap.get(), &sieveUs,
                                              residencyDev, residencyReq);
     double sieveMs = elapsedMs(t_sieve);
     dumpPhaseTimer("sieve phase", sieveMs);
@@ -547,7 +560,7 @@ maxPrimeMapValue = ff::runPullScheduler(cfg, r.devs, budgets, g,
     if (!dumpMapFile.empty()) {
         // Wheel-30 (tasks 6+7): the dump contract stays CANONICAL — convert
         // the per-slab internal image in place first.
-        ff::expandSieveMapToCanonical(hostMap.data(), g, cfg.slabSizeBytes);
+        ff::expandSieveMapToCanonical(hostMap.get(), g, cfg.slabSizeBytes);
         FILE* f = std::fopen(dumpMapFile.c_str(), "wb");
         if (!f) {
             std::fprintf(stderr,
@@ -555,7 +568,7 @@ maxPrimeMapValue = ff::runPullScheduler(cfg, r.devs, budgets, g,
                          dumpMapFile.c_str());
             return 1;
         }
-        std::fwrite(hostMap.data(), 1, mapBytes, f);
+        std::fwrite(hostMap.get(), 1, mapBytes, f);
         std::fclose(f);
         std::fprintf(stderr,
                      "[ff_sieve] dump-map: wrote %s (%llu bytes)\n",
@@ -565,7 +578,7 @@ maxPrimeMapValue = ff::runPullScheduler(cfg, r.devs, budgets, g,
     }
 
     // Create GpuPrime
-    GpuPrime prime(hostMap.data(), maxPrimeMapValue);
+    GpuPrime prime(hostMap.get(), maxPrimeMapValue);
 
     // Compute header values (matching reference Prime constructor)
     uint64_t maxGeneratedPrime = g.maxGeneratedPrime;
@@ -783,7 +796,7 @@ maxPrimeMapValue = ff::runPullScheduler(cfg, r.devs, budgets, g,
                         std::min(slabB, g.internalMapBytes - iOff);
                     const uint64_t cOff = (iOff / 8ull) * 15ull;
                     GpuSearchCopyH2D(ri, v, residency.devPtr + iOff,
-                                     hostMap.data() + cOff, cBi);
+                                     hostMap.get() + cOff, cBi);
                     ++fillSlabs;
                     fillBytes += cBi;
                 }
@@ -811,7 +824,7 @@ maxPrimeMapValue = ff::runPullScheduler(cfg, r.devs, budgets, g,
                         std::min(slabB, g.internalMapBytes - iOff);
                     const uint64_t cOff = (iOff / 8ull) * 15ull;
                     GpuSearchCopyH2D(ri, v, dPrimeMap.ptr + iOff,
-                                     hostMap.data() + cOff, cBi);
+                                     hostMap.get() + cOff, cBi);
                 }
             }
 
@@ -831,7 +844,7 @@ maxPrimeMapValue = ff::runPullScheduler(cfg, r.devs, budgets, g,
         // CPU search, emission) needs the canonical layout, so convert in
         // place now — strictly after the scheduler's post-join fence
         // (runPullScheduler returned) and after the internal H2D reads.
-        ff::expandSieveMapToCanonical(hostMap.data(), g, cfg.slabSizeBytes);
+        ff::expandSieveMapToCanonical(hostMap.get(), g, cfg.slabSizeBytes);
 
         if (useGpu) {
             // Launch GPU search.  Dispatch by vendor: both runtimes number
