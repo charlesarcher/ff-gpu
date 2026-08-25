@@ -1,21 +1,32 @@
-// hostmap_coverage.cpp — task 9 (B2): runtime enforcement of the hostmap
-// write-before-read invariant.
+// hostmap_coverage.cpp — task 9 (B2) + task 18 extension: runtime enforcement
+// of the hostmap write-before-read invariant, now across BOTH expansion
+// schedules (task-18 tiled two-phase epochs AND the adaptive in-place path).
 //
 // Strategy:
 //   1. Run the REAL ff_sieve binary built in POISON mode (ff_sieve_poison,
 //      compiled with FF_POISON_HOSTMAP=1): its host prime map starts filled
 //      with the 0xA5 sentinel instead of zero. Same allocation path as
 //      production; only the fill pattern differs.
-//   2. Run leg 65536 in BOTH search modes (default CPU search + --gpu-search).
-//   3. Assert rc==0 and that stdout, after timing normalization (the same
-//      rewrite scripts/verify.sh applies: 'Prime|Freudenthal time: <digits>'
-//      -> 'time: N'), is byte-identical to goldens/out_ff_seg_65536.txt.
+//   2. Search-mode cases assert rc==0 and that stdout, after timing
+//      normalization (the same rewrite scripts/verify.sh applies:
+//      'Prime|Freudenthal time: <digits>' -> 'time: N'), is byte-identical to
+//      the leg's golden. The run matrix spans:
+//        - leg 65536 default + --gpu-search (expansion is single-region
+//          ADAPTIVE IN-PLACE here; gpu-search SKIPS expansion entirely),
+//        - leg 524288 default slab (ONE 546 MiB region -> 9 whole-group
+//          64 MiB tiles -> the TILED two-phase epoch path),
+//        - leg 524288 --slab-size=128MiB (mixed grid: four 2-tile regions +
+//          one single-tile in-place region in the same run),
+//        - leg 524288 --slab-size=32MiB (every region single-tile: adaptive
+//          everywhere).
+//   3. Dump-map case: leg 524288 with --dump-map under sentinel fill must be
+//      BYTE-IDENTICAL to the CPU reference map (reference/ff_seg --dump-map).
+//      Unlike verdict-driven stdout equality, this proves EVERY canonical byte
+//      was producer-written — a single unwritten tile window would carry 0xA5.
 //
 // A single canonical byte read before its producer writes it carries 0xA5
-// bits into a primality verdict, flipping "(prime)" annotations or solution
-// lines with near-certainty — so golden equality proves no sentinel byte ever
-// influenced a verdict on any consumer path (CPU RunIt, GPU-search H2D feed +
-// emit, dump-map expansion ordering).
+// bits into a primality verdict or the dumped map, flipping "(prime)"
+// annotations, solution lines, or map bytes with near-certainty.
 //
 // Build: cmake --build --preset dev --target hostmap_coverage_test
 
@@ -33,6 +44,9 @@
 
 #ifndef FF_COVERAGE_POISON_BIN
 #error "FF_COVERAGE_POISON_BIN must point at the ff_sieve_poison binary"
+#endif
+#ifndef FF_COVERAGE_REF_BIN
+#error "FF_COVERAGE_REF_BIN must point at the reference ff_seg binary"
 #endif
 #ifndef FF_COVERAGE_GOLDENS_DIR
 #error "FF_COVERAGE_GOLDENS_DIR must point at the goldens directory"
@@ -147,33 +161,75 @@ void printFirstDiff(const std::string& got, const std::string& want) {
 
 int main() {
     const std::string poisonBin = FF_COVERAGE_POISON_BIN;
-    const std::string goldenPath =
-        std::string(FF_COVERAGE_GOLDENS_DIR) + "/out_ff_seg_65536.txt";
+    const std::string refBin = FF_COVERAGE_REF_BIN;
 
-    std::printf("=== hostmap_coverage: poison-build write-before-read trap ===\n");
+    std::printf("=== hostmap_coverage: poison-build write-before-read trap "
+                "(task 9 + task 18 tiled matrix) ===\n");
     std::printf("  poison binary: %s\n", poisonBin.c_str());
-
-    std::string golden;
-    if (!readWholeFile(goldenPath, &golden)) {
-        std::fprintf(stderr, "FAIL: cannot read golden %s\n",
-                     goldenPath.c_str());
-        return 1;
-    }
+    std::printf("  reference binary: %s\n", refBin.c_str());
 
     struct Case {
         const char* name;
         std::vector<std::string> args;
+        const char* leg;
+        bool dumpMap;   // true: byte-compare the dumped map vs reference
+        const char* envThreads;  // "" or FF_EXPANSION_THREADS value
     };
     const Case cases[] = {
-        {"cpu-search(default)", {}},
-        {"gpu-search", {"--gpu-search"}},
+        {"cpu-search(default) leg=65536 adaptive-inplace", {}, "65536",
+         false, ""},
+        {"gpu-search(skip-expansion) leg=65536", {"--gpu-search"}, "65536",
+         false, ""},
+        {"cpu-search(default) leg=524288 tiled-9-tiles", {}, "524288",
+         false, ""},
+        {"cpu-search(slab=128MiB) leg=524288 mixed-grid",
+         {"--slab-size=134217728"}, "524288", false, ""},
+        {"cpu-search(slab=32MiB) leg=524288 adaptive-all",
+         {"--slab-size=33554432"}, "524288", false, ""},
+        {"dump-map(default) leg=524288 tiled full-byte", {}, "524288", true,
+         ""},
+        {"dump-map(threads=1) leg=1048576 multi-region serialized", {},
+         "1048576", true, "1"},
+        {"dump-map(threads=4) leg=1048576 multi-region oversubscribed", {},
+         "1048576", true, "4"},
     };
 
     int fails = 0;
     for (const Case& c : cases) {
+        // Pool cap for this case (children inherit at exec; reference runs
+        // don't care but inherit harmlessly).
+        if (!*c.envThreads) ::unsetenv("FF_EXPANSION_THREADS");
+        else ::setenv("FF_EXPANSION_THREADS", c.envThreads, 1);
+
         std::vector<std::string> args = c.args;
         args.push_back("5");
-        args.push_back("65536");
+        args.push_back(c.leg);
+
+        std::string goldenPath;
+        std::string golden;
+        std::string gotMapPath;
+        std::string refMapPath;
+        if (c.dumpMap) {
+            gotMapPath = makeTempPath("ff_cov_map_got");
+            refMapPath = makeTempPath("ff_cov_map_ref");
+            if (gotMapPath.empty() || refMapPath.empty()) {
+                std::fprintf(stderr, "FAIL [%s]: cannot create temp files\n",
+                             c.name);
+                ++fails;
+                continue;
+            }
+            args.push_back("--dump-map");
+            args.push_back(gotMapPath);
+        } else {
+            goldenPath = std::string(FF_COVERAGE_GOLDENS_DIR) +
+                         "/out_ff_seg_" + c.leg + ".txt";
+            if (!readWholeFile(goldenPath, &golden)) {
+                std::fprintf(stderr, "FAIL [%s]: cannot read golden %s\n",
+                             c.name, goldenPath.c_str());
+                ++fails;
+                continue;
+            }
+        }
 
         RunResult r;
         if (!runCapture(poisonBin, args, &r)) {
@@ -188,6 +244,54 @@ int main() {
                          "  stderr head: %.600s\n",
                          c.name, r.rc, r.stderrText.c_str());
             ++fails;
+            continue;
+        }
+
+        if (c.dumpMap) {
+            std::vector<std::string> refArgs = {"--dump-map", refMapPath,
+                                                "5", c.leg};
+            RunResult rr;
+            if (!runCapture(refBin, refArgs, &rr) || rr.rc != 0) {
+                std::fprintf(stderr,
+                             "FAIL [%s]: reference dump-map run failed "
+                             "(rc=%d)\n",
+                             c.name, rr.rc);
+                ++fails;
+                continue;
+            }
+            std::string gotMap, refMap;
+            if (!readWholeFile(gotMapPath, &gotMap) ||
+                !readWholeFile(refMapPath, &refMap)) {
+                std::fprintf(stderr,
+                             "FAIL [%s]: cannot read dumped map file(s)\n",
+                             c.name);
+                ++fails;
+                continue;
+            }
+            ::unlink(gotMapPath.c_str());
+            ::unlink(refMapPath.c_str());
+            if (gotMap.size() != refMap.size()) {
+                std::fprintf(stderr,
+                             "FAIL [%s]: map size %zu != reference %zu\n",
+                             c.name, gotMap.size(), refMap.size());
+                ++fails;
+                continue;
+            }
+            if (gotMap != refMap) {
+                size_t diff = 0;
+                while (diff < gotMap.size() && gotMap[diff] == refMap[diff])
+                    ++diff;
+                std::fprintf(stderr,
+                             "FAIL [%s]: dumped map differs from reference "
+                             "at byte %zu (sentinel leak through an unwritten "
+                             "tile window?)\n",
+                             c.name, diff);
+                ++fails;
+                continue;
+            }
+            std::printf("  PASS [%s]: rc=0, dumped map byte-identical to CPU "
+                        "reference (%zu B) under 0xA5 sentinel fill\n",
+                        c.name, gotMap.size());
             continue;
         }
 
@@ -209,7 +313,8 @@ int main() {
 
     if (fails == 0) {
         std::printf("\n=== hostmap_coverage: PASS — every map byte read was "
-                    "producer-written before the sentinel could leak ===\n");
+                    "producer-written before the sentinel could leak "
+                    "(tiled + adaptive schedules) ===\n");
         return 0;
     }
     std::fprintf(stderr, "\n=== hostmap_coverage: FAIL (%d case(s)) ===\n",

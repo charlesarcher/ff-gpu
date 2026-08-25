@@ -761,22 +761,104 @@ void expandSlabInPlace(uint8_t* region, uint64_t cBc, uint64_t cBi,
     }
 }
 
-void expandSlabRange(uint8_t* hostMap, const LegGeometry& g,
-                     uint64_t slabSizeBytes, uint64_t sBegin, uint64_t sEnd)
+// Task-18 tile geometry: one expansion WORK ITEM is either
+//  - a WHOLE-SUPERBLOCK-GROUP tile (kExpandTileBytes internal bytes) of a
+//    multi-tile region, widened through private scratch, or
+//  - an entire single-tile region (<= kExpandTileBytes internal bytes),
+//    widened in place backward (zero extra traffic — the scratch round trip
+//    buys nothing when there is no starvation to fix).
+// Tiles never split a superblock group: kExpandTileBytes is a multiple of 8
+// and every interior tile edge lands on a group boundary, which also makes
+// 30*srcOff divisible by 16 so the per-tile canonical ceilings telescope to
+// the region's exact cBc (bijectivity: every canonical byte written once).
+struct ExpandItem {
+    uint32_t region;
+    bool inPlace;
+    uint64_t srcOff;      // tile: internal-byte offset of its raw sources
+    uint64_t cBi;         // tile: internal bytes (only the region-final tile
+                          //       may end mid-group)
+    uint64_t winOff;      // tile: canonical-byte offset of its window within
+                          //       the region (= 15*(srcOff/8))
+    uint64_t cBc;         // tile: canonical bytes produced
+    uint64_t valueBase;   // tile: first value covered (region-local)
+    uint64_t spanValues;  // tile: value span (clipped to the map span)
+};
+
+struct ExpandRegionGeom {
+    uint8_t* base;        // hostMap + (iOff/8)*15 — raw-source base AND
+                          // canonical window base (left-aligned deposit)
+    uint64_t iOff;        // internal-byte offset of the region in the map
+    uint64_t cBc;
+    uint64_t cBi;
+    uint64_t segLo;
+    uint64_t spanSlab;
+};
+
+constexpr uint64_t kExpandTileBytes = 64ull << 20;   // 64 MiB internal
+
+// Forward widening of one tile FROM ITS ARENA SLOT into its canonical
+// window. EPOCH SAFETY (task 18): phase A (arena fill) performs map READS
+// ONLY; the spawn/join between the two worker waves is the happens-before
+// barrier; phase B writes are confined to this tile's window
+// [winOff, winOff+cBc) — windows partition the region, regions partition the
+// map — and read only arena bytes no other item touches. No cross-thread
+// read/write pair exists inside either epoch. (Tiling the backward IN-PLACE
+// pass directly is racy: destinations drift upward at 15/8x the source rate,
+// so lower tiles' write ranges always overlap upper tiles' unread sources,
+// and shifting sources in-map first still races lower-writes/upper-reads —
+// proofs archived in .omo/start-work/evidence/e-tiling.md.)
+//
+// FORWARD order is load-bearing here: processing local group i ascending
+// never clobbers unread shifted sources because the write ceiling 15i+15
+// stays at or below the lowest unread source 7G'+8(i+1) iff 7i+7 <= 7G' iff
+// i <= G'-1 — always true. (Backward order self-clobbers: group q's write
+// floor 15q sits below group q-1's shifted source whenever q < G'.)
+void widenTileFromScratch(const uint8_t* src, uint8_t* regionBase,
+                          const ExpandItem& t, const ExpandTables& tab)
 {
-    const uint64_t internalTotal = g.internalMapBytes;
-    const uint64_t span = g.mapBytes << 4;
-    const uint64_t numSlabs =
-        (internalTotal + slabSizeBytes - 1) / slabSizeBytes;
-    for (uint64_t s = sBegin; s < sEnd && s < numSlabs; ++s) {
-        const uint64_t iOff = s * slabSizeBytes;
-        const uint64_t cBi = std::min(slabSizeBytes, internalTotal - iOff);
-        const uint64_t segLo = iOff * 30ull;
-        uint64_t segHi = segLo + slabSizeBytes * 30ull;
-        if (segHi > span) segHi = span;
-        const uint64_t cBc = (segHi - segLo + 15ull) / 16ull;
-        expandSlabInPlace(hostMap + (iOff / 8ull) * 15ull, cBc, cBi,
-                          segHi - segLo);
+    uint8_t* win = regionBase + t.winOff;
+    const uint64_t nG = t.cBi / 8;
+    const uint64_t tail = t.cBi % 8;
+    if (tail != 0) {
+        // Trailing partial superblock: values [valueBase+240*nG,
+        // valueBase+spanValues) -> canonical bytes [15*nG, cBc) of the tile
+        // window. Scalar-expanded FIRST: its source lives at scratch offset
+        // 8*nG, above every full-group write range (7G'+8nG >= 15nG iff
+        // G' >= nG), and the ascending loop below never reaches it either.
+        uint8_t wbuf[15] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+        for (uint64_t q = 0; q < tail; ++q) {
+            const uint8_t b = src[8 * nG + q];
+            if (!b) continue;
+            for (unsigned i = 0; i < kWheelResidueCount; ++i) {
+                if (!((b >> i) & 1u)) continue;
+                const uint64_t lv = t.valueBase + 240ull * nG + 30ull * q +
+                                    kWheelResidues[i];
+                if (lv >= t.valueBase + t.spanValues) break;  // padding slots
+                const uint64_t m = (lv - 1) / 2;
+                // (m>>3) is the region-local canonical byte; subtract the
+                // tile window base AND the full-group prefix to index the
+                // 15-byte tail buffer.
+                wbuf[(m >> 3) - t.winOff - 15 * nG] |=
+                    static_cast<uint8_t>(0x80u >> (m & 7u));
+            }
+        }
+        const uint64_t outBytes = t.cBc - 15 * nG;
+        for (uint64_t j = 0; j < outBytes && j < 15; ++j)
+            win[15 * nG + j] = wbuf[j];
+    }
+    for (uint64_t q = 0; q < nG; ++q) {
+        uint64_t Q;
+        std::memcpy(&Q, src + 8 * q, 8);
+        const uint64_t lo = tab.lo[0][Q & 0xffffu] |
+                            tab.lo[1][(Q >> 16) & 0xffffu] |
+                            tab.lo[2][(Q >> 32) & 0xffffu] |
+                            tab.lo[3][(Q >> 48) & 0xffffu];
+        const uint64_t hi = tab.hi[0][Q & 0xffffu] |
+                            tab.hi[1][(Q >> 16) & 0xffffu] |
+                            tab.hi[2][(Q >> 32) & 0xffffu] |
+                            tab.hi[3][(Q >> 48) & 0xffffu];
+        std::memcpy(win + 15 * q, &lo, 8);
+        std::memcpy(win + 15 * q + 8, &hi, 7);
     }
 }
 
@@ -798,21 +880,123 @@ void expandSieveMapToCanonical(uint8_t* hostMap, const LegGeometry& g,
                      "twice — exactly-once contract violated\n");
         std::abort();
     }
+    std::call_once(g_expandTablesOnce, buildExpandTables);
+    const ExpandTables& tab = *g_expandTables;
+
+    // Plan regions (frozen wheel-shape deposit geometry — identical formulas
+    // to the old per-slab pass) and work items.
+    const uint64_t span = g.mapBytes << 4;
     const uint64_t numSlabs =
         (g.internalMapBytes + slabSizeBytes - 1) / slabSizeBytes;
+    std::vector<ExpandRegionGeom> regions;
+    std::vector<ExpandItem> items;
+    regions.reserve(numSlabs);
+    for (uint64_t s = 0; s < numSlabs; ++s) {
+        const uint64_t iOff = s * slabSizeBytes;
+        const uint64_t cBi = std::min(slabSizeBytes, g.internalMapBytes - iOff);
+        const uint64_t segLo = iOff * 30ull;
+        uint64_t segHi = segLo + slabSizeBytes * 30ull;
+        if (segHi > span) segHi = span;
+        regions.push_back({hostMap + (iOff / 8ull) * 15ull, iOff,
+                           (segHi - segLo + 15ull) / 16ull, cBi, segLo,
+                           segHi - segLo});
+        if (cBi <= kExpandTileBytes) {
+            items.push_back({static_cast<uint32_t>(s), true, 0, cBi, 0,
+                             regions.back().cBc, 0, segHi - segLo});
+            continue;
+        }
+        const uint64_t numTiles =
+            (cBi + kExpandTileBytes - 1) / kExpandTileBytes;
+        for (uint64_t t = 0; t < numTiles; ++t) {
+            const uint64_t srcOff = t * kExpandTileBytes;
+            const uint64_t tileBytes =
+                std::min(kExpandTileBytes, cBi - srcOff);
+            const uint64_t vBegin = 30ull * srcOff;
+            uint64_t vEnd = vBegin + 30ull * tileBytes;
+            if (vEnd > segHi - segLo) vEnd = segHi - segLo;
+            items.push_back({static_cast<uint32_t>(s), false, srcOff,
+                             tileBytes, (srcOff / 8ull) * 15ull,
+                             (vEnd - vBegin + 15ull) / 16ull, vBegin,
+                             vEnd - vBegin});
+        }
+    }
+
+    // Pool size: hardware threads (FF_EXPANSION_THREADS caps it for scaling
+    // experiments) clamped to the work-item count.
     unsigned hw = std::thread::hardware_concurrency();
     if (hw == 0) hw = 4;
-    const unsigned nThreads =
-        static_cast<unsigned>(std::min<uint64_t>(hw, numSlabs));
+    if (const char* env = std::getenv("FF_EXPANSION_THREADS")) {
+        char* end = nullptr;
+        const long v = std::strtol(env, &end, 10);
+        if (end != env && v >= 1 && static_cast<unsigned long>(v) <= hw)
+            hw = static_cast<unsigned>(v);
+    }
+    const unsigned nThreads = static_cast<unsigned>(
+        std::min<uint64_t>(hw, std::max<uint64_t>(items.size(), 1ull)));
+
+    // Two spawn waves = two epochs. Every tile's raw sources must survive
+    // until ITS widen, so scratch is a PER-ITEM arena (not per-thread: a
+    // worker claims several items and each memcpy would otherwise overwrite
+    // the previous tile's slot before phase B reads it). Tiles partition the
+    // map, so the slot for item (region s, srcOff) is exactly the tile's
+    // global internal offset iOff+srcOff — the arena is internalMapBytes
+    // total. Wave 1 dispenses items dynamically and memcpy's each tile into
+    // its arena slot (reads-only epoch); the join below is the barrier; wave
+    // 2 replays each thread's OWN items: tiles forward-widen from their arena
+    // slots, single-tile regions run the original in-place backward pass;
+    // all map writes land in disjoint windows.
+    // Default-init (NOT zeroed): the arena is write-before-read and its
+    // fill must not pay a value-initialization pass inside the timed window.
+    std::unique_ptr<uint8_t[]> arena;
+    try {
+        arena.reset(new uint8_t[g.internalMapBytes]);
+    } catch (const std::bad_alloc&) {
+        std::fprintf(stderr,
+                     "[ff_sieve] error: expansion scratch alloc failed "
+                     "(%llu B)\n",
+                     static_cast<unsigned long long>(g.internalMapBytes));
+        return;
+    }
+    std::atomic<uint64_t> nextItem{0};
+    std::vector<std::vector<uint32_t>> owned(nThreads);
+    auto runWave = [&](unsigned tid, bool fill) {
+        if (fill) {
+            while (true) {
+                const uint64_t it =
+                    nextItem.fetch_add(1, std::memory_order_relaxed);
+                if (it >= items.size()) break;
+                const ExpandItem& item = items[it];
+                if (!item.inPlace) {
+                    const ExpandRegionGeom& reg = regions[item.region];
+                    std::memcpy(arena.get() + reg.iOff + item.srcOff,
+                                reg.base + item.srcOff, item.cBi);
+                }
+                owned[tid].push_back(static_cast<uint32_t>(it));
+            }
+            return;
+        }
+        for (uint32_t it : owned[tid]) {
+            const ExpandItem& item = items[it];
+            if (item.inPlace) {
+                const ExpandRegionGeom& reg = regions[item.region];
+                expandSlabInPlace(reg.base, reg.cBc, reg.cBi, reg.spanSlab);
+            } else {
+                const ExpandRegionGeom& reg = regions[item.region];
+                widenTileFromScratch(
+                    arena.get() + reg.iOff + item.srcOff, reg.base, item,
+                    tab);
+            }
+        }
+    };
     std::vector<std::thread> pool;
     pool.reserve(nThreads);
-    for (unsigned t = 0; t < nThreads; ++t) {
-        const uint64_t sBegin = numSlabs * t / nThreads;
-        const uint64_t sEnd = numSlabs * (t + 1) / nThreads;
-        if (sEnd > sBegin)
-            pool.emplace_back(expandSlabRange, hostMap, std::cref(g),
-                              slabSizeBytes, sBegin, sEnd);
-    }
+    for (unsigned t = 0; t < nThreads; ++t)
+        pool.emplace_back(runWave, t, true);
+    for (auto& th : pool) th.join();
+    nextItem.store(0, std::memory_order_relaxed);
+    pool.clear();
+    for (unsigned t = 0; t < nThreads; ++t)
+        pool.emplace_back(runWave, t, false);
     for (auto& th : pool) th.join();
     // Structural primes 3 and 5 survive wheel-30 unrepresented; the expansion
     // rebuilds every byte from scratch, so re-insert them (byte 0, bits

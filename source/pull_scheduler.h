@@ -115,16 +115,27 @@ void releasePullScheduler(PullMapResidency* residency);
 // Converts a hostMap produced by runPullScheduler (per-slab left-aligned
 // wheel-30 internal bytes) IN PLACE into the canonical 16-values-per-byte
 // format, so --dump-map / GpuPrime / stdout contracts see exactly the bytes
-// the reference produces. Backward per-superblock widening: with internal
-// bytes landed at each slab's canonical region start, processing superblocks
-// back-to-front never clobbers unread input (write base of group s is
-// 15s ≥ 8s+8 = past every still-unread byte for s ≥ 2; groups 0 and 1 stage
-// their 16 source bytes through a temp first). Table-driven: four 65536-entry
-// uint64-pair tables map each 16-input-bit quarter-superblock onto its
-// pre-shifted 30-bit canonical image (~2 ops per input byte; built once).
-// Multithreaded over slabs; the caller owns the pass timing (task 12: the
-// "wheel expansion" stderr line reports the overlapped pass's critical-path
-// residual — what the joining thread actually blocked past the kernel).
+// the reference produces. Task-18 tiled scheduling: work is split into
+// whole-superblock-group tiles of 64 MiB internal bytes; a region smaller
+// than one tile keeps the original single-pass backward in-place widening
+// (zero extra traffic). Multi-tile regions run in TWO EPOCHS separated by a
+// thread join (the barrier): epoch 1 copies each tile's raw sources into a
+// PER-ITEM arena slot (map reads only, so no writer can clobber sources
+// mid-flight; tiling the backward in-place pass directly is racy: canonical
+// destinations drift upward at 15/8x the source rate, so lower tiles' write
+// ranges always overlap upper tiles' unread sources; proofs archived in
+// .omo/start-work/evidence/e-tiling.md); epoch 2 widens each tile FORWARD
+// from its arena slot into its own canonical window — ascending group order
+// keeps write ceilings below unread shifted sources (15i+15 <= 7G'+8(i+1)
+// iff i <= G'-1), windows partition each region exactly and regions partition
+// the map, so every canonical byte is written exactly once. Pool size =
+// min(hardware_concurrency [FF_EXPANSION_THREADS env cap], work items).
+// Table-driven: four 65536-entry uint64-pair tables map each 16-input-bit
+// quarter-superblock onto its pre-shifted 30-bit canonical image (~2 ops per
+// input byte; built once). Multithreaded over tiles; the caller owns the pass
+// timing (task 12: the "wheel expansion" stderr line reports the overlapped
+// pass's critical-path residual — what the joining thread actually blocked
+// past the kernel).
 // slabSizeBytes must match the runPullScheduler call (8-byte aligned).
 void expandSieveMapToCanonical(uint8_t* hostMap, const LegGeometry& g,
                                uint64_t slabSizeBytes);

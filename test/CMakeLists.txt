@@ -161,10 +161,12 @@ add_test(NAME m4_mr_diff_bin COMMAND m4_mr_diff_bin)
 # ---- Task-9 hostmap coverage invariant (poison-build trap) ----
 # Poison twin of ff_sieve: SAME sources and link topology, compiled with
 # FF_POISON_HOSTMAP=1 so the host map starts sentinel-filled (0xA5) instead
-# of zero-filled. hostmap_coverage_test runs it on the 65536 leg in both
-# search modes and asserts stdout is byte-identical to the golden after
-# timing normalization — i.e. no sentinel byte ever influenced a verdict.
-# The production ff-gpu_exe keeps FF_POISON_HOSTMAP OFF (see top-level
+# of zero-filled. hostmap_coverage_test runs it across the task-18 run matrix
+# (leg 65536 both search modes; leg 524288 tiled / mixed-grid / adaptive slab
+# geometries) asserting stdout is byte-identical to the golden after timing
+# normalization, plus a --dump-map case byte-compared against the CPU
+# reference ff_seg map (full-byte coverage of the tiled expansion). The
+# production ff-gpu_exe keeps FF_POISON_HOSTMAP OFF (see top-level
 # CMakeLists.txt), so its behavior is untouched.
 
 add_executable(ff_sieve_poison "${PROJECT_SOURCE_DIR}/source/main.cpp")
@@ -190,11 +192,12 @@ target_compile_features(hostmap_coverage_test PRIVATE cxx_std_17)
 
 target_compile_definitions(hostmap_coverage_test PRIVATE
     FF_COVERAGE_POISON_BIN="$<TARGET_FILE:ff_sieve_poison>"
+    FF_COVERAGE_REF_BIN="$<TARGET_FILE:ff_seg>"
     FF_COVERAGE_GOLDENS_DIR="${PROJECT_SOURCE_DIR}/goldens"
 )
 
-add_dependencies(hostmap_coverage_test ff_sieve_poison)
+add_dependencies(hostmap_coverage_test ff_sieve_poison ff_seg)
 
 add_test(NAME hostmap_coverage_test COMMAND hostmap_coverage_test)
 
-set_tests_properties(hostmap_coverage_test PROPERTIES TIMEOUT 60)
+set_tests_properties(hostmap_coverage_test PROPERTIES TIMEOUT 300)
