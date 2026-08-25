@@ -32,6 +32,7 @@
 #include "devabstraction.h"
 #include "geometry.h"
 #include "m4/gpu_search_kernel.h"
+#include "m4/wheel_verdict.h"
 #include "m4/gpu_search_emission.cpp"   // inline for this standalone test
 
 // ---- Error handling ----
@@ -48,8 +49,8 @@
 
 // ---- Resolve kernel launch function (both arches) ----
 
-// ---- Small-prime sieve — CANONICAL map (host GpuPrime/emission format;
-//      the device copy is compacted to internal wheel-30 in main below) ----
+// ---- Small-prime sieve — CANONICAL map (compaction source; the device
+//      copy and the task-15/D emit decoder both consume internal wheel-30) ----
 
 static std::vector<uint8_t> cpu_generatePrimeMap(uint64_t limit) {
     uint64_t mapBytes = (limit >> 4) + 1;
@@ -103,8 +104,8 @@ int main(int /*argc*/, char** /*argv*/) {
     // Wheel-30 (task 9): the DEVICE buffer carries the INTERNAL layout
     // consumed by dev_IsPrime — same value span as canonical, sized by
     // ff::internalMapBytes (30 values/byte), exactly like production
-    // main.cpp plumbing. The CANONICAL map stays host-side only (GpuPrime
-    // oracle + emission).
+    // main.cpp plumbing. The CANONICAL map stays host-side only as the
+    // compaction source; emission decodes the internal bytes (task 15/D).
     const uint64_t mapBytes  = ff::internalMapBytes(sumLimit + 1);
 
     std::printf("=== m4_order: GPU search ordered emission test ===\n");
@@ -124,10 +125,12 @@ int main(int /*argc*/, char** /*argv*/) {
     ff::compactCanonicalToWheel30(h_primeMap.data(), h_internalMap.data(),
                                   maxPrimeMapValue + 1);
 
-    // --- 2. Build GpuPrime (host-side lookup table) ---
-    // We build the GpuPrime from the host prime map for emission. The GPU
-    // kernel uses the device copy of the same map.
-    GpuPrime* h_gpuPrime = new GpuPrime(h_primeMap.data(), maxPrimeMapValue);
+    // --- 2. Build the emit-path verdict decoder (task 15/D) ---
+    // The host internal image here is CONTIGUOUS (no per-slab packing), so
+    // the decoder gets one 8-aligned slab covering the whole image — the
+    // identity placement that production achieves per slab.
+    const uint64_t oneSlab = (h_internalMap.size() + 7ull) & ~7ull;
+    Wheel30Verdict h_verdict(h_internalMap.data(), maxPrimeMapValue, oneSlab);
 
     // --- 3. Compute kernel launch parameters ---
     uint64_t numOddSums = (sumLimit - sumStart) / 2 + 1;
@@ -141,7 +144,6 @@ int main(int /*argc*/, char** /*argv*/) {
     int devCount = ffdev::DevGetDeviceCount();
     if (devCount == 0) {
         std::printf("  No GPU devices available — skipping.\n");
-        delete h_gpuPrime;
         return 0;
     }
     std::printf("  GPU devices: %d\n", devCount);
@@ -176,7 +178,6 @@ int main(int /*argc*/, char** /*argv*/) {
         ffdev::DevFree(&dhRecords);
         ffdev::DevFree(&dhAtomicCount);
         ffdev::DevFree(&dhPrimeMap);
-        delete h_gpuPrime;
         return 0;
     }
 
@@ -206,7 +207,6 @@ int main(int /*argc*/, char** /*argv*/) {
         ffdev::DevFree(&dhRecords);
         ffdev::DevFree(&dhAtomicCount);
         ffdev::DevFree(&dhPrimeMap);
-        delete h_gpuPrime;
         return 1;
     }
 
@@ -228,15 +228,14 @@ int main(int /*argc*/, char** /*argv*/) {
             if (h_records[i].sum == 0) continue;   // unsolved slot
             ++seen;
             if (seen > 1 && h_records[i].sum <= prevSum) {
-                std::printf("  ORDER VIOLATION: slot %u (sum=%u) <= previous (sum=%llu)\n",
-                            i, (unsigned)h_records[i].sum,
-                            (unsigned long long)prevSum);
-                ffdev::DevFree(&dhRecords);
-                ffdev::DevFree(&dhAtomicCount);
-                ffdev::DevFree(&dhPrimeMap);
-                delete h_gpuPrime;
-                return 1;
-            }
+            std::printf("  ORDER VIOLATION: slot %u (sum=%u) <= previous (sum=%llu)\n",
+                        i, (unsigned)h_records[i].sum,
+                        (unsigned long long)prevSum);
+            ffdev::DevFree(&dhRecords);
+            ffdev::DevFree(&dhAtomicCount);
+            ffdev::DevFree(&dhPrimeMap);
+            return 1;
+        }
             prevSum = h_records[i].sum;
         }
         std::printf("  Slot order: OK (%u records, strictly ascending sum)\n", seen);
@@ -261,13 +260,12 @@ int main(int /*argc*/, char** /*argv*/) {
             ffdev::DevFree(&dhRecords);
             ffdev::DevFree(&dhAtomicCount);
             ffdev::DevFree(&dhPrimeMap);
-            delete h_gpuPrime;
             return 1;
         }
         dup2(fd, STDOUT_FILENO);
         close(fd);
         // GpuSearchEmit writes to stdout, which now goes to the file.
-        GpuSearchEmit(*h_gpuPrime, h_records.data(), (uint32_t)numOddSums);
+        GpuSearchEmit(h_verdict, h_records.data(), (uint32_t)numOddSums);
         // Reference emission ends with the timing footer (segmentedSieve.C:877);
         // goldens store it normalized to "N" (verify.sh NORM_SED), so emit the same shape.
         std::printf("Prime time: N \u03bcs\nFreudenthal time: N \u03bcs\n");
@@ -319,7 +317,6 @@ int main(int /*argc*/, char** /*argv*/) {
         ffdev::DevFree(&dhRecords);
         ffdev::DevFree(&dhAtomicCount);
         ffdev::DevFree(&dhPrimeMap);
-        delete h_gpuPrime;
         return 1;
     }
 
@@ -378,7 +375,6 @@ int main(int /*argc*/, char** /*argv*/) {
     ffdev::DevFree(&dhRecords);
     ffdev::DevFree(&dhAtomicCount);
     ffdev::DevFree(&dhPrimeMap);
-    delete h_gpuPrime;
 
     // --- 16. Final verdict ---
     if (nMismatch == 0) {

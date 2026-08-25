@@ -6,6 +6,9 @@ GpuPrime::GpuPrime(const uint8_t* primeMap, uint64_t maxMapValue)
 GpuPrime::~GpuPrime() {}
 
 GpuPrime::Boolean GpuPrime::IsPrime(uint64_t n) const {
+#ifndef NDEBUG
+    ++debugReads_;
+#endif
     // Reference (segmentedSieve.C:281-294): n==2 -> True, even -> False,
     // n > maxPrimeMapValue -> Miller-Rabin, else map lookup. Even numbers
     // share a map bit with the following odd and are never cleared, so the

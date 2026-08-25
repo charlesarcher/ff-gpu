@@ -29,6 +29,7 @@
 #include "pull_scheduler.h"
 #include "cpu_search.h"
 #include "m4/gpu_search_launcher.h"
+#include "m4/wheel_verdict.h"
 #include "m4/gpu_search_emission.cpp"
 #include <chrono>
 #include <iostream>
@@ -841,22 +842,25 @@ maxPrimeMapValue = ff::runPullScheduler(cfg, r.devs, budgets, g,
             dumpPhaseTimer("search H2D copies", gpuH2dMs);
         }
 
-        // Wheel-30 (tasks 6+7) + task 12 (C overlap): the GPU-search feed
-        // above consumed the per-slab internal bytes; EVERY other consumer
-        // (GpuPrime verdicts, CPU search, emission) needs the canonical
-        // layout. The conversion is destructive and non-idempotent
-        // (expandSlabInPlace widens backward IN PLACE), so it must run
-        // EXACTLY ONCE per process no matter which consumer needs the bytes
-        // first or in what order failure occurs. `canon` is the single
-        // owner: spawned here — strictly after the scheduler's post-join
-        // fence (runPullScheduler returned) and after the last internal H2D
-        // read of hostMap above — and joined before any canonical-byte
-        // consumer. Control-flow paths through the block below:
-        //   - GPU launch success: join before records D2H / emit;
-        //   - GPU launch failure -> CPU fallback: join before RunIt;
+        // Wheel-30 (tasks 6+7) + tasks 12/15 (C overlap, D scoped decoder):
+        // the GPU-search feed above consumed the per-slab internal bytes;
+        // EVERY other consumer (GpuPrime verdicts, CPU search, emission on
+        // non-GPU-success paths) needs the canonical layout. The conversion
+        // is destructive and non-idempotent (expandSlabInPlace widens
+        // backward IN PLACE), so it must run EXACTLY ONCE per process no
+        // matter which consumer needs the bytes first or in what order
+        // failure occurs. `canon` is the single owner; the spawn moved to
+        // each consuming path (task 15/D). Control-flow paths:
+        //   - GPU launch success: NO canonical consumer remains — emit
+        //     verdicts come from Wheel30Verdict decoding the unexpanded
+        //     internal bytes in place, so the expansion NEVER RUNS on this
+        //     path (its join residual — 160.034 ms median @ nv/524288, the
+        //     task-15 gate measurement — was pure wall-clock loss);
+        //   - GPU launch failure -> CPU fallback: spawned + joined before
+        //     RunIt below (serially; a failed launch leaves nothing to
+        //     overlap it with);
         //   - early capacity/alloc fallbacks and default CPU search: they
-        //     reach the spawn site all the same (it is unconditional), so
-        //     the worker is already running; join before RunIt;
+        //     reach the spawn site before RunIt all the same;
         //   - dump-map expanded synchronously earlier and returned before
         //     this point.
         // Host-only overlap: the kernel reads device buffers, never these
@@ -886,7 +890,6 @@ maxPrimeMapValue = ff::runPullScheduler(cfg, r.devs, budgets, g,
             ~CanonicalExpansion() { joinAndTime(); }   // never leak a joinable thread
         };
         CanonicalExpansion canon;
-        canon.spawn(hostMap.get(), g, cfg.slabSizeBytes);
 
         if (useGpu) {
             // Launch GPU search.  Dispatch by vendor: both runtimes number
@@ -907,11 +910,13 @@ maxPrimeMapValue = ff::runPullScheduler(cfg, r.devs, budgets, g,
 
             if (launchRet == 0) {
                 dumpPhaseTimer("search kernel", kernelMs);
-                // Overlap fence (task 12): the expansion ran beside the
-                // kernel; nothing past this line may start before its bytes
-                // are final — the D2H results feed emit, and emit reads
-                // hostMap through GpuPrime.
-                canon.joinAndTime();
+                // Task 15 (D): the expansion was never spawned on this path,
+                // so hostMap still holds the unexpanded per-slab INTERNAL
+                // bytes the H2D feed read; emit decodes them in place through
+                // Wheel30Verdict instead of GpuPrime's canonical view.
+                const Wheel30Verdict emitVerdict(hostMap.get(),
+                                                 maxPrimeMapValue,
+                                                 cfg.slabSizeBytes);
                 int ri = r.devs[gpuDeviceIndex].runtimeIndex;
                 const char* v = r.devs[gpuDeviceIndex].vendor;
 
@@ -930,8 +935,12 @@ maxPrimeMapValue = ff::runPullScheduler(cfg, r.devs, budgets, g,
                                elapsedMs(tSchedTeardown));
 
                 std::cout.flush();
+                // Consumer guard (task 15/D): nothing on the GPU-success
+                // path may read canonical bytes pre-emit — they were never
+                // expanded.
+                assert(prime.DebugCanonicalReadCount() == 0);
                 auto t1 = std::chrono::high_resolution_clock::now();
-                GpuSearchEmit(prime, hRecords.data(),
+                GpuSearchEmit(emitVerdict, hRecords.data(),
                               static_cast<uint32_t>(numOddSums));
                 auto t2 = std::chrono::high_resolution_clock::now();
                 double emitMs =
@@ -978,10 +987,11 @@ maxPrimeMapValue = ff::runPullScheduler(cfg, r.devs, budgets, g,
         // the scheduler its deferred teardown.
         if (residency.valid) ff::releasePullScheduler(&residency);
 
-        // Overlap fence (task 12): every path that reaches the CPU search
-        // consumes canonical bytes (RunIt walks hostMap directly), so join
-        // the expansion spawned above — whether it overlapped a failed GPU
-        // attempt or ran beside nothing on the default CPU-search path.
+        // Every path reaching the CPU search consumes canonical bytes (RunIt
+        // walks hostMap directly): spawn the expansion here — serially after
+        // a failed GPU attempt (nothing left to overlap it with), beside
+        // nothing on the default CPU-search path — and join before RunIt.
+        canon.spawn(hostMap.get(), g, cfg.slabSizeBytes);
         canon.joinAndTime();
 
         // CPU fallback (reuses smallPrimesRaw/smallPrimeCount from outer scope).

@@ -16,6 +16,8 @@
 #include "device_info.h"
 #include "device_registry.h"
 #include "geometry.h"
+#include "gpu_prime.h"
+#include "m4/wheel_verdict.h"
 
 static int g_failures = 0;
 
@@ -190,6 +192,79 @@ int main()
     for (unsigned t = 0; t < 128; ++t) checkSpan(1 + next() % 60000);
     checkSpan(1048577ull);
     checkSpan(2400001ull);
+
+    // ---- task 15 (D): Wheel30Verdict == GpuPrime::IsPrime ----
+    // The emit-path decoder must be verdict-exact against the canonical
+    // oracle: exhaustive n in [0, 2^22) over a random valid internal map
+    // (zero padding slots) expanded by the task-5 helper, then 10^6 random
+    // strata probes up to a full 2^28 span with boundary values, then a
+    // multi-slab PACKED-layout config exercising the production address
+    // translation ((s*slab/8)*15 placement shared with the H2D feed and
+    // expandSieveMapToCanonical).
+    {
+        auto buildMaps = [&](uint64_t span, std::vector<uint8_t>& x,
+                             std::vector<uint8_t>& y) {
+            x.assign(ff::internalMapBytes(span), 0);
+            y.assign(ff::canonicalMapBytes(span), 0);
+            for (uint64_t i = 0; i < x.size(); ++i)
+                x[i] = static_cast<uint8_t>(next());
+            for (uint64_t k = 0; k < x.size(); ++k)          // zero padding slots
+                for (unsigned i = 0; i < 8; ++i)
+                    if (30ull * k + kR[i] >= span)
+                        x[k] &= static_cast<uint8_t>(~(1u << i));
+            ff::expandWheel30ToCanonical(x.data(), y.data(), span);
+        };
+        auto verdictEq = [](bool got, GpuPrime::Boolean want) {
+            return got == (want == GpuPrime::True);
+        };
+
+        {   // exhaustive [0, 2^22): every residue class, 3/5 specials, bounds
+            const uint64_t span = 1ull << 22;
+            std::vector<uint8_t> x, y;
+            buildMaps(span, x, y);
+            GpuPrime oracle(y.data(), span - 1);
+            // Contiguous internal image: one 8-aligned slab => identity
+            // placement (single slab, s == 0 for every q).
+            Wheel30Verdict dec(x.data(), span - 1, (x.size() + 7ull) & ~7ull);
+            for (uint64_t n = 0; n < span; ++n)
+                CHECK(verdictEq(dec.IsPrime(n), oracle.IsPrime(n)));
+        }
+        {   // 10^6 random strata up to the full 2^28 span + edges
+            const uint64_t span = 1ull << 28;
+            std::vector<uint8_t> x, y;
+            buildMaps(span, x, y);
+            GpuPrime oracle(y.data(), span - 1);
+            Wheel30Verdict dec(x.data(), span - 1, (x.size() + 7ull) & ~7ull);
+            const uint64_t edge[] = {0, 1, 2, 3, 5, 7, 29, 30, 31, 59, 61,
+                                     (1ull << 20) - 1, 1ull << 20,
+                                     span - 31, span - 30, span - 2, span - 1};
+            for (uint64_t n : edge)
+                CHECK(verdictEq(dec.IsPrime(n), oracle.IsPrime(n)));
+            for (unsigned t = 0; t < 1000000; ++t) {
+                const uint64_t n =
+                    ((static_cast<uint64_t>(next()) << 24) | next()) % span;
+                CHECK(verdictEq(dec.IsPrime(n), oracle.IsPrime(n)));
+            }
+        }
+        {   // production PACKED layout: slabs of 512 internal bytes at
+            // (s*slab/8)*15 — the exact placement main.cpp feeds H2D and
+            // expandSlabRange widens. Odd sweep: layout-sensitive values.
+            const uint64_t span = 30000;
+            const uint64_t slab = 512;                       // 8-aligned
+            std::vector<uint8_t> x, y;
+            buildMaps(span, x, y);
+            std::vector<uint8_t> packed((x.size() / 8) * 15 + 16, 0);
+            for (uint64_t iOff = 0; iOff < x.size(); iOff += slab) {
+                const uint64_t cBi = std::min(slab, x.size() - iOff);
+                std::memcpy(packed.data() + (iOff / 8) * 15, x.data() + iOff,
+                            cBi);
+            }
+            GpuPrime oracle(y.data(), span - 1);
+            Wheel30Verdict dec(packed.data(), span - 1, slab);
+            for (uint64_t n = 1; n < span; n += 2)
+                CHECK(verdictEq(dec.IsPrime(n), oracle.IsPrime(n)));
+        }
+    }
 
 
     // ---- size parser ----

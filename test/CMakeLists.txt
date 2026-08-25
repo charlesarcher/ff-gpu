@@ -23,6 +23,10 @@ ff_gpu_setup_binary(abstraction_smoke)
 
 add_executable(ff_budget_selftest source/budget_selftest.cpp)
 
+# Task-15 (D) oracle: GpuPrime::IsPrime over an expanded canonical map.
+# gpu_prime.cpp is vendor-free, so the pure-host link stays GPU-runtime-free.
+target_sources(ff_budget_selftest PRIVATE ${PROJECT_SOURCE_DIR}/source/gpu_prime.cpp)
+
 target_compile_features(ff_budget_selftest PRIVATE cxx_std_17)
 
 target_link_libraries(ff_budget_selftest PRIVATE ff-gpu_core)

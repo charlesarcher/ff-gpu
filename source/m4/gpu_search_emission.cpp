@@ -14,6 +14,7 @@
 // solution count.
 
 #include "m4/gpu_search_kernel.h"
+#include "m4/wheel_verdict.h"
 #include "gpu_prime.h"
 
 #include <cstdio>
@@ -29,9 +30,15 @@
 //   - power-of-2:  " (2^N)" with fixed setprecision(0)
 //                 then if isLast: ",%*s" with width=3-floor(log10(N))
 //   - composite:   ",         " if isLast
+//
+// One template body serves both verdict sources: GpuPrime (canonical map,
+// CPU search + fallback paths) and Wheel30Verdict (internal wheel-30 map,
+// GPU-success emit path only — task 15/D).
 // ================================================================
 
-void PrintOutputTags(const GpuPrime& prime, uint64_t term, bool isLast) {
+template <typename Verdict>
+static void PrintOutputTagsImpl(const Verdict& prime, uint64_t term,
+                                bool isLast) {
     if (prime.IsPrime(term)) {
         std::printf(" (prime)");
         if (isLast) std::printf(", ");
@@ -48,6 +55,14 @@ void PrintOutputTags(const GpuPrime& prime, uint64_t term, bool isLast) {
     }
 }
 
+void PrintOutputTags(const GpuPrime& prime, uint64_t term, bool isLast) {
+    PrintOutputTagsImpl(prime, term, isLast);
+}
+
+void PrintOutputTags(const Wheel30Verdict& prime, uint64_t term, bool isLast) {
+    PrintOutputTagsImpl(prime, term, isLast);
+}
+
 // ================================================================
 // FormatGpuSearchResult
 //
@@ -61,8 +76,9 @@ void PrintOutputTags(const GpuPrime& prime, uint64_t term, bool isLast) {
 // Where lowTags has isLast=true, highTags has isLast=false.
 // ================================================================
 
-void FormatGpuSearchResult(const GpuPrime& prime, uint32_t count,
-                           const GpuRecord& rec) {
+template <typename Verdict>
+static void FormatGpuSearchResultImpl(const Verdict& prime, uint32_t count,
+                                      const GpuRecord& rec) {
     // First line: counter + sum/product/lowTerm + lowTags
     std::printf("%7u) sum =%9llu, product =%16llu,  low term =%9llu",
                 (unsigned)count,
@@ -78,6 +94,16 @@ void FormatGpuSearchResult(const GpuPrime& prime, uint32_t count,
     std::printf("\n");
 }
 
+void FormatGpuSearchResult(const GpuPrime& prime, uint32_t count,
+                           const GpuRecord& rec) {
+    FormatGpuSearchResultImpl(prime, count, rec);
+}
+
+void FormatGpuSearchResult(const Wheel30Verdict& prime, uint32_t count,
+                           const GpuRecord& rec) {
+    FormatGpuSearchResultImpl(prime, count, rec);
+}
+
 // ================================================================
 // GpuSearchEmit
 //
@@ -86,12 +112,23 @@ void FormatGpuSearchResult(const GpuPrime& prime, uint32_t count,
 // launch) are skipped.  slotCount = (sumLimit - sumStart)/2 + 1.
 // ================================================================
 
-void GpuSearchEmit(const GpuPrime& prime, const GpuRecord* records,
-                   uint32_t slotCount) {
+template <typename Verdict>
+static void GpuSearchEmitImpl(const Verdict& prime, const GpuRecord* records,
+                              uint32_t slotCount) {
     uint32_t ordinal = 0;
     for (uint32_t i = 0; i < slotCount; ++i) {
         if (records[i].sum == 0) continue;   // unsolved slot
         ++ordinal;
         FormatGpuSearchResult(prime, ordinal, records[i]);
     }
+}
+
+void GpuSearchEmit(const GpuPrime& prime, const GpuRecord* records,
+                   uint32_t slotCount) {
+    GpuSearchEmitImpl(prime, records, slotCount);
+}
+
+void GpuSearchEmit(const Wheel30Verdict& prime, const GpuRecord* records,
+                   uint32_t slotCount) {
+    GpuSearchEmitImpl(prime, records, slotCount);
 }
