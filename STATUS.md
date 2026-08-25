@@ -84,7 +84,8 @@ recovered** @1M vs amd-gap-analysis §2.3. Recorded honestly against that:
   direction (recorded as gains).
 - Occupancy split recorded honestly: sieve kernel 16 waves/SIMD ✓; search
   kernel 12 waves by measured decision (N=16 spill-free but +2.17% slower
-  @1M).
+  @1M). (Superseded 2026-08-25: post-bitmask-diet the tradeoff inverted and
+  N=16 is now baked — see Optimization campaign below.)
 
 ¹ amd_gpu@2M runs GPU search ENGAGED on the RX 9070 XT post-wheel-30: card
 named in stderr, zero fallback notices, residency handoff 0 B H2D, all reps
@@ -199,6 +200,60 @@ and NV@524288 sits at 2.18x vs its prior 2.46x verdict.
       does not survive the parsed timers. Routed to
       `.omo/notepads/kernel-gap-closure/problems.md`; remediation deliberately
       deferred (task-10 mandate).
+
+## Optimization campaign (2026-08-25)
+
+The 20-task optimization plan (`.omo/plans/gpu-optimization-execution.md`)
+ran to completion after the sweep above. The wall-clock/speedup tables in
+Current Performance are the 2026-08-24 pre-campaign sweep against the
+pre-campaign binary; they stand as the frozen-protocol baseline the campaign
+measured against (campaign gains below were booked from same-session
+interleaved A/Bs and parsed timers, not yet from a fresh authoritative
+sweep). Landed outcomes, every number from the evidence trail:
+
+- **Hostmap zero-fill deletion** (9dca37c): `hostmap zero-fill` timer
+  525.328 → 0.003 ms @amd@2M. The vendor-symmetric ~528 ms @2M cost the
+  Gate-1 decomposition surfaced is deleted outright.
+- **Canonical expansion overlapped behind `ensureCanonical()`** (9f51a68):
+  amd@1M total 3591 → 2920 ms; @2M 12472 → 11053 ms (join residuals
+  0.001 / 0.026 ms).
+- **Scoped in-map emit-verdict decoder** (31c77bd): nv@524288 wall
+  688.130 → 509.849 ms median (−25.9%); the GPU-success path no longer
+  spawns canonical expansion at all.
+- **Scratch bitmask diet** (b409375): search kernel −2.71% @1M / −3.19%
+  @2M; scratch 544 → 288 B/lane AMD and 512 → 256 B NV stack; AMD occupancy
+  rung re-baked N12 → N16 (post-diet the earlier "+2.17% slower @N=16"
+  verdict inverted).
+- **Expansion superblock tiling**, default CPU-search path + dump-map
+  (3ab5d4b): 4.16× / 2.36× / 1.00× @524K/1M/2M; starvation curve
+  191.9 → 75.6 ms (2 → 32 threads @524K). Plan bands honestly missed;
+  impossibility proofs for single-touch parallelism under the frozen deposit
+  layout are on record (`.omo/start-work/evidence/e-tiling.md`).
+
+Recorded with equal prominence, the nulls and rejects:
+
+- Targeted attribute queries: no measurable enum win (nv ~123–126 ms,
+  delta noise-level on this stack; amd ~7.5 ms unchanged) — ebd0d63.
+- REJECTED by measurement: F2 pre-MR trial screen (+1.29% @1M / +0.38% @2M),
+  F3 warp-uniform pulling (+0.84% @2M), F4 plain-OR reorder (+1.72% sieve
+  phase @amd@2M); evidence commits b760324 / 82e8c7d / 0ddc359.
+- F5 prewarm falsified, F6 fence demotion + hostRegister priced out
+  (597766c); F7 profiler track CLOSED on tooling absence (rocprofv3/omniperf
+  not installed; threshold verdicts UNMEASURED, rerun recipe archived at
+  `.omo/start-work/evidence/f7-profiler/summary.md`).
+
+Environment records (fuller notes in README):
+
+- `__launch_bounds__` second param means MIN_BLOCKS_PER_MULTIPROCESSOR on
+  CUDA but MIN_WARPS_PER_EXECUTION_UNIT on HIP/ROCm (CU/WGP-mode formulas
+  differ by wave size; raw GNU attribute spelling silently no-ops on ROCm
+  7.2, macro form mandatory; the HIP Porting Guide documents the mapping).
+- `CUDA_MODULE_LOADING`: unset everywhere, no repo override → driver default
+  LAZY verified (OVERRIDDEN-CLEAN audit).
+- nvidia-persistenced: installed, service inactive, persistence mode
+  Disabled; passwordless enablement BLOCKED-sudo at the task-7 freeze.
+  Enabling it later is a protocol change demanding a fresh re-baseline
+  (`scripts/BENCHMARK_METHODOLOGY.md`, frozen-reference section).
 
 ## Benchmark Recurrence
 

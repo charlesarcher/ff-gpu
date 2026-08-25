@@ -290,12 +290,60 @@ Wall-clock time (seconds), full process end-to-end:
 ### Notes
 
 - **nvidia_gpu / amd_gpu**: full GPU enablement — both the sieve kernel and the Freudenthal search kernel run on that card. Correctness is byte-identical to the reference in every cell (18/18 cells outcome=OK).
-- **Honest regression (committed ZERO-regression tier: FAIL)**: 14/18 cells stayed within ±3% of the frozen pre-plan baseline (`amd-gap/sweep-full.csv`); 4 cells remain beyond band after the one sanctioned re-run — nv@524288 +10.3%, nv@131072 +8.1%, amd@65536 +7.7%, nv@65536 +3.75%. Mechanism: the wheel design's canonical-expansion pass costs ~380 ms inside NV mid-leg totals, outweighing the sieve savings there (the NV sieve itself IMPROVED 337→101 ms @524288); the two @65536 misses are floor-cell noise-scale (+9/+8 ms on init-floor-dominated walls). None is a kernel-speed regression.
+- **Honest regression (committed ZERO-regression tier: FAIL)**: 14/18 cells stayed within ±3% of the frozen pre-plan baseline (`amd-gap/sweep-full.csv`); 4 cells remain beyond band after the one sanctioned re-run — nv@524288 +10.3%, nv@131072 +8.1%, amd@65536 +7.7%, nv@65536 +3.75%. Mechanism (corrected 2026-08-25 from the parsed wheel-expansion timer, Gate-1 sweep; see the Measurement upgrade note in `STATUS.md`): the canonical-expansion pass is paid by BOTH vendors, not NV alone. Parsed medians: nv 337.333 / 558.082 / 747.539 ms and amd 372.193 / 574.754 / 831.899 ms @524K/1M/2M, with phase attribution closed to ≤22.354 ms residual (≤0.285%). At the NV mid-legs this pass outweighs the sieve savings there (the NV sieve itself IMPROVED 337→101 ms @524288); the two @65536 misses are floor-cell noise-scale (+9/+8 ms on init-floor-dominated walls, unadjudicable at current resolution). None is a kernel-speed regression. (An earlier revision of this bullet attributed the NV mid-leg cost via subtraction-derived arithmetic; that attribution does not survive the parsed timers.)
 - **Headlines**: AMD@1048576 **2.89x** (9.473 s / 3.283 s) beats both its committed bar (≥1.6x) and stretch bar (≥1.8x); amd@2097152 converted from a 50.6 s CPU-fallback completion cell into a **true GPU-search cell at 12.483 s** (bar ≤38 s; also beats the ≤26 s marker); NV@1M 4.80x / @2M 7.58x exceed their prior verdict bands in the improvement direction. Sieve execution deficit vs `amd-gap-analysis` §2.3: **88.7% recovered** @1M (2369.8 → 268.5 ms).
-- **Occupancy, recorded honestly**: sieve kernel 16 waves/SIMD with 0 spills ✓; search kernel runs 12 waves/SIMD by measured decision — the N=16 rung compiled spill-free but measured +2.17% slower @1M (kernel is scratch-bound).
+- **Occupancy, recorded honestly**: sieve kernel 16 waves/SIMD with 0 spills ✓; search kernel runs 12 waves/SIMD by measured decision — the N=16 rung compiled spill-free but measured +2.17% slower @1M (kernel is scratch-bound). (Superseded 2026-08-25: after the compositePower2 bitmask diet halved scratch, the ladder re-measured and N=16 became the faster rung; it is now baked. See Optimization campaign below.)
 - **65K floors**: NVIDIA 0.263 s / AMD 0.113 s walls are init-floor-dominated (device enumeration alone: 124.2 ms NV vs 7.5 ms AMD per the verdict's phase decomposition).
 - ¹ **amd_gpu @ 2M** now runs GPU search ENGAGED on the RX 9070 XT: card named in stderr, zero fallback notices, residency handoff 0 B H2D, rc=0 byte-identical, all 3 reps carry search-kernel sub-timers (impossible under CPU fallback). See Known Issues #2.
 - AMD GPU requires ROCm 7.2+ for gfx1201 support.
+
+### Optimization campaign (2026-08-25)
+
+A 20-task instrumentation-and-optimization plan
+(`.omo/plans/gpu-optimization-execution.md`) ran to completion after the sweep
+above. The wall-clock and speedup tables in this section are the 2026-08-24
+pre-campaign sweep; they stand as the frozen-protocol baseline the campaign
+measured against. Landed outcomes, every number from the evidence trail:
+
+| Change | Measured outcome | Commit |
+|--------|------------------|--------|
+| Hostmap zero-fill deletion | `hostmap zero-fill` timer 525.328 → 0.003 ms @amd@2M; the vendor-symmetric ~528 ms @2M cost surfaced by the Gate-1 decomposition is deleted outright | 9dca37c |
+| Canonical expansion overlapped behind `ensureCanonical()` | amd@1M total 3591 → 2920 ms; @2M 12472 → 11053 ms (join residuals 0.001 / 0.026 ms) | 9f51a68 |
+| Scoped in-map emit-verdict decoder | nv@524288 wall 688.130 → 509.849 ms median, −25.9%; the GPU-success path no longer spawns canonical expansion at all | 31c77bd |
+| Scratch bitmask diet (`compositePower2[64]` → uint32 mask) | search kernel −2.71% @1M / −3.19% @2M; scratch 544 → 288 B/lane AMD, 512 → 256 B NV stack; AMD rung re-baked N12 → N16 | b409375 |
+| Expansion superblock tiling (default CPU-search path + dump-map) | 4.16× / 2.36× / 1.00× @524K/1M/2M; starvation curve 191.9 → 75.6 ms (2 → 32 threads @524K) | 3ab5d4b |
+
+Honest nulls and rejects, stated as plainly as the wins:
+
+- **Targeted attribute queries**: no measurable enum win — nv ~123–126 ms
+  (delta noise-level on this stack), amd ~7.5 ms unchanged (ebd0d63).
+- **REJECTED by measurement**: F2 pre-MR trial screen (+1.29% @1M / +0.38%
+  @2M slower), F3 warp-uniform pulling (+0.84% @2M slower), F4 plain-OR
+  reorder (+1.72% sieve phase @amd@2M) — evidence commits b760324 / 82e8c7d /
+  0ddc359.
+- **F5 prewarm falsified / F6 fences+pinning priced out** (597766c);
+  **F7 profiler track closed** — rocprofv3/omniperf are absent on this machine
+  (tooling-absence proof archived; a rerun recipe is on record should profiler
+  tooling land later).
+
+#### Portability & environment notes
+
+- **`__launch_bounds__` second parameter diverges between backends.** CUDA
+  reads it as MIN_BLOCKS_PER_MULTIPROCESSOR (minimum resident blocks per SM);
+  HIP/ROCm reinterprets it as MIN_WARPS_PER_EXECUTION_UNIT, with CU/WGP-mode
+  formulas that differ by wave size (gfx1201: wave32, 1536 VGPRs/SIMD budget,
+  granule 24, cap 16 waves/EU; wave64 halves the budget). On ROCm 7.2 the raw
+  GNU attribute spelling silently no-ops, so the macro form is mandatory. The
+  HIP Porting Guide documents this mapping; live ladder receipts live in
+  `.omo/evidence/gpu-speedup/gap-closure/task-2-kernel-gap-closure/ladder.md`.
+- **`CUDA_MODULE_LOADING=LAZY` is the verified effective default**: unset in
+  the shell environment and overridden nowhere in the repo (audit verdict
+  OVERRIDDEN-CLEAN, `.omo/start-work/evidence/env-audit.md`).
+- **nvidia-persistenced is installed but DISABLED**: passwordless enablement
+  was attempted once during the task-7 protocol freeze and was BLOCKED-sudo;
+  persistence mode read `Disabled` before and after. Enabling it later is a
+  protocol change requiring a fresh re-baseline before ±3% bands are quoted
+  (`scripts/BENCHMARK_METHODOLOGY.md`, frozen-reference section).
 
 ## Project Structure
 
