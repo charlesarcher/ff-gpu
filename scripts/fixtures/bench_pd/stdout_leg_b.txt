@@ -1,0 +1,5 @@
+maxPrimeMapValue 268435471 numPrimesRequested 3538 sqrtLimit 16384
+      1) sum =       17, product =              52,  low term =        4 (2^2),   high term =       13 (prime)
+   2357) sum =    65527, product =          524152,  low term =        8 (2^3),   high term =    65519 (prime)
+Prime time: 99999 μs
+Freudenthal time: 1 μs

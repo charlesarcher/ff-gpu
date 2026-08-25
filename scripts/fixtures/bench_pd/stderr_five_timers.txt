@@ -1,0 +1,17 @@
+device filter: --devices=amd kept 1 of 1 logical device(s)
+GPU search: AMD Radeon RX 9070 XT
+ff_sieve timing: device enumeration (--list-devices) = 999.123 ms
+ff_sieve timing: device enumeration = 124.200 ms
+ff_sieve timing: budget computation = 3.410 ms
+ff_sieve timing: hostmap zero-fill = 41.007 ms
+ff_sieve timing: sieve phase = 268.512 ms
+ff_sieve timing: wheel expansion = 377.900 ms
+ff_sieve timing: scheduler teardown = 12.340 ms
+ff_sieve timing: search device setup = 88.250 ms
+ff_sieve timing: search phase = 1500.001 ms
+ff_sieve timing: search H2D copies = 10.500 ms
+ff_sieve timing: search kernel = 1200.000 ms
+ff_sieve timing: search D2H copies = 250.000 ms
+ff_sieve timing: search emit = 39.501 ms
+ff_sieve timing: search device teardown = 7.750 ms
+ff_sieve timing: total = 2100.000 ms

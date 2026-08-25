@@ -1,0 +1,2 @@
+Reference ff_seg run: no GPU lines, no ff_sieve timing lines at all.
+   2357) sum =    65527, product =          524152,  low term =        8 (2^3),   high term =    65519 (prime)
