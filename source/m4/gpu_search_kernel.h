@@ -45,7 +45,6 @@
 // trap any future algebra change that would outgrow the table (dev preset
 // never defines NDEBUG, so these stay live in production builds).
 #define MAX_FACTORS                32
-#define MAX_COMP_MAX_POWER2        64
 
 // ---- Read-only load hints (task 15) -----------------------------------------
 // FF_SEARCH_LD_RO_*: explicit read-only data load for values that are
@@ -81,18 +80,22 @@
 // NVIDIA side is intentionally UNCLAMPED: ptxas holds its natural 78 regs /
 // 0 spills and clamping showed no benefit (parity check in ladder.md).
 //
-// BAKED RUNG = 12: N=16 compiles spill-free (VGPRs squeezed 100→88) but
-// measured +2.2% slower @1M — this kernel is local-memory bound, so the
-// occupancy win does not pay for the register squeeze; N=12 keeps native
-// resources AND pins the floor (future VGPR growth must spill loudly here
-// instead of silently dropping below 12 waves).
+// BAKED RUNG = 16 (re-baked by the F1 scratch diet's re-ladder): pre-diet,
+// N=16 compiled spill-free (VGPRs squeezed 100→88) but measured +2.2% slower
+// @1M — the kernel was local-memory bound at 544–560 B/lane scratch, so the
+// occupancy win did not pay for the register squeeze. The F1 bitmask diet
+// halved scratch (272 B/lane @N=12, 288 B/lane @N=16), flipping the tradeoff:
+// interleaved same-session A/B now measures N=16 FASTER on both legs
+// (−2.7% @1M / −3.2% @2M vs the pre-diet N=12 binary; 5/6 pairs each leg;
+// evidence: .omo/start-work/evidence/f1-replay-order-proof.md companion log
+// f1-scratch-diet-evidence.md). Still spill-free at the 16-wave budget.
 //
 // Compile-time override for experiments, mirroring the FF_SIEVE_* geometry
 // macro idiom: -DFF_SEARCH_MIN_BLOCKS_PER_SM=<n>. Values above the zero-spill
 // boundary FORCE register spills (proven in forced-spill-rung.log).
 #ifndef FF_SEARCH_MIN_BLOCKS_PER_SM
 #if defined(__HIP_PLATFORM_AMD__)
-#define FF_SEARCH_MIN_BLOCKS_PER_SM 12
+#define FF_SEARCH_MIN_BLOCKS_PER_SM 16
 #else
 #define FF_SEARCH_MIN_BLOCKS_PER_SM 0
 #endif
@@ -502,8 +505,15 @@ __global__ void FF_SEARCH_LAUNCH_BOUNDS SEARCH_KERNEL(
             // STATE-RESET RULE (work-stealing): every per-sum local is declared
             // HERE and fully re-initialized for each pulled index — no state
             // may survive across loop iterations.
-            uint32_t compositePower2[MAX_COMP_MAX_POWER2];
-            uint32_t numComposite = 0;
+            // Composite powers from Phase 1 as a bitmask (F1 scratch diet):
+            // bit p set <=> sum - 2^p was found composite. Replaces the
+            // retired compositePower2[64] table (256 B/lane -> 4 B/lane of
+            // scratch). Phase 1 visits each power2 at most once, so one bit
+            // per power is lossless. Domain bound: power2 >= 32 requires
+            // sum > 2^32 + 2, which GpuRecord.sum (uint32) already cannot
+            // represent — every sum this kernel can emit correctly has
+            // power2 <= 31, so uint32 covers the full supported domain.
+            uint32_t compositeMask = 0;
             uint32_t numValid = 0;
             uint64_t termA = 0, termB = 0;
             bool termsFound = false;
@@ -520,8 +530,7 @@ __global__ void FF_SEARCH_LAUNCH_BOUNDS SEARCH_KERNEL(
                         termsFound = true;
                     }
                 } else {
-                    if (numComposite < MAX_COMP_MAX_POWER2)
-                        compositePower2[numComposite++] = (uint32_t)power2;
+                    compositeMask |= (1u << power2);
                 }
             }
 
@@ -555,15 +564,21 @@ __global__ void FF_SEARCH_LAUNCH_BOUNDS SEARCH_KERNEL(
             }
 
             // ---- Phase 3: Power2Composite ----
+            // Walk compositeMask's set bits MSB-down. Phase 1 records each
+            // composite power2 exactly once into a strictly ascending
+            // sequence, so descending bit order visits the same powers in the
+            // same order as the retired table's backwards index walk —
+            // replay-order induction proof:
+            //   .omo/start-work/evidence/f1-replay-order-proof.md
             if (numValid <= 1) {
-                int32_t nc = (int32_t)numComposite - 1;
-                while (nc >= 0) {
-                    int32_t idx = nc;
-                    --nc;
-                    uint64_t evenTerm = ((uint64_t)1 << compositePower2[idx]);
+                uint32_t pending = compositeMask;
+                while (pending) {
+                    const uint32_t idx = 31u - (uint32_t)__clz(pending);
+                    pending &= ~(1u << idx);
+                    uint64_t evenTerm = ((uint64_t)1 << idx);
                     uint64_t oddTerm = sum - evenTerm;
                     if ((numValid += dev_AllButOneProductOfTermPairsOfSumOfFactorPairsHasSingleFactorPair(
-                            compositePower2[idx], oddTerm, sum,
+                            idx, oddTerm, sum,
                             primeMap, maxPrimeMapValue, smallPrimes, smallPrimeCount, primeIndex)) > 1)
                         break;
                     if (!termsFound && numValid == 1) {
