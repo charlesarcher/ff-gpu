@@ -31,6 +31,15 @@ CUDA calls anywhere in the tree.
 
 ## Current Performance (authoritative sweep: `scripts/bench_per_device.sh`, median of 3 timed reps after 1 untimed warmup; wheel-30 gap-closure final sweep 2026-08-24 — every figure verbatim from `.omo/evidence/gpu-speedup/gap-closure/final-verdict.md`)
 
+> **Measurement upgrade (2026-08-25)**: four new stderr timers landed
+> (`hostmap zero-fill`, `scheduler teardown`, `search device setup`,
+> `search device teardown`); the harness parses five phase columns (wheel
+> expansion plus those four) plus an `unaccounted_ms` completeness check, and
+> gates every rep on a normalized-sha256 stdout match. Wall-clock and speedup
+> tables below are untouched (2026-08-24 sweep); only the mechanism narrative
+> has been restated from the parsed medians. Numerators archived at
+> `.omo/start-work/evidence/gate1-numerators.md`.
+
 ### Wall-Clock Time (seconds)
 
 | Config | 65K | 131K | 262K | 524K | 1M | 2M |
@@ -55,10 +64,21 @@ recovered** @1M vs amd-gap-analysis §2.3. Recorded honestly against that:
 
 - The committed ZERO-regression tier is an honest **FAIL**: 14/18 cells clean;
   4 cells beyond ±3% after the one sanctioned re-run (nv@524288 +10.3%,
-  nv@131072 +8.1%, amd@65536 +7.7%, nv@65536 +3.75%). Mechanism: the wheel
-  canonical-expansion pass costs ~380 ms inside NV mid-leg totals,
-  outweighing sieve savings there (NV sieve itself IMPROVED 337→101 ms
-  @524288); the two @65536 misses are floor-cell noise-scale.
+  nv@131072 +8.1%, amd@65536 +7.7%, nv@65536 +3.75%). Mechanism, restated from
+  parsed timers (parsed wheel-expansion timer, Gate-1 sweep 2026-08-25; see
+  Measurement upgrade note below): the wheel canonical-expansion pass is paid
+  by BOTH vendors, not NV alone. Parsed medians: nv 337.333 / 558.082 /
+  747.539 ms and amd 372.193 / 574.754 / 831.899 ms @524K/1M/2M, with phase
+  attribution closed to ≤22.354 ms residual (≤0.285%). At the NV mid-legs this
+  pass outweighs the sieve savings there (NV sieve itself IMPROVED 337→101 ms
+  @524288). The decomposition also surfaced a previously invisible cost:
+  hostmap zero-fill measures 0.4→528 ms, vendor-symmetric (~528 ms @2M on both
+  cards); its deletion is funded (plan task 9). The two @65536 regressions
+  stay listed but are unadjudicable at current resolution: a ±3% band is
+  single-digit ms against 104-292 ms walls, below the 100+ ms
+  enumeration-jitter scale (parsed enum column: nv ~113-124 ms vs amd
+  ~7.5 ms), with config-block first-rep inflation documented in
+  `scripts/BENCHMARK_METHODOLOGY.md`.
 - NVIDIA band check is a **PARTIAL FAIL**: @524288 2.18x vs prior 2.46x =
   −11.5% ✗; @1M 4.80x and @2M 7.58x exceed their bands in the improvement
   direction (recorded as gains).
@@ -102,7 +122,9 @@ above. Headlines: NVIDIA up to **7.58x** @2M / **4.80x** @1M; AMD **2.89x**
 GPU-search cell at **12.483 s** / 3.31x. The pre-wheel "AMD ≥2x misses are
 structural" conclusion is OBSOLETE — it was invalidated by wheel-30 map
 compression. Honest residual: 4/18 cells regressed beyond ±3% vs the frozen
-pre-plan baseline (NV mid-leg canonical-expansion cost; floor-cell noise),
+pre-plan baseline (mechanism decomposed in Current Performance above: the
+wheel canonical-expansion pass, paid by both vendors per the parsed Gate-1
+timers; the floor-cell deltas are unadjudicable at current resolution),
 and NV@524288 sits at 2.18x vs its prior 2.46x verdict.
 
 ### 3. Thread Count Mismatch (INFORMATIONAL)
@@ -167,12 +189,16 @@ and NV@524288 sits at 2.18x vs its prior 2.46x verdict.
      completion cell into a **true GPU-search cell at 12.483 s** (bar ≤38 s);
      NV@1M 4.80x / @2M 7.58x; sieve execution deficit **88.7% recovered**
      vs amd-gap-analysis §2.3.
-   - Honest cost: the committed ZERO-regression tier FAILED on 4/18 cells
-     (nv@524288 +10.3%, nv@131072 +8.1%, amd@65536 +7.7%, nv@65536 +3.75%)
-     and NV@524288's speedup fell 2.46x → 2.18x (−11.5%) — the wheel
-     canonical-expansion pass costs ~380 ms inside NV mid-leg totals.
-     Routed to `.omo/notepads/kernel-gap-closure/problems.md`; remediation
-     deliberately deferred (task-10 mandate).
+    - Honest cost: the committed ZERO-regression tier FAILED on 4/18 cells
+      (nv@524288 +10.3%, nv@131072 +8.1%, amd@65536 +7.7%, nv@65536 +3.75%)
+      and NV@524288's speedup fell 2.46x → 2.18x (−11.5%). Decomposition
+      (parsed wheel-expansion timer, Gate-1 sweep 2026-08-25): the
+      canonical-expansion pass costs nv 337.333 / 558.082 / 747.539 ms and
+      amd 372.193 / 574.754 / 831.899 ms @524K/1M/2M, on BOTH vendors; the
+      earlier NV-only attribution rested on total-minus-phases arithmetic and
+      does not survive the parsed timers. Routed to
+      `.omo/notepads/kernel-gap-closure/problems.md`; remediation deliberately
+      deferred (task-10 mandate).
 
 ## Benchmark Recurrence
 
