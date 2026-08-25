@@ -780,13 +780,24 @@ void expandSlabRange(uint8_t* hostMap, const LegGeometry& g,
     }
 }
 
+// Task-12 debug trap: the expansion is destructive and non-idempotent
+// (expandSlabInPlace widens backward IN PLACE), so a second entry within one
+// process means an exactly-once contract violation in the caller — abort
+// loudly instead of silently corrupting hostMap.
+std::atomic<unsigned> g_expandEntries{0};
+
 }  // namespace
 
 void expandSieveMapToCanonical(uint8_t* hostMap, const LegGeometry& g,
                                uint64_t slabSizeBytes)
 {
     if (hostMap == nullptr || g.internalMapBytes == 0) return;
-    const auto t0 = std::chrono::steady_clock::now();
+    if (g_expandEntries.fetch_add(1, std::memory_order_relaxed) != 0) {
+        std::fprintf(stderr,
+                     "[ff_sieve] FATAL: expandSieveMapToCanonical entered "
+                     "twice — exactly-once contract violated\n");
+        std::abort();
+    }
     const uint64_t numSlabs =
         (g.internalMapBytes + slabSizeBytes - 1) / slabSizeBytes;
     unsigned hw = std::thread::hardware_concurrency();
@@ -807,9 +818,6 @@ void expandSieveMapToCanonical(uint8_t* hostMap, const LegGeometry& g,
     // rebuilds every byte from scratch, so re-insert them (byte 0, bits
     // 0x40|0x20). Value 1 arrives cleared through the internal 0xfe init.
     hostMap[0] |= static_cast<uint8_t>(0x60u);
-    const double ms = std::chrono::duration<double, std::milli>(
-                          std::chrono::steady_clock::now() - t0).count();
-    std::fprintf(stderr, "ff_sieve timing: wheel expansion = %.3f ms\n", ms);
 }
 
 }  // namespace ff

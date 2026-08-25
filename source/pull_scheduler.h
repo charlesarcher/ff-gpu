@@ -122,7 +122,9 @@ void releasePullScheduler(PullMapResidency* residency);
 // their 16 source bytes through a temp first). Table-driven: four 65536-entry
 // uint64-pair tables map each 16-input-bit quarter-superblock onto its
 // pre-shifted 30-bit canonical image (~2 ops per input byte; built once).
-// Multithreaded over slabs; emits one "ff_sieve timing:" line for the pass.
+// Multithreaded over slabs; the caller owns the pass timing (task 12: the
+// "wheel expansion" stderr line reports the overlapped pass's critical-path
+// residual — what the joining thread actually blocked past the kernel).
 // slabSizeBytes must match the runPullScheduler call (8-byte aligned).
 void expandSieveMapToCanonical(uint8_t* hostMap, const LegGeometry& g,
                                uint64_t slabSizeBytes);
