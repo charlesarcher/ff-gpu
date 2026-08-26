@@ -1,6 +1,7 @@
 #ifndef FF_GPU_PRIME_H
 #define FF_GPU_PRIME_H
 
+#include <atomic>
 #include <cstdint>
 
 class GpuPrime {
@@ -19,7 +20,7 @@ public:
     // Task-15 (D) consumer guard: counts canonical-layout reads in debug
     // builds so main.cpp can assert the GPU-success emit path performs ZERO
     // (its verdicts come from the Wheel30Verdict internal-layout decoder).
-    unsigned long long DebugCanonicalReadCount() const { return debugReads_; }
+    unsigned long long DebugCanonicalReadCount() const { return debugReads_.load(std::memory_order_relaxed); }
 
 private:
     static uint64_t ModularMulL(uint64_t a, uint64_t b, uint64_t modulus);
@@ -28,7 +29,7 @@ private:
 
     const uint8_t* primeMap_;
     uint64_t maxPrimeMapValue_;
-    mutable unsigned long long debugReads_ = 0;
+    mutable std::atomic<unsigned long long> debugReads_{0};
 };
 
 #endif

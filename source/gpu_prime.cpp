@@ -7,7 +7,7 @@ GpuPrime::~GpuPrime() {}
 
 GpuPrime::Boolean GpuPrime::IsPrime(uint64_t n) const {
 #ifndef NDEBUG
-    ++debugReads_;
+    debugReads_.fetch_add(1, std::memory_order_relaxed);
 #endif
     // Reference (segmentedSieve.C:281-294): n==2 -> True, even -> False,
     // n > maxPrimeMapValue -> Miller-Rabin, else map lookup. Even numbers
