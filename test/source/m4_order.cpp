@@ -228,14 +228,14 @@ int main(int /*argc*/, char** /*argv*/) {
             if (h_records[i].sum == 0) continue;   // unsolved slot
             ++seen;
             if (seen > 1 && h_records[i].sum <= prevSum) {
-            std::printf("  ORDER VIOLATION: slot %u (sum=%u) <= previous (sum=%llu)\n",
-                        i, (unsigned)h_records[i].sum,
-                        (unsigned long long)prevSum);
-            ffdev::DevFree(&dhRecords);
-            ffdev::DevFree(&dhAtomicCount);
-            ffdev::DevFree(&dhPrimeMap);
-            return 1;
-        }
+                std::printf("  ORDER VIOLATION: slot %u (sum=%u) <= previous (sum=%llu)\n",
+                            i, (unsigned)h_records[i].sum,
+                            (unsigned long long)prevSum);
+                ffdev::DevFree(&dhRecords);
+                ffdev::DevFree(&dhAtomicCount);
+                ffdev::DevFree(&dhPrimeMap);
+                return 1;
+            }
             prevSum = h_records[i].sum;
         }
         std::printf("  Slot order: OK (%u records, strictly ascending sum)\n", seen);

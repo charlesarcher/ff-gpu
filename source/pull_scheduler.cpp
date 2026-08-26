@@ -952,9 +952,9 @@ void expandSieveMapToCanonical(uint8_t* hostMap, const LegGeometry& g,
         arena.reset(new uint8_t[g.internalMapBytes]);
     } catch (const std::bad_alloc&) {
         // Memory-pressure fallback: widen every region IN PLACE (the
-        // zero-extra-memory region-grain schedule). The map MUST end
+        // zero-extra-memory region-grain schedule). Invariant owner: canonical consumers (dump-map, CPU search) require canonical layout; the map MUST end
         // canonical — bailing out here would hand internal-layout bytes to
-        // canonical consumers (dump-map, CPU search) with rc=0.
+        // those consumers with rc=0.
         std::fprintf(stderr,
                      "[ff_sieve] expansion: scratch alloc failed (%llu B) — "
                      "falling back to in-place region-grain widening\n",

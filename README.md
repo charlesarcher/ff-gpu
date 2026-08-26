@@ -84,6 +84,9 @@ The `dev` preset (defined in `CMakeUserPresets.json`):
 | `slab_cmp` | `build/test/slab_cmp` | Slab-kernel CPU-vs-GPU comparison |
 | `m4_kernel_unit_bin` | `build/test/m4_kernel_unit_bin` | M4 kernel unit test |
 | `m4_order_bin` | `build/test/m4_order_bin` | M4 output-order vs-golden test |
+| `m4_mr_diff_bin` | `build/test/m4_mr_diff_bin` | M4 Miller-Rabin differential vs host GpuPrime |
+| `hostmap_coverage_test` | `build/test/hostmap_coverage_test` | Hostmap coverage invariant (poison-build trap) |
+| `slab_geom_bench_amd` / `slab_geom_bench_nv` | `build/test/slab_geom_bench_{amd,nv}` | Slab geometry bench (per-arch hipcc binaries, direct-run; also registered as ctest) |
 
 ### Building individual targets
 
@@ -118,7 +121,7 @@ The build assumes these fixed locations (mirroring the original Makefile):
 
 - `/opt/rocm/bin/hipcc` — the `hipcc` compiler driver for both vendor sides
 - `/opt/rocm/include` — ROCm headers
-- `/usr/local/cuda/lib64` — CUDA runtime library (for `-lcudart`)
+- `/usr/local/cuda/lib64` — CUDA runtime library (for `-lcudart` and `-lcuda`; the NV backend links `-lcuda` for hipDeviceGet/GetName via HIP-on-CUDA, source-level HIP purity intact with no direct CUDA calls in source, libcuda resolves the symbol mapping)
 - `/opt/rocm/lib` — ROCm runtime library (for `-lamdhip64`)
 
 If your toolchain lives elsewhere, edit the paths in `CMakeLists.txt` (the AMD/NVIDIA custom-command blocks and the `FF_GPU_RUNTIME_LIBS` link directories).
@@ -128,7 +131,7 @@ If your toolchain lives elsewhere, edit the paths in `CMakeLists.txt` (the AMD/N
 Run the full suite with CTest:
 
 ```bash
-ctest --preset dev          # all 5 tests, parallel
+ctest --preset dev          # all 9 tests, parallel
 ```
 
 Run one test, or get verbose output on failure:
@@ -147,8 +150,11 @@ ctest --preset dev --output-on-failure
 | `slab_cmp` | Slab sieve kernel: CPU vs GPU output per slab | all pass |
 | `m4_kernel_unit_bin` | M4 GPU search kernel unit behavior | Slow (~83 s) |
 | `m4_order_bin` | M4 GPU-search emission vs reference `ff_seg` goldens, byte-identical | Slow (~7 s) |
+| `m4_mr_diff_bin` | M4 Miller-Rabin differential: device dev_IsPrime vs host GpuPrime | Fast |
+| `hostmap_coverage_test` | Hostmap coverage invariant (poison-build trap, leg 65536 both modes plus 524288 tiled geometries) | ~300 s timeout |
+| `slab_geom_bench_amd` / `slab_geom_bench_nv` | Slab geometry bench (per-arch hipcc binaries, direct-run) | Fast |
 
-Expected result: **all tests pass**.
+Expected result: **all 9 tests pass** (7 ctest binaries plus 2 slab_geom_bench).
 
 ## Running `ff_sieve`
 
@@ -386,7 +392,7 @@ Build outputs land in `build/` (fully gitignored); reference binaries stay in `r
 
 ### 1. `slab_cmp` — all cases pass
 
-The `slab_cmp` test previously failed 5/10 cases due to a test-side indexing mismatch (the GPU kernel correctly used segLo-relative indexing matching the production slab engine, but the test compared as global-indexed). The test has been corrected and **all cases pass** with byte-identical output — the matrix has since grown to **22 cases** (task-9 twin coverage: superblock truncation/mid-group tails, degenerate spans, deep offsets), all green in the latest `ctest` run (8/8 suites).
+The `slab_cmp` test previously failed 5/10 cases due to a test-side indexing mismatch (the GPU kernel correctly used segLo-relative indexing matching the production slab engine, but the test compared as global-indexed). The test has been corrected and **all cases pass** with byte-identical output — the matrix has since grown to **22 cases** (task-9 twin coverage: superblock truncation/mid-group tails, degenerate spans, deep offsets), all green in the latest `ctest` run (9/9 suites).
 
 ### 2. amd@2M leg — TRUE GPU search since the wheel-30 landing (was: auto-spill completion)
 

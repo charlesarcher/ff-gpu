@@ -938,6 +938,7 @@ maxPrimeMapValue = ff::runPullScheduler(cfg, r.devs, budgets, g,
                 // Consumer guard (task 15/D): nothing on the GPU-success
                 // path may read canonical bytes pre-emit — they were never
                 // expanded.
+                // NOTE: live in production (-O2 no NDEBUG); any future canonical read pre-emit on GPU-success trips this after minutes of kernel work, keep zero-read invariant
                 assert(prime.DebugCanonicalReadCount() == 0);
                 auto t1 = std::chrono::high_resolution_clock::now();
                 GpuSearchEmit(emitVerdict, hRecords.data(),

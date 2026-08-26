@@ -33,6 +33,7 @@ public:
         // Emit-path terms are < sumLimit, far below the map bound, so
         // dev_IsPrime's above-bound Miller-Rabin quirk is unreachable here BY
         // CONSTRUCTION — hard-stop if a future consumer ever breaks that.
+        // invariant: emit terms < sumLimit <= maxPrimeMapValue; tripping here means decoder called above-bound term, would need Miller-Rabin fallback
         assert(n <= max_);
         if (n == 2) return true;
         if (!(n & 1)) return false;

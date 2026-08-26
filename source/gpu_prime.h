@@ -20,6 +20,7 @@ public:
     // Task-15 (D) consumer guard: counts canonical-layout reads in debug
     // builds so main.cpp can assert the GPU-success emit path performs ZERO
     // (its verdicts come from the Wheel30Verdict internal-layout decoder).
+    // invariant: GPU-success emit must keep canonical reads at zero; tripping means canonical path leaked pre-emit, would corrupt verdicts
     unsigned long long DebugCanonicalReadCount() const { return debugReads_.load(std::memory_order_relaxed); }
 
 private:

@@ -222,7 +222,7 @@ run_one() {
     local cfg="$1" leg="$2" scratch_dir="$3" expect="$4" forbid="$5"; shift 5
     local t_start t_end wall_ms wall_s rc
     t_start=$(date +%s%N)
-    eval "cd '$scratch_dir' && timeout ${TIMEOUT_SEC} $*" \
+    eval "( cd '$scratch_dir' && exec timeout ${TIMEOUT_SEC} $* )" \
         > "$scratch_dir/output.txt" 2> "$scratch_dir/stderr.txt"
     rc=$?
     t_end=$(date +%s%N)
@@ -316,7 +316,7 @@ for entry in "${CONFIGS[@]}"; do
     cmd="${rest##*|}"
     [[ "$WARMUP" -ge 1 ]] || continue
     wd="$(mktemp -d "$ROOT/run/bench_pd_warm.XXXXXX")"
-    eval "cd '$wd' && timeout ${TIMEOUT_SEC} $cmd ${LEGS[0]}" \
+    eval "( cd '$wd' && exec timeout ${TIMEOUT_SEC} $cmd ${LEGS[0]} )" \
         > /dev/null 2>&1
     echo "  warm: $cfg done"
     rm -rf "$wd"
@@ -388,7 +388,7 @@ for entry in "${CONFIGS[@]}"; do
         sha_all=yes
         if [[ "$JIT_WARMUP" == 1 ]]; then
             wwd="$(mktemp -d "$ROOT/run/bench_pd_jit.XXXXXX")"
-            eval "cd '$wwd' && timeout ${TIMEOUT_SEC} $cmd $leg" >/dev/null 2>&1
+            eval "( cd '$wwd' && exec timeout ${TIMEOUT_SEC} $cmd $leg )" >/dev/null 2>&1
             rm -rf "$wwd"
         fi
         target="$REPS"; r=0; extras=0
