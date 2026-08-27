@@ -351,6 +351,49 @@ Honest nulls and rejects, stated as plainly as the wins:
   protocol change requiring a fresh re-baseline before ±3% bands are quoted
   (`scripts/BENCHMARK_METHODOLOGY.md`, frozen-reference section).
 
+### Fine-grained sweep (32 points, post-campaign, 2026-08-26)
+
+Linear 64 KiB step from 65 536 → 2 097 152 (32 legs), same authoritative harness (`bench_per_device.sh`, median-of-5 sub-second, sha256 gate active), 96/96 cells OK. Full table at `.omo/start-work/evidence/fine-sweep-summary.md` and raw CSVs at `scripts/bench_per_device_results.csv`.
+
+Wall-clock medians (s) and speedup vs reference — compact excerpt (every 4th leg plus the 6 original legs marked ●):
+
+| leg | ref | amd_gpu | nvidia_gpu | amd sp | nvidia sp |
+|-----|-----|---------|------------|--------|-----------|
+| 65536 ● | 0.019 | 0.085 | 0.226 | 0.22x | 0.08x |
+| 131072 ● | 0.088 | 0.131 | 0.252 | 0.67x | 0.35x |
+| 196608 | 0.202 | 0.169 | 0.272 | 1.20x | 0.74x |
+| 262144 ● | 0.419 | 0.243 | 0.335 | 1.72x | 1.25x |
+| 327680 | 0.726 | 0.339 | 0.394 | 2.14x | 1.84x |
+| 393216 | 1.109 | 0.443 | 0.448 | 2.50x | 2.48x |
+| 458752 | 1.612 | 0.553 | 0.492 | 2.92x | 3.28x |
+| 524288 ● | 2.177 | 0.724 | 0.585 | 3.01x | 3.72x |
+| 589824 | 2.685 | 0.901 | 0.701 | 2.98x | 3.83x |
+| 655360 | 3.365 | 1.012 | 0.742 | 3.33x | 4.54x |
+| 720896 | 4.215 | 1.251 | 0.892 | 3.37x | 4.73x |
+| 786432 | 4.942 | 1.449 | 0.939 | 3.41x | 5.26x |
+| 851968 | 5.890 | 1.765 | 1.084 | 3.34x | 5.43x |
+| 917504 | 6.908 | 1.971 | 1.118 | 3.50x | 6.18x |
+| 983040 | 8.106 | 2.227 | 1.187 | 3.64x | 6.83x |
+| 1048576 ● | 9.282 | 2.457 | 1.331 | 3.78x | 6.97x |
+| 1114112 | 10.484 | 2.777 | 1.431 | 3.78x | 7.33x |
+| 1179648 | 11.778 | 3.228 | 1.612 | 3.65x | 7.31x |
+| 1245184 | 13.217 | 3.534 | 1.746 | 3.74x | 7.57x |
+| 1310720 | 14.866 | 4.003 | 1.921 | 3.71x | 7.74x |
+| 1376256 | 16.571 | 4.420 | 2.150 | 3.75x | 7.71x |
+| 1441792 | 18.126 | 4.878 | 2.219 | 3.72x | 8.17x |
+| 1507328 | 19.925 | 5.419 | 2.313 | 3.68x | 8.61x |
+| 1572864 | 21.892 | 5.870 | 2.548 | 3.73x | 8.59x |
+| 1638400 | 23.913 | 6.556 | 2.752 | 3.65x | 8.69x |
+| 1703936 | 25.897 | 7.018 | 3.076 | 3.69x | 8.42x |
+| 1769472 | 28.114 | 7.868 | 3.287 | 3.57x | 8.55x |
+| 1835008 | 30.325 | 8.214 | 3.385 | 3.69x | 8.96x |
+| 1900544 | 32.499 | 8.848 | 3.595 | 3.67x | 9.04x |
+| 1966080 | 35.567 | 9.384 | 3.822 | 3.79x | 9.31x |
+| 2031616 | 38.011 | 10.233 | 4.207 | 3.71x | 9.04x |
+| 2097152 ● | 40.437 | 10.733 | 4.243 | 3.77x | 9.53x |
+
+Crossover (first win vs CPU): **AMD at 196 608** (1.20×), **NVIDIA at 262 144** (1.25×). Beyond crossover, wins widen monotonically to **3.77× (AMD) / 9.53× (NVIDIA) @2M**.
+
 ## Project Structure
 
 ```

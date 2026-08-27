@@ -255,6 +255,24 @@ Environment records (fuller notes in README):
   Enabling it later is a protocol change demanding a fresh re-baseline
   (`scripts/BENCHMARK_METHODOLOGY.md`, frozen-reference section).
 
+## Post-campaign fine-grained sweep (32 points, 2026-08-26)
+
+Linear 64 KiB step 65 536 → 2 097 152 (32 legs), same harness (`bench_per_device.sh`, median-of-5, sha256 gate), 96/96 cells OK. Evidence at `.omo/start-work/evidence/fine-sweep-summary.md` and `scripts/bench_per_device_results.csv`.
+
+Wall medians (s) and speedup vs reference — compact table:
+
+| leg | ref | amd_gpu | nvidia_gpu | amd sp | nvidia sp |
+|-----|-----|---------|------------|--------|-----------|
+| 65536 | 0.019 | 0.085 | 0.226 | 0.22x | 0.08x |
+| 131072 | 0.088 | 0.131 | 0.252 | 0.67x | 0.35x |
+| 196608 | 0.202 | 0.169 | 0.272 | 1.20x | 0.74x |
+| 262144 | 0.419 | 0.243 | 0.335 | 1.72x | 1.25x |
+| 524288 | 2.177 | 0.724 | 0.585 | 3.01x | 3.72x |
+| 1048576 | 9.282 | 2.457 | 1.331 | 3.78x | 6.97x |
+| 2097152 | 40.437 | 10.733 | 4.243 | 3.77x | 9.53x |
+
+Full 32-row table in the evidence file. Crossover: **AMD at 196 608**, **NVIDIA at 262 144**; beyond, monotonic to **3.77× / 9.53× @2M**.
+
 ## Benchmark Recurrence
 
 To reproduce results:
